@@ -1,0 +1,123 @@
+name: Build SDKs & Kernel Runtime Packages
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-sdk-packages:
+    name: Build Domain SDKs (Python Wheel & Node.js NPM)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build Python Wheel (.whl) & Node.js Package (.tgz)
+        run: |
+          mkdir -p dist/sdk
+          python3 sdk/python/build_wheel.py dist/sdk
+          cd sdk/nodejs && npm pack --pack-destination ../../dist/sdk
+
+      - name: Verify Python Wheel installation
+        run: |
+          pip install dist/sdk/atelier_sdk-*.whl
+          python3 -c "from atelier_sdk import AtelierDomain, __version__; print('Verified Python SDK version:', __version__)"
+
+      - name: Upload SDK Packages Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: atelier-domain-sdks
+          path: dist/sdk/*
+
+  build-kernel-runtime:
+    name: Build Precompiled Kernel Runtime (${{ matrix.target_label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target_label: linux-x86_64
+            bin_name: atelier-kernel
+          - os: windows-latest
+            target_label: windows-x86_64
+            bin_name: atelier-kernel.exe
+          - os: macos-latest
+            target_label: macos-arm64
+            bin_name: atelier-kernel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Registry & Target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run Kernel Unit & Integration Tests
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test
+
+      - name: Build Release Kernel Binary
+        run: cargo build --release
+
+      - name: Assemble Kernel Runtime Bundle
+        shell: bash
+        run: |
+          mkdir -p dist/kernel-runtime-${{ matrix.target_label }}
+          cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
+          cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
+          python3 sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
+          (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
+          tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}
+
+      - name: Upload Kernel Runtime Artifact (${{ matrix.target_label }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: atelier-kernel-runtime-${{ matrix.target_label }}
+          path: dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz
+
+  publish-github-release:
+    name: Publish GitHub Release (on v* tag)
+    needs: [build-sdk-packages, build-kernel-runtime]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download All Built Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*.whl
+            release-assets/*.tgz
+            release-assets/*.tar.gz
+          generate_release_notes: true

@@ -1,5 +1,9 @@
 /target/
 /data/
+/dist/
+__pycache__/
+*.pyc
+*.egg-info/
 *.db
 *.db-shm
 *.db-wal

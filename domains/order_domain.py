@@ -20,6 +20,7 @@ def on_create(msg):
     order_id = data.get("order_id", f"ORD-{msg.message_id[-6:]}")
     sku = data.get("sku", "ATELIER-GEAR-01")
     qty = data.get("qty", 1)
+    domain.logger.phase("INFO", "start", f"Processing new order {order_id} ({qty}x {sku})", layer="DOMAIN")
     order_record = {
         "order_id": order_id,
         "sku": sku,
@@ -28,6 +29,8 @@ def on_create(msg):
         "requested_by": msg.source_domain,
     }
     domain.storage_insert(record_id=order_id, category="sales_order", data=order_record)
+    domain.logger.info("Order %s persisted to store_order", order_id, layer="DOMAIN")
+    domain.logger.phase("INFO", "finish", f"Order {order_id} created successfully", layer="DOMAIN")
     return {
         "ok": True,
         "runtime": "Python3 (atelier_sdk)",
@@ -38,6 +41,7 @@ def on_create(msg):
 
 @domain.handler("echo")
 def on_echo(msg):
+    domain.logger.info("Handling echo request for %s", msg.source_domain, layer="DOMAIN")
     return {
         "echo_from": "order.echo (Python3)",
         "received_params": msg.params,
@@ -47,8 +51,15 @@ def on_echo(msg):
 
 @domain.handler("slow_op")
 def on_slow_op(msg):
-    delay_ms = int(msg.params.get("delay_ms", 400))
-    time.sleep(delay_ms / 1000.0)
+    delay_ms = int(msg.params.get("delay_ms", 600))
+    key = f"order_task_{msg.message_id[-6:]}"
+    domain.logger.progress(f"Waiting to acquire resource for {key}", key=key, waiting=True, layer="DOMAIN")
+    time.sleep(delay_ms * 0.3 / 1000.0)
+    domain.logger.progress(f"Executing batch step 1/2 for {key}", key=key, frac=0.50, waiting=False, layer="DOMAIN")
+    time.sleep(delay_ms * 0.4 / 1000.0)
+    domain.logger.progress(f"Executing batch step 2/2 for {key}", key=key, frac=0.90, waiting=False, layer="DOMAIN")
+    time.sleep(delay_ms * 0.3 / 1000.0)
+    domain.logger.progress(f"Task {key} completed", key=key, frac=1.0, done=True, layer="DOMAIN")
     return {
         "ok": True,
         "slept_ms": delay_ms,

@@ -15,12 +15,65 @@ class DomainExecutionFailed extends Error {
   }
 }
 
+class DomainLogger {
+  constructor(domain, defaultLayer = "DOMAIN", defaultComponent = "") {
+    this._domain = domain;
+    this.defaultLayer = defaultLayer;
+    this.defaultComponent = defaultComponent;
+  }
+
+  _log(level, msg, opts = {}) {
+    const record = {
+      ts: Date.now() / 1000,
+      level: String(level).toUpperCase(),
+      layer: opts.layer || this.defaultLayer,
+      component: opts.component || this.defaultComponent,
+      message: String(msg),
+      phase: opts.phase || "",
+      console_only: Boolean(opts.consoleOnly || opts.console_only),
+      ephemeral: false,
+    };
+    this._domain._emitLog(record);
+  }
+
+  debug(msg, opts = {}) { this._log("DEBUG", msg, opts); }
+  info(msg, opts = {}) { this._log("INFO", msg, opts); }
+  warn(msg, opts = {}) { this._log("WARNING", msg, opts); }
+  warning(msg, opts = {}) { this._log("WARNING", msg, opts); }
+  error(msg, opts = {}) { this._log("ERROR", msg, opts); }
+  critical(msg, opts = {}) { this._log("CRITICAL", msg, opts); }
+
+  phase(level, phaseName, msg, opts = {}) {
+    this._log(level, msg, { ...opts, phase: phaseName });
+  }
+
+  progress(msg, { key = null, frac = null, waiting = false, done = false, layer = "", component = "" } = {}) {
+    const record = {
+      ts: Date.now() / 1000,
+      level: "INFO",
+      layer: layer || this.defaultLayer,
+      component: component || this.defaultComponent,
+      message: String(msg),
+      phase: "",
+      console_only: false,
+      ephemeral: true,
+      key: key || null,
+      frac: typeof frac === "number" ? frac : null,
+      waiting: Boolean(waiting),
+      done: Boolean(done),
+    };
+    this._domain._emitLog(record);
+  }
+}
+
 class AtelierDomain {
-  constructor({ stageDelayMs = 0 } = {}) {
+  constructor({ domain = "", stageDelayMs = 0 } = {}) {
+    this._domainName = domain;
     this._seqCounter = 1;
     this._handlers = new Map();
     this._receiptCallbacks = [];
     this._stageDelayMs = stageDelayMs;
+    this.logger = new DomainLogger(this, "DOMAIN", domain);
   }
 
   /**
@@ -135,6 +188,13 @@ class AtelierDomain {
     });
   }
 
+  _emitLog(record) {
+    this._writeFrame({
+      frame_type: "log",
+      record,
+    });
+  }
+
   _writeFrame(frame) {
     process.stdout.write(JSON.stringify(frame) + "\n");
   }
@@ -226,4 +286,5 @@ class AtelierDomain {
 module.exports = {
   AtelierDomain,
   DomainExecutionFailed,
+  DomainLogger,
 };

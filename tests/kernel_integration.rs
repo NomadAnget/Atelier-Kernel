@@ -515,3 +515,115 @@ fn test_stale_instance_fault_does_not_revoke_new_domain_instance() {
     assert!(kernel.router().active_routes().is_empty());
 }
 
+/// 6. Tests unified multi-state logging:
+///    - Structured lifecycle logs with `phase` ("start" / "finish") persisted to `hub_logs`.
+///    - Ephemeral progress logs (`ephemeral: true`) tracked in-memory & fanned out via SSE, NEVER polluting `hub_logs`.
+///    - `console_only: true` logs suppressed from both DB and subscribers.
+///    - Raw pipe JSON frame ingestion for `frame_type: "log"`.
+#[test]
+fn test_unified_multi_state_logging_and_hub_logs_persistence() {
+    let tmp_dir = std::env::temp_dir().join(format!("atelier_log_test_{}", std::process::id()));
+    let db_path = tmp_dir.join("kernel.db");
+    let kernel = AtelierKernel::open_with_db(&db_path).unwrap();
+
+    let rx = kernel.logger().subscribe();
+
+    // 1. Log structured lifecycle events with `phase`
+    kernel.logger().phase("INFO", "ENGINES", "model_runner", "start", "Initializing neural weights");
+    kernel.logger().phase("INFO", "ENGINES", "model_runner", "finish", "Weights loaded successfully");
+
+    // 2. Log high-frequency heartbeat with `console_only = true`
+    kernel.logger().reinject(atelier_kernel::LogRecord {
+        id: None,
+        ts: atelier_kernel::logging::now_secs_f64(),
+        level: "DEBUG".to_string(),
+        layer: "ENGINES".to_string(),
+        component: "heartbeat".to_string(),
+        message: "tick-heartbeat".to_string(),
+        phase: String::new(),
+        console_only: true,
+        ephemeral: false,
+        key: None,
+        frac: None,
+        waiting: false,
+        done: false,
+    });
+
+    // 3. Log ephemeral progress: downloading weights
+    kernel.logger().progress(
+        "ENGINES",
+        "downloader",
+        "Downloading model chunk 1/2",
+        Some("dl_model_weights".to_string()),
+        Some(0.50),
+        false,
+        false,
+    );
+
+    // Verify in-memory active progress map
+    let active_prog = kernel.logger().active_progress();
+    assert_eq!(active_prog.len(), 1);
+    assert_eq!(active_prog[0].key.as_deref(), Some("dl_model_weights"));
+    assert_eq!(active_prog[0].frac, Some(0.50));
+
+    // Finish the progress
+    kernel.logger().progress(
+        "ENGINES",
+        "downloader",
+        "Download complete",
+        Some("dl_model_weights".to_string()),
+        Some(1.00),
+        false,
+        true, // done
+    );
+
+    // After done=true, active_progress clears the key
+    assert!(kernel.logger().active_progress().is_empty());
+
+    // 4. Test ingestion of structured log frame from child domain pipe
+    let _domain_pipe = kernel.attach_domain("order");
+    kernel.router().handle_raw_pipe_line_for_instance(
+        "order",
+        1,
+        r#"{"frame_type":"log","record":{"level":"INFO","layer":"DOMAIN","component":"order","message":"Order #1001 processed","phase":"finish"}}"#,
+    );
+
+    // Drain real-time subscriber messages
+    let mut received_records = Vec::new();
+    while let Ok(rec) = rx.try_recv() {
+        received_records.push(rec);
+    }
+
+    // Subscriber should have received:
+    // - 2 phase logs ("start", "finish")
+    // - 2 progress logs (0.50, 1.00 done)
+    // - 1 pipe log ("Order #1001 processed")
+    // NOTE: console_only heartbeat was NOT sent to subscribers!
+    assert_eq!(received_records.len(), 5);
+    assert!(!received_records.iter().any(|r| r.message == "tick-heartbeat"));
+
+    // Wait briefly for LogStore async writer batch to flush to disk
+    std::thread::sleep(Duration::from_millis(350));
+
+    // 5. Query persisted `hub_logs`
+    let stored_logs = kernel.logger().query_logs(100, None, None, None, None, None).unwrap();
+
+    // Verify hub_logs contains only true historical logs, NOT ephemeral progress and NOT console_only!
+    assert!(!stored_logs.iter().any(|l| l.message.contains("Downloading")));
+    assert!(!stored_logs.iter().any(|l| l.message == "tick-heartbeat"));
+
+    let start_log = stored_logs.iter().find(|l| l.message == "Initializing neural weights").expect("start log persisted");
+    assert_eq!(start_log.phase, "start");
+    assert_eq!(start_log.layer, "ENGINES");
+
+    let finish_log = stored_logs.iter().find(|l| l.message == "Weights loaded successfully").expect("finish log persisted");
+    assert_eq!(finish_log.phase, "finish");
+
+    let pipe_log = stored_logs.iter().find(|l| l.message == "Order #1001 processed").expect("pipe log persisted");
+    assert_eq!(pipe_log.component, "order");
+    assert_eq!(pipe_log.phase, "finish");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+

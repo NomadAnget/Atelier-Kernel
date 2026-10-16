@@ -326,6 +326,109 @@
       padding: 6px 8px;
       border-radius: 4px;
     }
+
+    /* Unified Logging & Ephemeral Progress styles */
+    .progress-container {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .progress-card {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 8px 12px;
+    }
+    .progress-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 4px;
+      font-size: 12px;
+    }
+    .progress-key {
+      font-family: monospace;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .progress-pct {
+      font-family: monospace;
+      font-weight: bold;
+      color: #38bdf8;
+    }
+    .progress-bar-bg {
+      background: #1e293b;
+      height: 7px;
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+    .progress-bar-fill {
+      background: linear-gradient(90deg, #38bdf8, #818cf8);
+      height: 100%;
+      transition: width 0.3s ease;
+    }
+    .progress-bar-indeterminate {
+      width: 40%;
+      position: absolute;
+      animation: indeterminate 1.5s infinite ease-in-out;
+    }
+    @keyframes indeterminate {
+      0% { left: -40%; }
+      100% { left: 100%; }
+    }
+    .pulse-waiting {
+      animation: pulse 1.2s infinite;
+      color: #fbbf24;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .log-stream {
+      max-height: 380px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 11.5px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-right: 4px;
+    }
+    .log-entry {
+      background: #090e17;
+      border: 1px solid #1e293b;
+      border-radius: 4px;
+      padding: 5px 8px;
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      word-break: break-all;
+    }
+    .log-entry.level-debug { border-left: 3px solid #64748b; color: #94a3b8; }
+    .log-entry.level-info { border-left: 3px solid #38bdf8; }
+    .log-entry.level-warning { border-left: 3px solid #f59e0b; }
+    .log-entry.level-error { border-left: 3px solid #ef4444; background: rgba(239, 68, 68, 0.05); }
+    .log-entry.level-critical { border-left: 3px solid #dc2626; background: rgba(220, 38, 38, 0.15); font-weight: bold; }
+    .badge-phase-start {
+      background: rgba(56, 189, 248, 0.15);
+      color: #38bdf8;
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .badge-phase-finish {
+      background: rgba(34, 197, 94, 0.15);
+      color: #4ade80;
+      border: 1px solid rgba(34, 197, 94, 0.4);
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -373,6 +476,8 @@
           <button onclick="runPreset('storage_evolve')">⑧ 存储即消息: 结构演进<br><span class="sub-hint">StorageUpdate 动态加字段不改表</span></button>
           <button onclick="runPreset('storage_query')">⑨ 存储即消息: 跨域读取<br><span class="sub-hint">StorageQuery 读取 order 域表</span></button>
           <button onclick="runPreset('storage_isolation')">⑩ 验证跨域写入拦截<br><span class="sub-hint">尝试越权改写 order 表 -> 拒绝</span></button>
+          <button onclick="runPreset('slow_progress')">⑪ 实时临时任务进度<br><span class="sub-hint">order.slow_op 扇出 SSE 进度条</span></button>
+          <button onclick="runPreset('multi_lang_logs')">⑫ 多语言结构化日志<br><span class="sub-hint">Python+Node phase起止配对</span></button>
         </div>
 
         <div class="card-header" style="margin-top:8px;">
@@ -445,6 +550,33 @@
           </div>
           <div id="webui-receipts" class="inbox-list"></div>
         </div>
+      <div class="card">
+        <div class="card-header">
+          <h2>系统统一日志体系与多状态执行进度 (`Structured Logs & Live Progress`)</h2>
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
+            <select id="filter-log-level" onchange="renderLogs()" style="background:#0b0f17;color:#e2e8f0;border:1px solid #26334d;border-radius:5px;padding:2px 6px;font-size:11px;">
+              <option value="ALL">全部级别</option>
+              <option value="INFO">INFO</option>
+              <option value="WARNING">WARNING</option>
+              <option value="ERROR">ERROR</option>
+              <option value="PHASE">仅看 Phase 起止配对</option>
+            </select>
+            <select id="filter-log-layer" onchange="renderLogs()" style="background:#0b0f17;color:#e2e8f0;border:1px solid #26334d;border-radius:5px;padding:2px 6px;font-size:11px;">
+              <option value="ALL">全部 Layer</option>
+              <option value="DOMAIN">DOMAIN (各语言域)</option>
+              <option value="ENGINES">ENGINES (引擎执行体)</option>
+              <option value="CORE">CORE (内核基础设施)</option>
+              <option value="SUBPROC">SUBPROC (子进程兜底)</option>
+            </select>
+            <button onclick="refreshHistoricalLogs()" style="font-size:11px; padding:3px 8px;">🔄 查 SQLite hub_logs</button>
+          </div>
+        </div>
+
+        <!-- In-Place Live Ephemeral Progress Bars Container -->
+        <div id="progress-container" class="progress-container"></div>
+
+        <!-- Structured Log Stream -->
+        <div id="log-stream" class="log-stream"></div>
       </div>
 
       <div class="card">
@@ -464,12 +596,145 @@
     let streamPaused = false;
     let latestSnapshot = null;
     let expandedKeys = new Set();
+    let activeProgressMap = new Map();
+    let logRecords = [];
+
+    function initLogStream() {
+      try {
+        const es = new EventSource('/api/logs/stream');
+        es.onmessage = (e) => {
+          try {
+            const rec = JSON.parse(e.data);
+            handleIncomingLogRecord(rec);
+          } catch (_) {}
+        };
+        es.onerror = () => {};
+      } catch (_) {}
+    }
+
+    function handleIncomingLogRecord(rec) {
+      if (rec.ephemeral) {
+        if (rec.done) {
+          activeProgressMap.delete(rec.key);
+        } else if (rec.key) {
+          activeProgressMap.set(rec.key, rec);
+        }
+        renderProgress();
+      } else if (!rec.console_only) {
+        logRecords.unshift(rec);
+        if (logRecords.length > 300) logRecords.pop();
+        renderLogs();
+      }
+    }
+
+    function renderProgress() {
+      const pContainer = document.getElementById('progress-container');
+      if (!pContainer) return;
+      if (activeProgressMap.size === 0) {
+        pContainer.innerHTML = '';
+        return;
+      }
+      const items = Array.from(activeProgressMap.values());
+      pContainer.innerHTML = items.map(item => {
+        let barHtml = '';
+        let statusHtml = '';
+        if (item.waiting) {
+          statusHtml = `<span class="pulse-waiting">⏳ 等待资源中...</span>`;
+          barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill progress-bar-indeterminate" style="background:#f59e0b;"></div></div>`;
+        } else if (typeof item.frac === 'number') {
+          const pct = Math.round(item.frac * 100);
+          statusHtml = `<span class="progress-pct">${pct}%</span>`;
+          barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%;"></div></div>`;
+        } else {
+          statusHtml = `<span style="color:#a855f7;">⚡ 处理中</span>`;
+          barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill progress-bar-indeterminate"></div></div>`;
+        }
+        return `
+          <div class="progress-card">
+            <div class="progress-header">
+              <div>
+                <span class="progress-key">${item.key || '任务'}</span>
+                <span class="lang-tag" style="margin-left:6px;">${item.layer || 'DOMAIN'}/${item.component || ''}</span>
+                <span style="margin-left:8px; color:#cbd5e1;">${item.message || ''}</span>
+              </div>
+              <div>${statusHtml}</div>
+            </div>
+            ${barHtml}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function renderLogs() {
+      const lContainer = document.getElementById('log-stream');
+      if (!lContainer) return;
+      const lvlFilter = document.getElementById('filter-log-level')?.value || 'ALL';
+      const lyrFilter = document.getElementById('filter-log-layer')?.value || 'ALL';
+
+      const filtered = logRecords.filter(r => {
+        if (lvlFilter === 'PHASE') {
+          if (!r.phase) return false;
+        } else if (lvlFilter !== 'ALL' && r.level !== lvlFilter) {
+          return false;
+        }
+        if (lyrFilter !== 'ALL' && r.layer !== lyrFilter) {
+          return false;
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        lContainer.innerHTML = `<div style="text-align:center; padding:12px; color:#64748b;">暂无符合条件的日志记录（各域记录日志后将在此实时展示）</div>`;
+        return;
+      }
+
+      lContainer.innerHTML = filtered.slice(0, 150).map(r => {
+        const timeStr = new Date((r.ts || 0) * 1000).toLocaleTimeString();
+        const lvlClass = `level-${(r.level || 'info').toLowerCase()}`;
+        const phaseHtml = r.phase === 'start' ? `<span class="badge-phase-start">[start]</span>`
+                        : r.phase === 'finish' ? `<span class="badge-phase-finish">[finish]</span>`
+                        : (r.phase ? `<span class="lang-tag">&lt;${r.phase}&gt;</span>` : '');
+        const tag = (r.layer || r.component) ? `[${r.layer}/${r.component}]` : '';
+        return `
+          <div class="log-entry ${lvlClass}">
+            <span style="color:#64748b; font-size:10.5px;">${timeStr}</span>
+            <span style="font-weight:600; min-width:44px;">${r.level}</span>
+            <span style="color:#94a3b8; font-size:10.5px;">${tag}</span>
+            ${phaseHtml}
+            <span style="flex:1; color:#f1f5f9;">${r.message}</span>
+          </div>
+        `;
+      }).join('');
+    }
+
+    async function refreshHistoricalLogs() {
+      try {
+        const res = await fetch('/api/logs?limit=100');
+        const data = await res.json();
+        if (data.logs) {
+          logRecords = data.logs;
+          renderLogs();
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
     async function fetchSnapshot() {
       if (streamPaused) return;
       try {
         const res = await fetch('/api/snapshot');
         latestSnapshot = await res.json();
+        if (latestSnapshot.recent_logs && logRecords.length === 0) {
+          logRecords = latestSnapshot.recent_logs.slice().reverse();
+          renderLogs();
+        }
+        if (latestSnapshot.active_progress && activeProgressMap.size === 0) {
+          for (const p of latestSnapshot.active_progress) {
+            if (p.key) activeProgressMap.set(p.key, p);
+          }
+          renderProgress();
+        }
         renderAll();
       } catch (e) {
         console.error(e);
@@ -765,9 +1030,26 @@
           params: { domain: 'order', record_id: 'forged_order_999', category: 'sales_order' },
           data: { forged: true }
         });
+      } else if (name === 'slow_progress') {
+        await sendToKernel({
+          targets: ['order.slow_op'],
+          message_type: 'RunSlowProgressTask',
+          seq: 0,
+          params: { delay_ms: 1200 },
+          data: { task_name: '权重分片加载' }
+        });
+      } else if (name === 'multi_lang_logs') {
+        await sendToKernel({
+          targets: ['order.create', 'inventory.deduct'],
+          message_type: 'MultiLangLogDemo',
+          seq: 0,
+          params: { trace: 'phase_pair_demo' },
+          data: { sku: 'NEURAL-LINK-V2', qty: 2 }
+        });
       }
     }
 
+    initLogStream();
     fetchSnapshot();
     setInterval(fetchSnapshot, 400);
   </script>

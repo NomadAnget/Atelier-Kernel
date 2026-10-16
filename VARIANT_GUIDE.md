@@ -191,7 +191,63 @@ my-product-variant/
 
 ---
 
-## 五、如何触发自动化构建与发布
+## 五、内核统一接管的多语言日志体系（Unified Multi-State Logging）
+
+Atelier Kernel 内建了与 `atelier-core` 一脉相承的黑匣子日志基础设施。不仅能跨语言统一接管子进程日志，还原生支持**多状态结构化日志**：
+
+### 1. 三大出口（Three Sinks）
+
+- **控制台（Console）**：紧凑单行格式 `HH:MM:SS LEVEL [layer/component] message <phase>`，TTY 环境色彩高亮。
+- **实时订阅流（Subscriber Stream / SSE）**：基于事件流扇出至 Web 前端与观察者（`/api/logs/stream`），慢订阅丢帧绝不阻塞业务。
+- **内核直管持久化表（SQLite `hub_logs`）**：由内核独立后台写线程按 WAL 批处理异步落库，队列饱和丢帧，黑匣子绝不反噬被观察者。
+
+### 2. 多状态日志形态（Multi-State Log Patterns）
+
+| 日志形态 | API | 去向 | 特性与用途 |
+| :--- | :--- | :--- | :--- |
+| **分级日志** | `domain.logger.info(msg, layer=..., component=...)` | 控制台 + SSE + `hub_logs` | 记录事实与业务状态，支持 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。 |
+| **生命周期起止配对** | `domain.logger.phase(level, "start" \| "finish", msg)` | 控制台 + SSE + `hub_logs` | 结构化字段 `phase` 原生配对同一操作起止，无需靠正则表达式猜测文本前缀。 |
+| **临时实时进度** | `domain.logger.progress(msg, key=..., frac=..., waiting=..., done=...)` | **仅 SSE 实时流** | 前端按 `key` 原地更新进度条，`frac`∈[0,1] 渲确定进度条，`waiting=True` 渲等待脉冲，`done=True` 清除。**不落 `hub_logs` 磁盘库**，防止高频刷屏膨胀数据库！ |
+| **控制台刷屏过滤** | `domain.logger.debug(msg, console_only=True)` | **仅终端控制台** | 引擎心跳与高频调试，既不入库也不进 SSE。 |
+| **子进程裸输出兜底** | 域内第三方库裸 `print` 或未捕获 tracebacks | 控制台 + SSE + `hub_logs` | 内核 supervisor 异步文本泵自动截获 `stderr`，自动标记为 `layer: "SUBPROC"` 并统一接管。 |
+
+### 3. 多语言使用示例
+
+#### Python 域示例：
+```python
+# 1. 结构化起止配对
+domain.logger.phase("INFO", "start", f"正在生成订单 {order_id}")
+
+# 2. 事实日志
+domain.logger.info("订单 %s 数据已落库", order_id)
+
+# 3. 临时进度条（高频更新，只走 Web SSE 原地刷新，不污染 hub_logs）
+domain.logger.progress("正在下载模型分片 1/2", key=f"dl_{order_id}", frac=0.50)
+domain.logger.progress("分片下载完成", key=f"dl_{order_id}", frac=1.00, done=True)
+
+# 4. 起止完成配对
+domain.logger.phase("INFO", "finish", f"订单 {order_id} 处理完成")
+```
+
+#### Node.js 域示例：
+```javascript
+// 1. 结构化起止配对
+domain.logger.phase("INFO", "start", `正在扣减库存 ${sku}`);
+
+// 2. 事实日志
+domain.logger.info(`扣减成功，剩余库存: ${remaining}`);
+
+// 3. 临时进度条
+domain.logger.progress("任务计算中", { key: `calc_${sku}`, frac: 0.75 });
+domain.logger.progress("计算完毕", { key: `calc_${sku}`, frac: 1.0, done: true });
+
+// 4. 起止完成配对
+domain.logger.phase("INFO", "finish", `库存 ${sku} 扣减完毕`);
+```
+
+---
+
+## 六、如何触发自动化构建与发布
 
 1. **本地一键构建发布包**：
    在仓库根目录执行：
@@ -208,3 +264,4 @@ my-product-variant/
      git push origin v0.1.0
      ```
      GitHub Actions 将自动创建 Release 页面并挂载全部平台运行包与 SDK 安装包。
+

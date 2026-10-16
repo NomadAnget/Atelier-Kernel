@@ -25,7 +25,39 @@ export interface StorageDeleteOptions {
 }
 
 export interface AtelierDomainOptions {
+  domain?: string;
   stageDelayMs?: number;
+}
+
+export interface LogOptions {
+  layer?: string;
+  component?: string;
+  phase?: string;
+  consoleOnly?: boolean;
+  console_only?: boolean;
+}
+
+export interface ProgressOptions {
+  key?: string | null;
+  frac?: number | null;
+  waiting?: boolean;
+  done?: boolean;
+  layer?: string;
+  component?: string;
+}
+
+export class DomainLogger {
+  defaultLayer: string;
+  defaultComponent: string;
+  constructor(domain: AtelierDomain, defaultLayer?: string, defaultComponent?: string);
+  debug(msg: any, opts?: LogOptions): void;
+  info(msg: any, opts?: LogOptions): void;
+  warn(msg: any, opts?: LogOptions): void;
+  warning(msg: any, opts?: LogOptions): void;
+  error(msg: any, opts?: LogOptions): void;
+  critical(msg, opts?: LogOptions): void;
+  phase(level: string, phaseName: string, msg: any, opts?: LogOptions): void;
+  progress(msg: any, options?: ProgressOptions): void;
 }
 
 export class DomainExecutionFailed extends Error {
@@ -34,6 +66,7 @@ export class DomainExecutionFailed extends Error {
 }
 
 export class AtelierDomain {
+  readonly logger: DomainLogger;
   constructor(options?: AtelierDomainOptions);
   handler<TData = Record<string, any>, TParams = Record<string, any>>(
     name: string,

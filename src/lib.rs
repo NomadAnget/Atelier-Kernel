@@ -1,5 +1,6 @@
 pub mod frontend;
 pub mod ledger;
+pub mod logging;
 pub mod observer;
 pub mod protocol;
 pub mod router;
@@ -12,6 +13,7 @@ use std::sync::Arc;
 
 pub use frontend::InteractiveFrontendDomain;
 pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
+pub use logging::{KernelLogHub, LogFramePayload, LogRecord, LogStore};
 pub use observer::KernelObserver;
 pub use web_frontend::WebFrontendDomain;
 pub use protocol::{
@@ -32,10 +34,12 @@ pub use supervisor::{
 /// 3. Kernel Ledger (Kernel-generated `message_id` & three-level idempotent delivery)
 /// 4. Kernel Observer (Dedicated real-time message lifecycle observation)
 /// 5. Domain Storage Engine (Per-domain SQLite table creation & message-driven CRUD)
+/// 6. Kernel Logger & LogStore (Structured multi-state logging, ephemeral progress & SQLite hub_logs)
 pub struct AtelierKernel {
     ledger: Arc<KernelLedger>,
     observer: Arc<KernelObserver>,
     storage: Arc<DomainStorageEngine>,
+    logger: Arc<KernelLogHub>,
     router: Arc<KernelRouter>,
     supervisor: Arc<DomainSupervisor>,
 }
@@ -44,22 +48,25 @@ impl AtelierKernel {
     /// Creates a new Atelier Kernel backed by an in-memory SQLite database.
     pub fn new_in_memory() -> Result<Self, StorageError> {
         let storage = Arc::new(DomainStorageEngine::new_in_memory()?);
-        Ok(Self::from_storage(storage))
+        let logger = Arc::new(KernelLogHub::new(None)?);
+        Ok(Self::from_components(storage, logger))
     }
 
     /// Creates a new Atelier Kernel backed by a persistent SQLite database file.
     pub fn open_with_db(db_path: impl AsRef<Path>) -> Result<Self, StorageError> {
-        let storage = Arc::new(DomainStorageEngine::open_file(db_path)?);
-        Ok(Self::from_storage(storage))
+        let storage = Arc::new(DomainStorageEngine::open_file(db_path.as_ref())?);
+        let logger = Arc::new(KernelLogHub::new(Some(db_path.as_ref()))?);
+        Ok(Self::from_components(storage, logger))
     }
 
-    fn from_storage(storage: Arc<DomainStorageEngine>) -> Self {
+    fn from_components(storage: Arc<DomainStorageEngine>, logger: Arc<KernelLogHub>) -> Self {
         let ledger = Arc::new(KernelLedger::new());
         let observer = Arc::new(KernelObserver::default());
         let router = Arc::new(KernelRouter::new(
             Arc::clone(&ledger),
             Arc::clone(&observer),
             Arc::clone(&storage),
+            Arc::clone(&logger),
         ));
         let supervisor = Arc::new(DomainSupervisor::new(Arc::clone(&router)));
 
@@ -67,6 +74,7 @@ impl AtelierKernel {
             ledger,
             observer,
             storage,
+            logger,
             router,
             supervisor,
         }
@@ -82,6 +90,10 @@ impl AtelierKernel {
 
     pub fn storage(&self) -> &Arc<DomainStorageEngine> {
         &self.storage
+    }
+
+    pub fn logger(&self) -> &Arc<KernelLogHub> {
+        &self.logger
     }
 
     pub fn router(&self) -> &Arc<KernelRouter> {

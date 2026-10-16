@@ -1,5 +1,5 @@
 """
-Atelier Kernel Official Python Domain SDK (`atelier_sdk.py`).
+Atelier Kernel Official Python Domain SDK (`atelier_sdk`).
 
 Encapsulates OS Stdio JSON-Lines pipe framing, sequence numbering, handler
 registration (`kernel.registry`), 4-stage receipt reporting (`Received` ->
@@ -9,13 +9,20 @@ so business domains only need to import `AtelierDomain` and declare handlers.
 import asyncio
 import inspect
 import json
+import logging
 import sys
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
 __version__ = "0.1.0"
-__all__ = ["AtelierDomain", "DeliveryMessage", "DomainExecutionFailed", "__version__"]
+__all__ = [
+    "AtelierDomain",
+    "DeliveryMessage",
+    "DomainExecutionFailed",
+    "DomainLogger",
+    "__version__",
+]
 
 
 class DomainExecutionFailed(Exception):
@@ -58,15 +65,167 @@ class DeliveryMessage(dict):
         return self.get("data") or {}
 
 
+class DomainLogger:
+    """
+    Unified structured logger for Atelier Domain.
+    Emits structured log frames over the domain's stdout pipe to the Kernel.
+
+    Supports 3 core operational patterns:
+    1. Hierarchical logs: debug, info, warning, error, critical with `phase` execution pairing.
+    2. Ephemeral progress: progress(msg, key=..., frac=..., waiting=..., done=...).
+    3. Console only: console_only=True (suppressed from hub_logs and SSE).
+    """
+
+    def __init__(
+        self,
+        domain: "AtelierDomain",
+        default_layer: str = "DOMAIN",
+        default_component: str = "",
+    ):
+        self._domain = domain
+        self.default_layer = default_layer
+        self.default_component = default_component
+
+    def _log(
+        self,
+        level: str,
+        msg: str,
+        *args: Any,
+        layer: str = "",
+        component: str = "",
+        phase: str = "",
+        console_only: bool = False,
+        exc_info: Any = None,
+    ) -> None:
+        try:
+            text = (msg % args) if args else str(msg)
+        except Exception:
+            text = str(msg)
+
+        if exc_info:
+            import traceback
+
+            if exc_info is True:
+                text += "\n" + traceback.format_exc()
+            elif isinstance(exc_info, tuple):
+                text += "\n" + "".join(traceback.format_exception(*exc_info))
+            elif isinstance(exc_info, BaseException):
+                text += f"\n{type(exc_info).__name__}: {exc_info}"
+
+        record: Dict[str, Any] = {
+            "ts": time.time(),
+            "level": level.upper(),
+            "layer": layer or self.default_layer,
+            "component": component or self.default_component,
+            "message": text,
+            "phase": phase or "",
+            "console_only": bool(console_only),
+            "ephemeral": False,
+        }
+        self._domain._emit_log(record)
+
+    def debug(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log("DEBUG", msg, *args, **kwargs)
+
+    def info(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log("INFO", msg, *args, **kwargs)
+
+    def warning(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log("WARNING", msg, *args, **kwargs)
+
+    def warn(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log("WARNING", msg, *args, **kwargs)
+
+    def error(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log("ERROR", msg, *args, **kwargs)
+
+    def critical(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        self._log("CRITICAL", msg, *args, **kwargs)
+
+    def exception(self, msg: str, *args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("exc_info", True)
+        self._log("ERROR", msg, *args, **kwargs)
+
+    def phase(self, level: str, phase_name: str, msg: str, *args: Any, **kwargs: Any) -> None:
+        """Logs a lifecycle start/finish execution phase pair."""
+        kwargs["phase"] = phase_name
+        self._log(level, msg, *args, **kwargs)
+
+    def progress(
+        self,
+        msg: str,
+        *,
+        key: str = "",
+        frac: Optional[float] = None,
+        waiting: bool = False,
+        done: bool = False,
+        layer: str = "",
+        component: str = "",
+    ) -> None:
+        """
+        Ephemeral real-time progress update.
+        Dispatched in-memory to Web UI / SSE observers; never enters SQLite hub_logs.
+        """
+        record: Dict[str, Any] = {
+            "ts": time.time(),
+            "level": "INFO",
+            "layer": layer or self.default_layer,
+            "component": component or self.default_component,
+            "message": str(msg),
+            "phase": "",
+            "console_only": False,
+            "ephemeral": True,
+            "key": key or None,
+            "frac": frac,
+            "waiting": bool(waiting),
+            "done": bool(done),
+        }
+        self._domain._emit_log(record)
+
+
+class _StdlibLoggingHandler(logging.Handler):
+    """Bridges standard Python `logging` into AtelierDomain's structured logger."""
+
+    def __init__(self, domain_logger: DomainLogger):
+        super().__init__()
+        self._logger = domain_logger
+
+    def emit(self, record: logging.LogRecord) -> None:
+        layer = getattr(record, "layer", "") or ""
+        comp = getattr(record, "component", "") or record.name
+        phase = getattr(record, "phase", "") or ""
+        console_only = getattr(record, "console_only", False)
+        msg = record.getMessage()
+        self._logger._log(
+            record.levelname,
+            msg,
+            layer=layer,
+            component=comp,
+            phase=phase,
+            console_only=console_only,
+            exc_info=record.exc_info,
+        )
+
+
 class AtelierDomain:
     """High-level Python Domain SDK for Atelier Kernel."""
 
-    def __init__(self, stage_delay_sec: float = 0.0):
+    def __init__(
+        self,
+        domain: str = "",
+        stage_delay_sec: float = 0.0,
+    ):
+        self._domain_name = domain
         self._seq_counter = 1
         self._write_lock = threading.Lock()
         self._handlers: Dict[str, Callable[..., Any]] = {}
         self._receipt_callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._stage_delay_sec = stage_delay_sec
+        self.logger = DomainLogger(
+            self,
+            default_layer="DOMAIN",
+            default_component=domain,
+        )
 
     def handler(self, name: str):
         """Decorator that registers a message handler for `<domain>.<name>`."""
@@ -199,6 +358,25 @@ class AtelierDomain:
                 "status": status,
                 "data": data,
             })
+
+    def _emit_log(self, record: Dict[str, Any]) -> None:
+        """Emits a structured log frame over the domain's stdout pipe to the Kernel."""
+        with self._write_lock:
+            self._write_frame_unlocked({
+                "frame_type": "log",
+                "record": record,
+            })
+
+    def attach_stdlib_logging(self, level: str = "INFO", root: bool = True) -> _StdlibLoggingHandler:
+        """
+        Bridges Python's standard `logging` library to this domain's structured logger.
+        Any `logging.info(...)` or third-party logger will be relayed to the Kernel.
+        """
+        target_logger = logging.getLogger() if root else logging.getLogger(self._domain_name)
+        target_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+        handler = _StdlibLoggingHandler(self.logger)
+        target_logger.addHandler(handler)
+        return handler
 
     def _write_frame_unlocked(self, frame: Dict[str, Any]) -> None:
         line = json.dumps(frame, ensure_ascii=False) + "\n"

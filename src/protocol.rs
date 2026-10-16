@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::logging::LogFramePayload;
+
 /// Built-in kernel target for domain handler registration.
 pub const KERNEL_REGISTRY_TARGET: &str = "kernel.registry";
 /// Built-in kernel target for message-driven domain storage CRUD.
@@ -98,6 +100,8 @@ pub enum DomainToKernelFrame {
     Send(OutboundMessage),
     /// Report execution progress/completion receipt for a delivered message.
     Receipt(InboundReceipt),
+    /// Structured multi-state log frame or ephemeral progress telemetry.
+    Log(LogFramePayload),
 }
 
 /// Top-level JSON-Lines frame sent from the Kernel to a Domain (`stdin`).

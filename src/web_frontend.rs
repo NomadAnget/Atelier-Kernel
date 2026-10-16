@@ -239,6 +239,12 @@ impl WebFrontendDomain {
                     )
                 }
             }
+            ("GET", p) if p.starts_with("/api/logs/stream") => {
+                self.handle_logs_stream(stream)
+            }
+            ("GET", p) if p.starts_with("/api/logs") => {
+                self.handle_query_logs(&mut stream, p)
+            }
             _ => self.write_response(&mut stream, "404 Not Found", "text/plain", b"Not Found"),
         }
     }
@@ -291,6 +297,81 @@ impl WebFrontendDomain {
             }
             _ => {}
         }
+    }
+
+    fn handle_logs_stream(&self, mut stream: TcpStream) -> std::io::Result<()> {
+        let _ = stream.set_read_timeout(None);
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+        stream.write_all(header.as_bytes())?;
+        stream.flush()?;
+
+        // Send active ephemeral progress items first
+        for prog in self.kernel.logger().active_progress() {
+            let json_str = serde_json::to_string(&prog).unwrap_or_default();
+            let chunk = format!("data: {json_str}\n\n");
+            if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
+                return Ok(());
+            }
+        }
+
+        let rx = self.kernel.logger().subscribe();
+        while let Ok(rec) = rx.recv() {
+            let json_str = serde_json::to_string(&rec).unwrap_or_default();
+            let chunk = format!("data: {json_str}\n\n");
+            if stream.write_all(chunk.as_bytes()).is_err() || stream.flush().is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_query_logs(&self, stream: &mut TcpStream, path: &str) -> std::io::Result<()> {
+        let query_str = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let mut level: Option<String> = None;
+        let mut layer: Option<String> = None;
+        let mut component: Option<String> = None;
+        let mut phase: Option<String> = None;
+        let mut limit = 200usize;
+
+        for pair in query_str.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                match k {
+                    "level" if !v.is_empty() => level = Some(v.to_string()),
+                    "layer" if !v.is_empty() => layer = Some(v.to_string()),
+                    "component" if !v.is_empty() => component = Some(v.to_string()),
+                    "phase" if !v.is_empty() => phase = Some(v.to_string()),
+                    "limit" => {
+                        if let Ok(l) = v.parse::<usize>() {
+                            limit = l;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let logs = self
+            .kernel
+            .logger()
+            .query_logs(
+                limit,
+                level.as_deref(),
+                layer.as_deref(),
+                component.as_deref(),
+                phase.as_deref(),
+                None,
+            )
+            .unwrap_or_default();
+
+        let active_progress = self.kernel.logger().active_progress();
+
+        let resp = json!({
+            "logs": logs,
+            "active_progress": active_progress,
+        });
+        let bytes = serde_json::to_vec(&resp).unwrap_or_default();
+        self.write_response(stream, "200 OK", "application/json", &bytes)
     }
 
     fn build_snapshot_json(&self) -> Value {
@@ -377,6 +458,8 @@ impl WebFrontendDomain {
         let recent_events: Vec<_> = all_events.into_iter().rev().take(60).collect();
         let webui_inbox = self.inbox_history.lock().clone();
         let webui_receipts = self.receipt_history.lock().clone();
+        let recent_logs = self.kernel.logger().recent_logs();
+        let active_progress = self.kernel.logger().active_progress();
 
         json!({
             "active_routes": active_routes,
@@ -387,6 +470,8 @@ impl WebFrontendDomain {
             "recent_events": recent_events,
             "webui_inbox": webui_inbox,
             "webui_receipts": webui_receipts,
+            "recent_logs": recent_logs,
+            "active_progress": active_progress,
         })
     }
 

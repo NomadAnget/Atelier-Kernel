@@ -7,6 +7,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::ledger::{KernelLedger, ReceiptTransition};
+use crate::logging::KernelLogHub;
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DomainStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
@@ -38,6 +39,7 @@ pub struct KernelRouter {
     ledger: Arc<KernelLedger>,
     observer: Arc<KernelObserver>,
     storage: Arc<DomainStorageEngine>,
+    logger: Arc<KernelLogHub>,
 }
 
 impl KernelRouter {
@@ -45,6 +47,7 @@ impl KernelRouter {
         ledger: Arc<KernelLedger>,
         observer: Arc<KernelObserver>,
         storage: Arc<DomainStorageEngine>,
+        logger: Arc<KernelLogHub>,
     ) -> Self {
         Self {
             next_instance_id: AtomicU64::new(1),
@@ -54,6 +57,7 @@ impl KernelRouter {
             ledger,
             observer,
             storage,
+            logger,
         }
     }
 
@@ -67,6 +71,10 @@ impl KernelRouter {
 
     pub fn storage(&self) -> &Arc<DomainStorageEngine> {
         &self.storage
+    }
+
+    pub fn logger(&self) -> &Arc<KernelLogHub> {
+        &self.logger
     }
 
     /// Returns the per-domain serialization mutex used to guarantee atomic generation isolation.
@@ -257,6 +265,17 @@ impl KernelRouter {
             }
             DomainToKernelFrame::Receipt(inbound) => {
                 self.handle_inbound_receipt(authenticated_domain, inbound);
+                None
+            }
+            DomainToKernelFrame::Log(payload) => {
+                let mut record = payload.into_record();
+                if record.component.is_empty() {
+                    record.component = authenticated_domain.to_string();
+                }
+                if record.layer.is_empty() {
+                    record.layer = "DOMAIN".to_string();
+                }
+                self.logger.reinject(record);
                 None
             }
         }

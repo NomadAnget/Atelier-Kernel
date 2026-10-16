@@ -42,6 +42,10 @@ domain = AtelierDomain()
 
 @domain.handler("echo")
 def on_echo(msg, ctx):
+    domain.logger.info("processing echo %s", msg.data.get("val"), layer="TEST", component="demo")
+    domain.logger.phase("INFO", "start", "starting calc", layer="ENGINES")
+    domain.logger.progress("calculating", key="calc_1", frac=0.6, waiting=False, done=False)
+    domain.logger.progress("calc done", key="calc_1", frac=1.0, done=True)
     return {"reply": msg.data.get("val")}
 
 @domain.handler("fail_op")
@@ -111,6 +115,10 @@ const { AtelierDomain, DomainExecutionFailed } = require("./domains/atelier_sdk"
 const domain = new AtelierDomain();
 
 domain.handler("echo", (msg, ctx) => {
+  domain.logger.info("processing echo " + msg.data.val, { layer: "TEST", component: "demo" });
+  domain.logger.phase("INFO", "start", "starting calc", { layer: "ENGINES" });
+  domain.logger.progress("calculating", { key: "calc_1", frac: 0.6, waiting: false, done: false });
+  domain.logger.progress("calc done", { key: "calc_1", frac: 1.0, done: true });
   return { reply: msg.data.val };
 });
 
@@ -227,6 +235,37 @@ def main():
         assert unknown_stages[2]["status"] == "execution_failed"
         assert "Unknown handler" in unknown_stages[2]["data"]["error"]
     print("  [OK] Unknown handler rejection identical")
+
+    # 6. Structured Multi-State Logging consistency (info, phase start, progress, progress done)
+    for lang, frames in [("Python", py_frames), ("Node.js", node_frames)]:
+        log_frames = [f for f in frames if f.get("frame_type") == "log"]
+        assert len(log_frames) == 4, f"{lang} expected 4 log frames, got {len(log_frames)}"
+
+        info_log = log_frames[0]["record"]
+        assert info_log["level"] == "INFO"
+        assert info_log["layer"] == "TEST"
+        assert info_log["component"] == "demo"
+        assert "processing echo 42" in info_log["message"]
+        assert not info_log["ephemeral"]
+
+        phase_log = log_frames[1]["record"]
+        assert phase_log["level"] == "INFO"
+        assert phase_log["phase"] == "start"
+        assert phase_log["layer"] == "ENGINES"
+        assert phase_log["message"] == "starting calc"
+
+        prog_log = log_frames[2]["record"]
+        assert prog_log["ephemeral"] is True
+        assert prog_log["key"] == "calc_1"
+        assert abs(prog_log["frac"] - 0.6) < 1e-5
+        assert not prog_log["done"]
+
+        done_log = log_frames[3]["record"]
+        assert done_log["ephemeral"] is True
+        assert done_log["key"] == "calc_1"
+        assert abs(done_log["frac"] - 1.0) < 1e-5
+        assert done_log["done"] is True
+    print("  [OK] Structured multi-state logging framing (info/phase/progress) identical")
 
     print("\nALL MULTI-LANGUAGE SDK BEHAVIORS 100% CONSISTENT!")
 

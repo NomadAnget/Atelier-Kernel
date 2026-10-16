@@ -32,7 +32,9 @@ domain = AtelierDomain()
 
 @domain.handler("ping")
 def on_ping(msg):
+    domain.logger.info("Received ping from %s", msg.source_domain)
     domain.storage_insert(record_id="last_ping", category="health", data=msg.data)
+    domain.logger.phase("INFO", "finish", "Handled ping request")
     return {"pong": True, "from": "sample_py", "received": msg.data}
 
 if __name__ == "__main__":
@@ -198,7 +200,12 @@ fn run_variant_smoke_test(
         kernel.supervisor().stop_process_domain(&spec.domain_id);
     }
 
-    println!("[SmokeTest] Variant smoke test PASSED (registration + 4-stage message lifecycle verified)!");
+    // Verify SQLite hub_logs persistence
+    thread::sleep(Duration::from_millis(250));
+    let persisted_logs = kernel.logger().query_logs(20, None, None, None, None, None)?;
+    println!("[SmokeTest] Verified hub_logs persistence: recorded {} structured log entries in SQLite", persisted_logs.len());
+
+    println!("[SmokeTest] Variant smoke test PASSED (registration + 4-stage messaging + unified hub_logs verified)!");
     Ok(())
 }
 

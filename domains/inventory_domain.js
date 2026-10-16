@@ -17,8 +17,10 @@ const stockLedger = {
 domain.handler("deduct", (msg) => {
   const sku = msg.data.sku || "ATELIER-GEAR-01";
   const qty = Number(msg.data.qty || 1);
+  domain.logger.phase("INFO", "start", `Deducting ${qty}x ${sku} from inventory`, { layer: "DOMAIN" });
   const current = stockLedger[sku] ?? 100;
   if (current < qty) {
+    domain.logger.error(`Failed to deduct ${sku}: requested ${qty} but available ${current}`, { layer: "DOMAIN" });
     throw new DomainExecutionFailed({
       error: "insufficient_stock",
       sku,
@@ -32,6 +34,8 @@ domain.handler("deduct", (msg) => {
     remaining: stockLedger[sku],
     updated_by: "inventory (Node.js)",
   });
+  domain.logger.info(`Updated stock for ${sku}, remaining: ${stockLedger[sku]}`, { layer: "DOMAIN" });
+  domain.logger.phase("INFO", "finish", `Deduction completed for ${sku}`, { layer: "DOMAIN" });
   return {
     ok: true,
     runtime: "Node.js (atelier_sdk)",

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
+use crate::logging::{LogRecord, now_secs_f64};
 use crate::protocol::{
     ContractStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
     KERNEL_STORAGE_TARGET, KernelToDomainFrame, MSG_REGISTER_HANDLERS, MSG_STORAGE_DELETE,
@@ -191,7 +192,7 @@ impl DomainSupervisor {
         cmd.args(&spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
 
         if let Some(dir) = &spec.working_dir {
             cmd.current_dir(dir);
@@ -214,7 +215,7 @@ impl DomainSupervisor {
                         .args(&spec.args)
                         .stdin(Stdio::piped())
                         .stdout(Stdio::piped())
-                        .stderr(Stdio::inherit());
+                        .stderr(Stdio::piped());
                     if let Some(dir) = &spec.working_dir {
                         fallback.current_dir(dir);
                     }
@@ -246,6 +247,7 @@ impl DomainSupervisor {
             .stdout
             .take()
             .ok_or_else(|| SupervisorError::StdioCaptureFailed(domain_id.clone()))?;
+        let child_stderr = child.stderr.take();
 
         let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
         let instance_id = self.router.attach_domain_pipe(&domain_id, tx);
@@ -279,7 +281,7 @@ impl DomainSupervisor {
             .ok();
 
         // Reader thread: Domain ChildStdout -> Kernel (physically bound to `(domain_id, instance_id)`)
-        let reader_domain = domain_id;
+        let reader_domain = domain_id.clone();
         let router_ref = Arc::clone(&self.router);
         let stopping_ref = Arc::clone(&stopping);
         thread::Builder::new()
@@ -309,6 +311,43 @@ impl DomainSupervisor {
                 }
             })
             .ok();
+
+        // Fallback Stderr text pump: captures unhandled stderr / print / tracebacks and routes into unified logger
+        if let Some(child_stderr) = child_stderr {
+            let stderr_domain = domain_id;
+            let logger_ref = Arc::clone(self.router.logger());
+            let stopping_ref = Arc::clone(&stopping);
+            thread::Builder::new()
+                .name(format!("kernel-pipe-err-{stderr_domain}-{instance_id}"))
+                .spawn(move || {
+                    let reader = BufReader::new(child_stderr);
+                    for line in reader.lines().flatten() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if stopping_ref.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        logger_ref.reinject(LogRecord {
+                            id: None,
+                            ts: now_secs_f64(),
+                            level: "WARN".to_string(),
+                            layer: "SUBPROC".to_string(),
+                            component: stderr_domain.clone(),
+                            message: trimmed.to_string(),
+                            phase: String::new(),
+                            console_only: false,
+                            ephemeral: false,
+                            key: None,
+                            frac: None,
+                            waiting: false,
+                            done: false,
+                        });
+                    }
+                })
+                .ok();
+        }
 
         Ok(pid)
     }

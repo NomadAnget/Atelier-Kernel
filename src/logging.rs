@@ -34,6 +34,9 @@ fn default_info_level() -> String {
 /// 3. **Console Only**: `console_only=true` (high-frequency heartbeats). Printed only to terminal, excluded from both `hub_logs` and SSE fanout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogRecord {
+    /// Kernel-bound origin; None for historical records predating this field.
+    #[serde(default)]
+    pub source_domain: Option<String>,
     #[serde(default)]
     pub id: Option<i64>,
     #[serde(default = "now_secs_f64")]
@@ -72,6 +75,7 @@ pub struct LogRecord {
 impl Default for LogRecord {
     fn default() -> Self {
         Self {
+            source_domain: None,
             id: None,
             ts: now_secs_f64(),
             level: "INFO".to_string(),
@@ -173,6 +177,18 @@ impl LogStore {
         conn_writer.execute_batch(&ddl)?;
         conn_reader.execute_batch(&ddl)?;
 
+        // Additive migration; preserve unknown origins of pre-upgrade rows.
+        for conn in [&conn_writer, &conn_reader] {
+            let present = {
+                let mut stmt = conn.prepare("PRAGMA table_info(hub_logs)")?;
+                let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                names.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == "source_domain")
+            };
+            if !present {
+                conn.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;")?;
+            }
+        }
+
         let (tx, rx) = mpsc::sync_channel::<LogRecord>(10_000);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
@@ -242,8 +258,8 @@ impl LogStore {
                     let insert_res = {
                         let stmt = tx.prepare_cached(
                             &format!(
-                                "INSERT INTO {LOGS_TABLE} (ts, level, layer, component, message, phase)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                                "INSERT INTO {LOGS_TABLE} (ts, level, layer, component, message, phase, source_domain)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
                             )
                         );
                         if let Ok(mut statement) = stmt {
@@ -255,6 +271,7 @@ impl LogStore {
                                     rec.component,
                                     rec.message,
                                     rec.phase,
+                                    rec.source_domain,
                                 ]);
                             }
                             Ok(())
@@ -290,7 +307,7 @@ impl LogStore {
     ) -> Result<Vec<LogRecord>, StorageError> {
         let conn = self.query_conn.lock();
         let mut sql = format!(
-            "SELECT id, ts, level, layer, component, message, phase FROM {LOGS_TABLE} WHERE 1=1"
+            "SELECT id, ts, level, layer, component, message, phase, source_domain FROM {LOGS_TABLE} WHERE 1=1"
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -331,6 +348,7 @@ impl LogStore {
 
         let rows = stmt.query_map(param_refs.as_slice(), |row| {
             Ok(LogRecord {
+                source_domain: row.get(7)?,
                 id: Some(row.get(0)?),
                 ts: row.get(1)?,
                 level: row.get(2)?,
@@ -406,6 +424,9 @@ impl KernelLogHub {
     /// Core relay entry point: reinjects a structured log record from remote child domains or internal kernel subsystems.
     /// Preserves complete field fidelity (level, layer, component, phase, key, frac, waiting, done).
     pub fn reinject(&self, mut record: LogRecord) {
+        if record.source_domain.is_none() {
+            record.source_domain = Some("kernel".to_string());
+        }
         if record.ts <= 0.0 {
             record.ts = now_secs_f64();
         }
@@ -510,6 +531,7 @@ impl KernelLogHub {
         done: bool,
     ) {
         self.reinject(LogRecord {
+            source_domain: Some("kernel".to_string()),
             id: None,
             ts: now_secs_f64(),
             level: "INFO".to_string(),
@@ -528,6 +550,7 @@ impl KernelLogHub {
 
     fn log_level(&self, level: &str, layer: &str, component: &str, message: String, phase: &str) {
         self.reinject(LogRecord {
+            source_domain: Some("kernel".to_string()),
             id: None,
             ts: now_secs_f64(),
             level: level.to_string(),

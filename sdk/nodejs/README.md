@@ -5,7 +5,7 @@ Official zero-dependency Node.js / TypeScript SDK for building **Atelier Kernel*
 ## Installation
 
 ```bash
-npm install ./atelier-sdk-0.1.0.tgz
+npm install ./atelier-sdk-0.1.1.tgz
 ```
 
 ## Quick Start
@@ -23,3 +23,5 @@ domain.handler("deduct", (msg) => {
 
 domain.run();
 ```
+
+Log records returned by the kernel observer include source_domain (kernel-bound IPC owner, kernel for internal records, null for historical records before v0.1.1). SDK callers do not need to supply it; a claimed source is overwritten by the kernel.

@@ -6,6 +6,24 @@ use atelier_kernel::{
 };
 use serde_json::json;
 
+#[test]
+fn test_log_origin_additive_migration_and_restart() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp").join(format!("origin-migration-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("logs.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE hub_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, level TEXT NOT NULL, layer TEXT DEFAULT '', component TEXT DEFAULT '', message TEXT NOT NULL, phase TEXT DEFAULT ''); INSERT INTO hub_logs(ts,level,layer,component,message) VALUES(1,'INFO','ENGINES','worker','legacy');").unwrap();
+    }
+    for _ in 0..2 {
+        let kernel = AtelierKernel::open_with_db(&path).unwrap();
+        kernel.logger().set_console_enabled(false);
+        let rows = kernel.logger().query_logs(100, None, None, None, None, None).unwrap();
+        assert_eq!(rows.iter().find(|r| r.message == "legacy").unwrap().source_domain, None);
+    }
+}
+
 /// 1. Tests domain handler registration, `<domain>.<handler>` routing, and `TargetInvalid` pre-send interception.
 #[test]
 fn test_registration_routing_and_target_invalid_interception() {
@@ -534,6 +552,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
 
     // 2. Log high-frequency heartbeat with `console_only = true`
     kernel.logger().reinject(atelier_kernel::LogRecord {
+        source_domain: None,
         id: None,
         ts: atelier_kernel::logging::now_secs_f64(),
         level: "DEBUG".to_string(),
@@ -585,7 +604,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
     kernel.router().handle_raw_pipe_line_for_instance(
         "order",
         1,
-        r#"{"frame_type":"log","record":{"level":"INFO","layer":"DOMAIN","component":"order","message":"Order #1001 processed","phase":"finish"}}"#,
+        r#"{"frame_type":"log","record":{"source_domain":"spoofed","level":"INFO","layer":"DOMAIN","component":"order","message":"Order #1001 processed","phase":"finish"}}"#,
     );
 
     // Drain real-time subscriber messages
@@ -600,6 +619,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
     // - 1 pipe log ("Order #1001 processed")
     // NOTE: console_only heartbeat was NOT sent to subscribers!
     assert_eq!(received_records.len(), 5);
+    assert_eq!(received_records.iter().find(|r| r.message == "Order #1001 processed").unwrap().source_domain.as_deref(), Some("order"));
     assert!(!received_records.iter().any(|r| r.message == "tick-heartbeat"));
 
     // Wait briefly for LogStore async writer batch to flush to disk
@@ -614,6 +634,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
 
     let start_log = stored_logs.iter().find(|l| l.message == "Initializing neural weights").expect("start log persisted");
     assert_eq!(start_log.phase, "start");
+    assert_eq!(start_log.source_domain.as_deref(), Some("kernel"));
     assert_eq!(start_log.layer, "ENGINES");
 
     let finish_log = stored_logs.iter().find(|l| l.message == "Weights loaded successfully").expect("finish log persisted");
@@ -622,6 +643,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
     let pipe_log = stored_logs.iter().find(|l| l.message == "Order #1001 processed").expect("pipe log persisted");
     assert_eq!(pipe_log.component, "order");
     assert_eq!(pipe_log.phase, "finish");
+    assert_eq!(pipe_log.source_domain.as_deref(), Some("order"));
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

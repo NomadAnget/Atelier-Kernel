@@ -330,6 +330,7 @@ impl DomainSupervisor {
                             break;
                         }
                         logger_ref.reinject(LogRecord {
+                            source_domain: Some(stderr_domain.clone()),
                             id: None,
                             ts: now_secs_f64(),
                             level: "WARN".to_string(),

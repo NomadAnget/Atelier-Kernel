@@ -269,6 +269,7 @@ impl KernelRouter {
             }
             DomainToKernelFrame::Log(payload) => {
                 let mut record = payload.into_record();
+                record.source_domain = Some(authenticated_domain.to_string());
                 if record.component.is_empty() {
                     record.component = authenticated_domain.to_string();
                 }

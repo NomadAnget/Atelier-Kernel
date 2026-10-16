@@ -35,3 +35,6 @@
 | **按域存储引擎** | `src/storage.rs` | 基于 SQLite 的按域建表与“写隔离、读可跨表”存储引擎，响应 `StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete` 消息并产生标准四阶段回执。 |
 | **契约校验与自动路由器** | `src/router.rs` | 维护 `<domain>.<handler>` 路由表、执行 `TargetInvalid` 零盲发拦截、多目标独立分发、回执归属校验与状态推进。 |
 | **域宿主与管道生命周期** | `src/supervisor.rs` | 通过 OS `Stdio` 管道拉起多语言子进程、物理绑定 `domain_id` 身份、监控崩溃退出并自动触发 `ExecutionFailed` 恢复。 |
+# Log origin contract (v0.1.1)
+
+Every log record exposes `source_domain`. For domain IPC frames the kernel overwrites this field with the authenticated pipe owner, regardless of any claimed origin. Captured stderr uses the supervised domain ID. Kernel-generated records use `kernel`. SQLite adds this nullable column without rewriting historical records; pre-upgrade rows remain null (unknown), never inferred from layer/component. History and SSE carry the same field; old SDKs remain compatible and need not provide it.

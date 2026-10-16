@@ -5,7 +5,7 @@ Official zero-dependency Python SDK for building **Atelier Kernel** domains.
 ## Installation
 
 ```bash
-pip install atelier_sdk-0.1.0-py3-none-any.whl
+pip install atelier_sdk-0.1.1-py3-none-any.whl
 ```
 
 ## Quick Start
@@ -24,3 +24,5 @@ def on_create(msg):
 if __name__ == "__main__":
     domain.run()
 ```
+
+Log records returned by the kernel observer include source_domain (kernel-bound IPC owner, kernel for internal records, null for historical records before v0.1.1). SDK callers do not need to supply it; a claimed source is overwritten by the kernel.

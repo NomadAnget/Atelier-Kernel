@@ -63,19 +63,46 @@ fn default_web_bind() -> String {
 }
 
 impl KernelBootConfig {
-    /// Loads `KernelBootConfig` from a JSON file path.
+    /// Loads `KernelBootConfig` from a JSON file path and resolves relative `db_path`
+    /// and `working_dir` entries relative to the configuration file's parent directory.
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self, SupervisorError> {
-        let path_str = path.as_ref().display().to_string();
-        let raw = std::fs::read_to_string(&path).map_err(|source| {
+        let path_ref = path.as_ref();
+        let path_str = path_ref.display().to_string();
+        let raw = std::fs::read_to_string(path_ref).map_err(|source| {
             SupervisorError::ConfigReadFailed {
                 path: path_str.clone(),
                 source,
             }
         })?;
-        serde_json::from_str(&raw).map_err(|source| SupervisorError::ConfigParseFailed {
-            path: path_str,
-            source,
-        })
+        let mut cfg: Self =
+            serde_json::from_str(&raw).map_err(|source| SupervisorError::ConfigParseFailed {
+                path: path_str,
+                source,
+            })?;
+
+        if let Some(base_dir) = path_ref
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty() && *p != std::path::Path::new("."))
+        {
+            let db_p = std::path::Path::new(&cfg.db_path);
+            if db_p.is_relative() {
+                cfg.db_path = base_dir.join(db_p).to_string_lossy().to_string();
+            }
+            for spec in &mut cfg.domains {
+                match &spec.working_dir {
+                    None => {
+                        spec.working_dir = Some(base_dir.to_string_lossy().to_string());
+                    }
+                    Some(dir) if std::path::Path::new(dir).is_relative() => {
+                        spec.working_dir =
+                            Some(base_dir.join(dir).to_string_lossy().to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(cfg)
     }
 }
 

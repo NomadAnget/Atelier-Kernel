@@ -1,12 +1,15 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atelier_kernel::{
-    AtelierKernel, InteractiveFrontendDomain, KernelBootConfig, WebFrontendDomain,
+    AtelierKernel, ContractStatus, DomainStatus, InteractiveFrontendDomain, KernelBootConfig,
+    KernelToDomainFrame, WebFrontendDomain,
 };
+use serde_json::json;
 
 const DEFAULT_TEMPLATE_JSON: &str = r#"{
   "db_path": "./data/atelier_kernel.db",
@@ -58,6 +61,147 @@ fn init_variant_skeleton(target_dir: &str) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Boots a variant configuration, verifies that all configured domains register their handlers,
+/// dispatches a live probe message to each domain, verifies the 4-stage receipt lifecycle
+/// (`Sent -> Received -> Started -> Completed`), and exits cleanly.
+fn run_variant_smoke_test(
+    config_path: &str,
+    boot_config: &KernelBootConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("[SmokeTest] Booting variant from config: {}", config_path);
+    let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
+
+    if boot_config.domains.is_empty() {
+        return Err("No domains declared in boot configuration".into());
+    }
+
+    let spawn_results = kernel.supervisor().boot_from_config(boot_config);
+    for (domain_id, res) in spawn_results {
+        match res {
+            Ok(pid) => println!("[SmokeTest] Spawned domain '{}' (pid={})", domain_id, pid),
+            Err(err) => return Err(format!("Failed to spawn domain '{}': {}", domain_id, err).into()),
+        }
+    }
+
+    // 1. Wait for all configured domains to register handlers and become Active
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let all_active = boot_config.domains.iter().all(|spec| {
+            kernel.router().domain_status(&spec.domain_id) == Some(DomainStatus::Active)
+                && kernel
+                    .router()
+                    .active_routes()
+                    .iter()
+                    .any(|r| r.starts_with(&format!("{}.", spec.domain_id)))
+        });
+        if all_active {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "Timed out waiting for domains to register handlers. Current routes: {:?}",
+                kernel.router().active_routes()
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+
+    let active_routes = kernel.router().active_routes();
+    println!("[SmokeTest] All configured domains Active! Registered routes: {:?}", active_routes);
+
+    // 2. Attach probe domain and send a message to the first registered route of each domain
+    let probe = kernel.attach_domain("smoke_verifier");
+    let mut target_routes = Vec::new();
+    for spec in &boot_config.domains {
+        let prefix = format!("{}.", spec.domain_id);
+        if let Some(route) = active_routes.iter().find(|r| r.starts_with(&prefix)) {
+            target_routes.push(route.clone());
+        }
+    }
+
+    let msg_id = probe.send(
+        target_routes.clone(),
+        "VariantSmokeProbe",
+        json!({ "smoke_test": true }),
+        json!({ "hello": "variant_verification" }),
+    );
+    println!(
+        "[SmokeTest] Dispatched probe message '{}' to targets {:?}",
+        msg_id, target_routes
+    );
+
+    let mut completed_targets = HashSet::new();
+    let mut seen_stages_per_target: std::collections::HashMap<String, Vec<ContractStatus>> =
+        std::collections::HashMap::new();
+
+    let msg_deadline = Instant::now() + Duration::from_secs(5);
+    while completed_targets.len() < target_routes.len() {
+        if Instant::now() >= msg_deadline {
+            return Err(format!(
+                "Timed out waiting for 4-stage receipts. Seen stages: {:?}",
+                seen_stages_per_target
+            )
+            .into());
+        }
+        for frame in probe.drain_frames() {
+            if let KernelToDomainFrame::Receipt(r) = frame
+                && r.message_id == msg_id
+            {
+                seen_stages_per_target
+                    .entry(r.target.clone())
+                    .or_default()
+                    .push(r.status);
+                if r.status == ContractStatus::Completed {
+                    println!(
+                        "[SmokeTest] Target '{}' completed with payload: {}",
+                        r.target,
+                        r.data.unwrap_or_default()
+                    );
+                    completed_targets.insert(r.target);
+                } else if r.status == ContractStatus::ExecutionFailed
+                    || r.status == ContractStatus::TargetInvalid
+                    || r.status == ContractStatus::ContractInvalid
+                {
+                    return Err(format!(
+                        "Probe failed for target '{}' with status {:?}: {:?}",
+                        r.target, r.status, r.data
+                    )
+                    .into());
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    // Verify every target went through Sent -> Received -> Started -> Completed
+    for route in &target_routes {
+        let stages = seen_stages_per_target.get(route).cloned().unwrap_or_default();
+        if stages
+            != vec![
+                ContractStatus::Sent,
+                ContractStatus::Received,
+                ContractStatus::Started,
+                ContractStatus::Completed,
+            ]
+        {
+            return Err(format!(
+                "Unexpected receipt stages for '{}': {:?}",
+                route, stages
+            )
+            .into());
+        }
+    }
+
+    // Cleanly stop all domains
+    for spec in &boot_config.domains {
+        kernel.supervisor().stop_process_domain(&spec.domain_id);
+    }
+
+    println!("[SmokeTest] Variant smoke test PASSED (registration + 4-stage message lifecycle verified)!");
+    Ok(())
+}
+
 fn print_help() {
     println!("Atelier Kernel v{} — Single-Machine Multi-Domain Microkernel Runtime", env!("CARGO_PKG_VERSION"));
     println!();
@@ -67,6 +211,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("  --config <path>   Path to boot configuration JSON (default: ./kernel_boot.json)");
     println!("  --headless        Run pure microkernel supervisor without Web UI dashboard");
+    println!("  --smoke-test      Boot variant, verify domain registration & 4-stage messaging, and exit");
     println!("  --cli             Run interactive CLI REPL frontend domain");
     println!("  --auto, -a        Run automated 7-stage kernel verification suite and exit");
     println!("  --init <dir>      Initialize a new product variant directory with config template");
@@ -103,6 +248,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or("./kernel_boot.json");
 
     let boot_config = KernelBootConfig::load_from_file(config_path)?;
+
+    if args.iter().any(|a| a == "--smoke-test") {
+        return run_variant_smoke_test(config_path, &boot_config);
+    }
 
     if args.iter().any(|a| a == "--auto" || a == "-a") {
         let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;

@@ -96,6 +96,14 @@ jobs:
           (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
           tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}
 
+      - name: End-to-End Variant Smoke Test (--init + --smoke-test)
+        shell: bash
+        run: |
+          pip install dist/kernel-runtime-${{ matrix.target_label }}/sdk/atelier_sdk-0.1.0-py3-none-any.whl
+          ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --init ./ci-smoke-variant
+          ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --config ./ci-smoke-variant/kernel_boot.json --smoke-test
+          rm -rf ./ci-smoke-variant
+
       - name: Upload Kernel Runtime Artifact (${{ matrix.target_label }})
         uses: actions/upload-artifact@v4
         with:

@@ -70,9 +70,17 @@ OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCHIVE_NAME="atelier-kernel-runtime-${OS}-${ARCH}.tar.gz"
 tar -C "${DIST_DIR}" -czf "${DIST_DIR}/${ARCHIVE_NAME}" kernel-runtime sdk
 
+echo "==> [5/5] Running End-to-End Variant Smoke Test (--init + --smoke-test)..."
+SMOKE_DIR="${DIST_DIR}/_smoke_variant"
+rm -rf "${SMOKE_DIR}"
+"${RUNTIME_OUT}/atelier-kernel" --init "${SMOKE_DIR}"
+PYTHONPATH="${SDK_OUT}/atelier_sdk-0.1.0-py3-none-any.whl" \
+  "${RUNTIME_OUT}/atelier-kernel" --config "${SMOKE_DIR}/kernel_boot.json" --smoke-test
+rm -rf "${SMOKE_DIR}"
+
 echo ""
 echo "================================================================"
-echo "Atelier Kernel Automated Packaging Complete!"
+echo "Atelier Kernel Automated Packaging & Verification Complete!"
 echo "  - Python SDK Wheel:   ${SDK_OUT}/atelier_sdk-0.1.0-py3-none-any.whl"
 echo "  - Node.js SDK NPM:    ${SDK_OUT}/atelier-sdk-0.1.0.tgz"
 echo "  - Kernel Binary:      ${RUNTIME_OUT}/atelier-kernel"

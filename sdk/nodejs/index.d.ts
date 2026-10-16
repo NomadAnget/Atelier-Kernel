@@ -11,14 +11,21 @@ export interface DeliveryMessage<TData = Record<string, any>, TParams = Record<s
 export interface StorageQueryOptions {
   domain?: string;
   recordId?: string;
+  record_id?: string;
   category?: string;
   filter?: Record<string, any>;
+  filter_map?: Record<string, any>;
   limit?: number;
 }
 
 export interface StorageDeleteOptions {
   recordId?: string;
+  record_id?: string;
   category?: string;
+}
+
+export interface AtelierDomainOptions {
+  stageDelayMs?: number;
 }
 
 export class DomainExecutionFailed extends Error {
@@ -27,10 +34,10 @@ export class DomainExecutionFailed extends Error {
 }
 
 export class AtelierDomain {
-  constructor();
+  constructor(options?: AtelierDomainOptions);
   handler<TData = Record<string, any>, TParams = Record<string, any>>(
     name: string,
-    fn: (msg: DeliveryMessage<TData, TParams>) => any | Promise<any>
+    fn: (msg: DeliveryMessage<TData, TParams>, domain: AtelierDomain) => any | Promise<any>
   ): this;
   onReceipt(fn: (receiptFrame: Record<string, any>) => void): this;
   send(
@@ -43,7 +50,15 @@ export class AtelierDomain {
   storageInsert(recordId: string, category: string, data: Record<string, any>, upsert?: boolean): number;
   storageUpdate(recordId: string, data: Record<string, any>, patch?: boolean): number;
   storageDelete(options?: StorageDeleteOptions): number;
+  storageDelete(recordId?: string, category?: string): number;
   storageQuery(options?: StorageQueryOptions): number;
+  storageQuery(
+    domain?: string,
+    recordId?: string,
+    category?: string,
+    filter?: Record<string, any>,
+    limit?: number
+  ): number;
   reportReceipt(
     messageId: string,
     target: string,

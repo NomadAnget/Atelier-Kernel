@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Atelier Kernel Official Node.js Domain SDK (`atelier_sdk.js`).
  *
@@ -17,10 +16,11 @@ class DomainExecutionFailed extends Error {
 }
 
 class AtelierDomain {
-  constructor() {
+  constructor({ stageDelayMs = 0 } = {}) {
     this._seqCounter = 1;
     this._handlers = new Map();
     this._receiptCallbacks = [];
+    this._stageDelayMs = stageDelayMs;
   }
 
   /**
@@ -84,29 +84,41 @@ class AtelierDomain {
 
   /**
    * Deletes record(s) from this domain's dedicated storage table via `kernel.storage`.
+   * Supports both object options `{ recordId, category }` and positional arguments `(recordId, category)`.
    */
-  storageDelete({ recordId = undefined, category = undefined } = {}) {
+  storageDelete(arg1, arg2) {
     const params = {};
-    if (recordId !== undefined) params.record_id = recordId;
-    if (category !== undefined) params.category = category;
+    if (typeof arg1 === "object" && arg1 !== null) {
+      if (arg1.recordId !== undefined) params.record_id = arg1.recordId;
+      if (arg1.record_id !== undefined) params.record_id = arg1.record_id;
+      if (arg1.category !== undefined) params.category = arg1.category;
+    } else {
+      if (arg1 !== undefined) params.record_id = arg1;
+      if (arg2 !== undefined) params.category = arg2;
+    }
     return this.send(["kernel.storage"], "StorageDelete", params, {});
   }
 
   /**
    * Queries this domain's storage table or another domain's storage table (read-only cross-domain access).
+   * Supports both object options `{ domain, recordId, category, filter, limit }` and positional arguments.
    */
-  storageQuery({
-    domain = undefined,
-    recordId = undefined,
-    category = undefined,
-    filter = undefined,
-    limit = 500,
-  } = {}) {
+  storageQuery(arg1, recordId, category, filter, limit = 500) {
     const params = { limit };
-    if (domain !== undefined) params.domain = domain;
-    if (recordId !== undefined) params.record_id = recordId;
-    if (category !== undefined) params.category = category;
-    if (filter !== undefined) params.filter = filter;
+    if (typeof arg1 === "object" && arg1 !== null) {
+      if (arg1.domain !== undefined) params.domain = arg1.domain;
+      if (arg1.recordId !== undefined) params.record_id = arg1.recordId;
+      if (arg1.record_id !== undefined) params.record_id = arg1.record_id;
+      if (arg1.category !== undefined) params.category = arg1.category;
+      if (arg1.filter !== undefined) params.filter = arg1.filter;
+      if (arg1.filter_map !== undefined) params.filter = arg1.filter_map;
+      if (arg1.limit !== undefined) params.limit = arg1.limit;
+    } else {
+      if (arg1 !== undefined) params.domain = arg1;
+      if (recordId !== undefined) params.record_id = recordId;
+      if (category !== undefined) params.category = category;
+      if (filter !== undefined) params.filter = filter;
+    }
     return this.send(["kernel.storage"], "StorageQuery", params, {});
   }
 
@@ -173,6 +185,9 @@ class AtelierDomain {
       // Stage 2 (`Received`) and Stage 3 (`Started`)
       this.reportReceipt(msgId, target, "received", null);
       this.reportReceipt(msgId, target, "started", null);
+      if (this._stageDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this._stageDelayMs));
+      }
 
       const handlerFn = this._handlers.get(handlerName);
       if (!handlerFn) {
@@ -183,7 +198,7 @@ class AtelierDomain {
       }
 
       try {
-        const result = await handlerFn({
+        const msg = {
           message_id: msgId,
           source_domain: frame.source_domain,
           target,
@@ -191,7 +206,8 @@ class AtelierDomain {
           message_type: frame.message_type || "",
           params: frame.params || {},
           data: frame.data || {},
-        });
+        };
+        const result = await handlerFn(msg, this);
         this.reportReceipt(msgId, target, "completed", result ?? null);
       } catch (err) {
         if (err instanceof DomainExecutionFailed) {

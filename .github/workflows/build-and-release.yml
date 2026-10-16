@@ -40,6 +40,10 @@ jobs:
           pip install dist/sdk/atelier_sdk-*.whl
           python3 -c "from atelier_sdk import AtelierDomain, __version__; print('Verified Python SDK version:', __version__)"
 
+      - name: Run Cross-Language SDK Consistency Test Suite
+        run: |
+          python3 tests/sdk_consistency_test.py
+
       - name: Upload SDK Packages Artifact
         uses: actions/upload-artifact@v4
         with:

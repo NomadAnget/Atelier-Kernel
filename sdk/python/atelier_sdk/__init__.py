@@ -6,6 +6,8 @@ registration (`kernel.registry`), 4-stage receipt reporting (`Received` ->
 `Started` -> `Completed` / `ExecutionFailed`), and `kernel.storage` CRUD helpers
 so business domains only need to import `AtelierDomain` and declare handlers.
 """
+import asyncio
+import inspect
 import json
 import sys
 import threading
@@ -40,6 +42,10 @@ class DeliveryMessage(dict):
         return self["target"]
 
     @property
+    def targets(self) -> List[str]:
+        return self.get("targets") or [self.target]
+
+    @property
     def message_type(self) -> str:
         return self.get("message_type", "")
 
@@ -58,7 +64,7 @@ class AtelierDomain:
     def __init__(self, stage_delay_sec: float = 0.0):
         self._seq_counter = 1
         self._write_lock = threading.Lock()
-        self._handlers: Dict[str, Callable[[DeliveryMessage], Any]] = {}
+        self._handlers: Dict[str, Callable[..., Any]] = {}
         self._receipt_callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._stage_delay_sec = stage_delay_sec
 
@@ -67,7 +73,7 @@ class AtelierDomain:
         if not name or "." in name:
             raise ValueError(f"Invalid handler name '{name}': must be non-empty and not contain '.'")
 
-        def decorator(func: Callable[[DeliveryMessage], Any]):
+        def decorator(func: Callable[..., Any]):
             self._handlers[name] = func
             return func
 
@@ -155,6 +161,7 @@ class AtelierDomain:
         domain: Optional[str] = None,
         record_id: Optional[str] = None,
         category: Optional[str] = None,
+        filter: Optional[Dict[str, Any]] = None,
         filter_map: Optional[Dict[str, Any]] = None,
         limit: int = 500,
     ) -> int:
@@ -166,8 +173,9 @@ class AtelierDomain:
             params["record_id"] = record_id
         if category is not None:
             params["category"] = category
-        if filter_map is not None:
-            params["filter"] = filter_map
+        active_filter = filter if filter is not None else filter_map
+        if active_filter is not None:
+            params["filter"] = active_filter
         return self.send(
             targets=["kernel.storage"],
             message_type="StorageQuery",
@@ -250,7 +258,22 @@ class AtelierDomain:
                 continue
 
             try:
-                result = handler_fn(msg)
+                try:
+                    sig = inspect.signature(handler_fn)
+                    param_count = len(sig.parameters)
+                except Exception:
+                    param_count = 1
+
+                if param_count >= 2:
+                    call_res = handler_fn(msg, self)
+                else:
+                    call_res = handler_fn(msg)
+
+                if inspect.iscoroutine(call_res):
+                    result = asyncio.run(call_res)
+                else:
+                    result = call_res
+
                 self.report_receipt(msg_id, target, "completed", result)
             except DomainExecutionFailed as exc:
                 self.report_receipt(msg_id, target, "execution_failed", exc.payload)

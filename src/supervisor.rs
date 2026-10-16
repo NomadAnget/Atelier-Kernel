@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,18 @@ impl KernelBootConfig {
     }
 }
 
+pub fn default_auto_restart() -> bool {
+    true
+}
+
+pub fn default_max_restarts() -> Option<u32> {
+    Some(10)
+}
+
+pub fn default_restart_delay_ms() -> u64 {
+    500
+}
+
 /// Configuration for spawning a language-agnostic OS process Domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainProcessSpec {
@@ -116,6 +129,40 @@ pub struct DomainProcessSpec {
     pub args: Vec<String>,
     #[serde(default)]
     pub working_dir: Option<String>,
+    #[serde(default = "default_auto_restart")]
+    pub auto_restart: bool,
+    #[serde(default = "default_max_restarts")]
+    pub max_restarts: Option<u32>,
+    #[serde(default = "default_restart_delay_ms")]
+    pub restart_delay_ms: u64,
+}
+
+impl Default for DomainProcessSpec {
+    fn default() -> Self {
+        Self {
+            domain_id: String::new(),
+            command: String::new(),
+            args: Vec::new(),
+            working_dir: None,
+            auto_restart: default_auto_restart(),
+            max_restarts: default_max_restarts(),
+            restart_delay_ms: default_restart_delay_ms(),
+        }
+    }
+}
+
+impl DomainProcessSpec {
+    pub fn new(domain_id: impl Into<String>, command: impl Into<String>, args: Vec<String>) -> Self {
+        Self {
+            domain_id: domain_id.into(),
+            command: command.into(),
+            args,
+            working_dir: None,
+            auto_restart: default_auto_restart(),
+            max_restarts: default_max_restarts(),
+            restart_delay_ms: default_restart_delay_ms(),
+        }
+    }
 }
 
 struct ManagedProcess {
@@ -124,69 +171,57 @@ struct ManagedProcess {
     stopping: Arc<AtomicBool>,
 }
 
-/// Kernel Domain Supervisor: takes over starting and managing the lifecycle of
-/// language-agnostic Domains via OS parent-child anonymous `Stdio` pipes.
-pub struct DomainSupervisor {
+#[derive(Debug, Clone)]
+struct RestartTracker {
+    consecutive_restarts: u32,
+    last_spawn_instant: Option<Instant>,
+}
+
+struct RestartRequest {
+    domain_id: String,
+    failed_instance_id: u64,
+    exit_status: Option<String>,
+}
+
+struct DomainSupervisorInner {
     router: Arc<KernelRouter>,
     specs: RwLock<HashMap<String, DomainProcessSpec>>,
     processes: Mutex<HashMap<String, ManagedProcess>>,
+    stopped_domains: Mutex<HashSet<String>>,
+    restart_trackers: Mutex<HashMap<String, RestartTracker>>,
 }
 
-impl DomainSupervisor {
-    pub fn new(router: Arc<KernelRouter>) -> Self {
-        Self {
-            router,
-            specs: RwLock::new(HashMap::new()),
-            processes: Mutex::new(HashMap::new()),
+impl DomainSupervisorInner {
+    fn stop_process_internal(&self, domain_id: &str) -> bool {
+        let managed_opt = self.processes.lock().remove(domain_id);
+        if let Some(managed) = managed_opt {
+            managed.stopping.store(true, Ordering::SeqCst);
+            {
+                let mut child = managed.child.lock();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.router.mark_domain_faulted_for_instance(
+                domain_id,
+                Some(managed.instance_id),
+                "domain stopped by kernel supervisor",
+            );
+            true
+        } else {
+            false
         }
     }
 
-    pub fn router(&self) -> &Arc<KernelRouter> {
-        &self.router
-    }
-
-    /// Boots all domains declared in `config.domains`.
-    pub fn boot_from_config(&self, config: &KernelBootConfig) -> Vec<(String, Result<u32, SupervisorError>)> {
-        let mut results = Vec::new();
-        for spec in &config.domains {
-            let domain_id = spec.domain_id.clone();
-            let res = self.spawn_process_domain(spec.clone());
-            results.push((domain_id, res));
-        }
-        results
-    }
-
-    /// Respawns a previously registered process domain by its `domain_id`.
-    pub fn respawn_domain(&self, domain_id: &str) -> Result<u32, SupervisorError> {
-        let spec = self
-            .specs
-            .read()
-            .get(domain_id)
-            .cloned()
-            .ok_or_else(|| SupervisorError::UnknownDomainSpec(domain_id.to_string()))?;
-        self.spawn_process_domain(spec)
-    }
-
-    /// Returns the registered `DomainProcessSpec` for `domain_id`, if it is an external process domain.
-    pub fn get_spec(&self, domain_id: &str) -> Option<DomainProcessSpec> {
-        self.specs.read().get(domain_id).cloned()
-    }
-
-    /// Returns all registered external `DomainProcessSpec`s.
-    pub fn list_specs(&self) -> Vec<DomainProcessSpec> {
-        let mut list: Vec<DomainProcessSpec> = self.specs.read().values().cloned().collect();
-        list.sort_by(|a, b| a.domain_id.cmp(&b.domain_id));
-        list
-    }
-
-    /// Spawns a language-agnostic child process for `spec.domain_id` and binds its
-    /// `stdin` / `stdout` pipes directly to `spec.domain_id` in the Kernel.
-    pub fn spawn_process_domain(&self, spec: DomainProcessSpec) -> Result<u32, SupervisorError> {
+    fn spawn_process_internal(
+        &self,
+        spec: DomainProcessSpec,
+        restart_tx: Sender<RestartRequest>,
+    ) -> Result<u32, SupervisorError> {
         let domain_id = spec.domain_id.clone();
         self.specs.write().insert(domain_id.clone(), spec.clone());
 
         // Stop any existing process for this domain first.
-        let _ = self.stop_process_domain(&domain_id);
+        let _ = self.stop_process_internal(&domain_id);
 
         let mut cmd = Command::new(&spec.command);
         cmd.args(&spec.args)
@@ -264,6 +299,15 @@ impl DomainSupervisor {
             },
         );
 
+        {
+            let mut trackers = self.restart_trackers.lock();
+            let tracker = trackers.entry(domain_id.clone()).or_insert_with(|| RestartTracker {
+                consecutive_restarts: 0,
+                last_spawn_instant: None,
+            });
+            tracker.last_spawn_instant = Some(Instant::now());
+        }
+
         // Writer thread: Kernel -> Domain ChildStdin (JSON-Lines)
         let writer_domain = domain_id.clone();
         thread::Builder::new()
@@ -284,6 +328,8 @@ impl DomainSupervisor {
         let reader_domain = domain_id.clone();
         let router_ref = Arc::clone(&self.router);
         let stopping_ref = Arc::clone(&stopping);
+        let child_for_reader = Arc::clone(&child_arc);
+        let restart_tx_for_reader = restart_tx;
         thread::Builder::new()
             .name(format!("kernel-pipe-rx-{reader_domain}-{instance_id}"))
             .spawn(move || {
@@ -308,6 +354,18 @@ impl DomainSupervisor {
                         Some(instance_id),
                         "domain process exited or closed stdout pipe",
                     );
+
+                    // Reap child process to get exit status and prevent zombie process
+                    let exit_status = {
+                        let mut lock = child_for_reader.lock();
+                        lock.wait().ok().map(|s| s.to_string())
+                    };
+
+                    let _ = restart_tx_for_reader.send(RestartRequest {
+                        domain_id: reader_domain,
+                        failed_instance_id: instance_id,
+                        exit_status,
+                    });
                 }
             })
             .ok();
@@ -353,24 +411,317 @@ impl DomainSupervisor {
         Ok(pid)
     }
 
+    fn handle_restart_request(
+        self: &Arc<Self>,
+        req: RestartRequest,
+        restart_tx: &Sender<RestartRequest>,
+    ) {
+        // 1. Is this domain intentionally stopped?
+        if self.stopped_domains.lock().contains(&req.domain_id) {
+            return;
+        }
+
+        // 2. Check current process instance
+        let current_instance = {
+            let procs = self.processes.lock();
+            procs
+                .get(&req.domain_id)
+                .map(|p| (p.instance_id, p.stopping.load(Ordering::SeqCst)))
+        };
+
+        if let Some((inst_id, stopping)) = current_instance {
+            if stopping || inst_id != req.failed_instance_id {
+                // Either intentionally stopping or already replaced by a newer instance.
+                return;
+            }
+        }
+
+        // 3. Look up spec
+        let spec = match self.specs.read().get(&req.domain_id).cloned() {
+            Some(s) => s,
+            None => return,
+        };
+
+        if !spec.auto_restart {
+            self.router.logger().reinject(LogRecord {
+                source_domain: Some("kernel".to_string()),
+                id: None,
+                ts: now_secs_f64(),
+                level: "INFO".to_string(),
+                layer: "SUPERVISOR".to_string(),
+                component: req.domain_id.clone(),
+                message: format!(
+                    "Domain '{}' exited unexpectedly (instance_id={}), auto-restart disabled by configuration.",
+                    req.domain_id, req.failed_instance_id
+                ),
+                phase: String::new(),
+                console_only: false,
+                ephemeral: false,
+                key: None,
+                frac: None,
+                waiting: false,
+                done: false,
+            });
+            return;
+        }
+
+        // 4. Rate-limiting & max restarts check
+        let now = Instant::now();
+        let (attempt, allow_restart) = {
+            let mut trackers = self.restart_trackers.lock();
+            let tracker = trackers
+                .entry(req.domain_id.clone())
+                .or_insert_with(|| RestartTracker {
+                    consecutive_restarts: 0,
+                    last_spawn_instant: None,
+                });
+
+            // If the process had been running stably for > 5 seconds before crashing,
+            // reset consecutive restarts count.
+            if let Some(spawned_at) = tracker.last_spawn_instant {
+                if now.duration_since(spawned_at) > Duration::from_secs(5) {
+                    tracker.consecutive_restarts = 0;
+                }
+            }
+
+            tracker.consecutive_restarts += 1;
+            let attempt = tracker.consecutive_restarts;
+
+            let allowed = match spec.max_restarts {
+                Some(max) => attempt <= max,
+                None => true,
+            };
+            (attempt, allowed)
+        };
+
+        if !allow_restart {
+            self.router.logger().reinject(LogRecord {
+                source_domain: Some("kernel".to_string()),
+                id: None,
+                ts: now_secs_f64(),
+                level: "ERROR".to_string(),
+                layer: "SUPERVISOR".to_string(),
+                component: req.domain_id.clone(),
+                message: format!(
+                    "Domain '{}' exceeded maximum restart attempts ({:?}). Giving up automatic restart.",
+                    req.domain_id, spec.max_restarts
+                ),
+                phase: String::new(),
+                console_only: false,
+                ephemeral: false,
+                key: None,
+                frac: None,
+                waiting: false,
+                done: false,
+            });
+            return;
+        }
+
+        let delay_ms = spec.restart_delay_ms;
+        let exit_desc = req.exit_status.unwrap_or_else(|| "unknown".to_string());
+        self.router.logger().reinject(LogRecord {
+            source_domain: Some("kernel".to_string()),
+            id: None,
+            ts: now_secs_f64(),
+            level: "WARN".to_string(),
+            layer: "SUPERVISOR".to_string(),
+            component: req.domain_id.clone(),
+            message: format!(
+                "Domain '{}' exited unexpectedly (status: {}, instance_id={}). Auto-restarting in {}ms (attempt {})...",
+                req.domain_id,
+                exit_desc,
+                req.failed_instance_id,
+                delay_ms,
+                attempt
+            ),
+            phase: String::new(),
+            console_only: false,
+            ephemeral: false,
+            key: None,
+            frac: None,
+            waiting: false,
+            done: false,
+        });
+
+        // Spawn a background restart thread so this delay does not block other domains
+        let inner_clone = Arc::clone(self);
+        let domain_id = req.domain_id;
+        let failed_instance_id = req.failed_instance_id;
+        let restart_tx_for_thread = restart_tx.clone();
+        thread::Builder::new()
+            .name(format!("kernel-supervisor-restart-{domain_id}"))
+            .spawn(move || {
+                if delay_ms > 0 {
+                    thread::sleep(Duration::from_millis(delay_ms));
+                }
+                if inner_clone.stopped_domains.lock().contains(&domain_id) {
+                    return;
+                }
+                let should_spawn = {
+                    let procs = inner_clone.processes.lock();
+                    match procs.get(&domain_id) {
+                        Some(p) => {
+                            !p.stopping.load(Ordering::SeqCst)
+                                && p.instance_id == failed_instance_id
+                        }
+                        None => true,
+                    }
+                };
+                if should_spawn {
+                    match inner_clone.spawn_process_internal(spec, restart_tx_for_thread) {
+                        Ok(new_pid) => {
+                            inner_clone.router.logger().reinject(LogRecord {
+                                source_domain: Some("kernel".to_string()),
+                                id: None,
+                                ts: now_secs_f64(),
+                                level: "INFO".to_string(),
+                                layer: "SUPERVISOR".to_string(),
+                                component: domain_id.clone(),
+                                message: format!(
+                                    "Domain '{}' automatically restarted successfully (pid={})",
+                                    domain_id, new_pid
+                                ),
+                                phase: String::new(),
+                                console_only: false,
+                                ephemeral: false,
+                                key: None,
+                                frac: None,
+                                waiting: false,
+                                done: false,
+                            });
+                        }
+                        Err(err) => {
+                            inner_clone.router.logger().reinject(LogRecord {
+                                source_domain: Some("kernel".to_string()),
+                                id: None,
+                                ts: now_secs_f64(),
+                                level: "ERROR".to_string(),
+                                layer: "SUPERVISOR".to_string(),
+                                component: domain_id.clone(),
+                                message: format!(
+                                    "Domain '{}' auto-restart spawn failed: {}",
+                                    domain_id, err
+                                ),
+                                phase: String::new(),
+                                console_only: false,
+                                ephemeral: false,
+                                key: None,
+                                frac: None,
+                                waiting: false,
+                                done: false,
+                            });
+                        }
+                    }
+                }
+            })
+            .ok();
+    }
+}
+
+/// Kernel Domain Supervisor: takes over starting and managing the lifecycle of
+/// language-agnostic Domains via OS parent-child anonymous `Stdio` pipes.
+pub struct DomainSupervisor {
+    inner: Arc<DomainSupervisorInner>,
+    restart_tx: Sender<RestartRequest>,
+}
+
+impl DomainSupervisor {
+    pub fn new(router: Arc<KernelRouter>) -> Self {
+        let inner = Arc::new(DomainSupervisorInner {
+            router,
+            specs: RwLock::new(HashMap::new()),
+            processes: Mutex::new(HashMap::new()),
+            stopped_domains: Mutex::new(HashSet::new()),
+            restart_trackers: Mutex::new(HashMap::new()),
+        });
+        let (restart_tx, restart_rx) = mpsc::channel::<RestartRequest>();
+
+        let monitor_inner = Arc::clone(&inner);
+        let monitor_tx = restart_tx.clone();
+        thread::Builder::new()
+            .name("kernel-supervisor-monitor".to_string())
+            .spawn(move || {
+                while let Ok(req) = restart_rx.recv() {
+                    monitor_inner.handle_restart_request(req, &monitor_tx);
+                }
+            })
+            .ok();
+
+        Self { inner, restart_tx }
+    }
+
+    pub fn router(&self) -> &Arc<KernelRouter> {
+        &self.inner.router
+    }
+
+    /// Returns true if `domain_id` was explicitly stopped by kernel supervisor.
+    pub fn is_stopped(&self, domain_id: &str) -> bool {
+        self.inner.stopped_domains.lock().contains(domain_id)
+    }
+
+    /// Returns the consecutive restart attempt count for `domain_id`.
+    pub fn restart_count(&self, domain_id: &str) -> u32 {
+        self.inner
+            .restart_trackers
+            .lock()
+            .get(domain_id)
+            .map(|t| t.consecutive_restarts)
+            .unwrap_or(0)
+    }
+
+    /// Boots all domains declared in `config.domains`.
+    pub fn boot_from_config(&self, config: &KernelBootConfig) -> Vec<(String, Result<u32, SupervisorError>)> {
+        let mut results = Vec::new();
+        for spec in &config.domains {
+            let domain_id = spec.domain_id.clone();
+            let res = self.spawn_process_domain(spec.clone());
+            results.push((domain_id, res));
+        }
+        results
+    }
+
+    /// Respawns a previously registered process domain by its `domain_id`.
+    pub fn respawn_domain(&self, domain_id: &str) -> Result<u32, SupervisorError> {
+        let spec = self
+            .inner
+            .specs
+            .read()
+            .get(domain_id)
+            .cloned()
+            .ok_or_else(|| SupervisorError::UnknownDomainSpec(domain_id.to_string()))?;
+        self.inner.stopped_domains.lock().remove(domain_id);
+        self.inner.restart_trackers.lock().remove(domain_id);
+        self.spawn_process_domain(spec)
+    }
+
+    /// Returns the registered `DomainProcessSpec` for `domain_id`, if it is an external process domain.
+    pub fn get_spec(&self, domain_id: &str) -> Option<DomainProcessSpec> {
+        self.inner.specs.read().get(domain_id).cloned()
+    }
+
+    /// Returns all registered external `DomainProcessSpec`s.
+    pub fn list_specs(&self) -> Vec<DomainProcessSpec> {
+        let mut list: Vec<DomainProcessSpec> = self.inner.specs.read().values().cloned().collect();
+        list.sort_by(|a, b| a.domain_id.cmp(&b.domain_id));
+        list
+    }
+
+    /// Spawns a language-agnostic child process for `spec.domain_id` and binds its
+    /// `stdin` / `stdout` pipes directly to `spec.domain_id` in the Kernel.
+    pub fn spawn_process_domain(&self, spec: DomainProcessSpec) -> Result<u32, SupervisorError> {
+        self.inner.stopped_domains.lock().remove(&spec.domain_id);
+        self.inner.restart_trackers.lock().remove(&spec.domain_id);
+        self.inner
+            .spawn_process_internal(spec, self.restart_tx.clone())
+    }
+
     /// Stops a managed child process domain cleanly and revokes its routes.
     pub fn stop_process_domain(&self, domain_id: &str) -> bool {
-        let managed_opt = self.processes.lock().remove(domain_id);
-        if let Some(managed) = managed_opt {
-            managed.stopping.store(true, Ordering::SeqCst);
-            if let Some(mut child) = managed.child.try_lock() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            self.router.mark_domain_faulted_for_instance(
-                domain_id,
-                Some(managed.instance_id),
-                "domain stopped by kernel supervisor",
-            );
-            true
-        } else {
-            false
-        }
+        self.inner
+            .stopped_domains
+            .lock()
+            .insert(domain_id.to_string());
+        self.inner.stop_process_internal(domain_id)
     }
 
     /// Attaches an in-process domain pipe (useful for embedded Rust domains and fast integration tests).
@@ -378,11 +729,11 @@ impl DomainSupervisor {
     /// to `domain_id` by the Kernel.
     pub fn attach_in_process_domain(&self, domain_id: &str) -> DomainPipeClient {
         let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
-        let instance_id = self.router.attach_domain_pipe(domain_id, tx);
+        let instance_id = self.inner.router.attach_domain_pipe(domain_id, tx);
         DomainPipeClient {
             domain_id: domain_id.to_string(),
             instance_id,
-            router: Arc::clone(&self.router),
+            router: Arc::clone(&self.inner.router),
             inbox: Mutex::new(rx),
             next_seq: std::sync::atomic::AtomicU64::new(1),
         }
@@ -391,7 +742,7 @@ impl DomainSupervisor {
 
 impl Drop for DomainSupervisor {
     fn drop(&mut self) {
-        let domain_ids: Vec<String> = self.processes.lock().keys().cloned().collect();
+        let domain_ids: Vec<String> = self.inner.processes.lock().keys().cloned().collect();
         for id in domain_ids {
             self.stop_process_domain(&id);
         }

@@ -386,6 +386,8 @@ fn test_os_process_stdio_supervision_and_observer() {
             command: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), shell_script.to_string()],
             working_dir: None,
+            auto_restart: false,
+            ..Default::default()
         })
         .expect("Failed to spawn external shell domain process");
     assert!(pid > 0);
@@ -647,5 +649,203 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+/// 8. Tests that when an external OS process domain exits unexpectedly, the Kernel Supervisor
+///    automatically restarts it, assigns a new instance_id, and restores registered routes.
+#[test]
+fn test_domain_auto_restart_on_unexpected_exit() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    let caller = kernel.attach_domain("test_client");
+
+    // Shell script that registers `ping`, handles messages, and crashes if told to
+    let script = r#"
+        echo '{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{"handlers":["ping"]},"data":{}}'
+        while IFS= read -r line; do
+            case "$line" in
+                *'"frame_type":"deliver"'*)
+                    msg_id=$(echo "$line" | sed -n 's/.*"message_id":"\([^"]*\)".*/\1/p')
+                    if echo "$line" | grep -q '"crash":true'; then
+                        echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"received\",\"data\":null}"
+                        echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"started\",\"data\":null}"
+                        # Exit unexpectedly!
+                        exit 99
+                    fi
+                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"received\",\"data\":null}"
+                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"started\",\"data\":null}"
+                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"completed\",\"data\":{\"reply\":\"pong\"}}"
+                    ;;
+            esac
+        done
+    "#;
+
+    let pid1 = kernel
+        .spawn_process_domain(DomainProcessSpec {
+            domain_id: "resilient_sh".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: None,
+            auto_restart: true,
+            max_restarts: Some(5),
+            restart_delay_ms: 60,
+        })
+        .expect("Spawn resilient_sh");
+    assert!(pid1 > 0);
+
+    // 1. Wait for resilient_sh to become Active
+    let mut active = false;
+    for _ in 0..50 {
+        if kernel.router().domain_status("resilient_sh") == Some(DomainStatus::Active) {
+            active = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(active, "resilient_sh should become Active");
+
+    let inst1 = kernel.router().domain_instance_id("resilient_sh").unwrap();
+
+    // 2. Normal ping check
+    let msg1 = caller.send(
+        vec!["resilient_sh.ping".to_string()],
+        "PingTest",
+        json!({}),
+        json!({"crash": false}),
+    );
+    let mut completed1 = false;
+    for _ in 0..4 {
+        if let Ok(KernelToDomainFrame::Receipt(r)) = caller.recv_frame_timeout(Duration::from_secs(2)) {
+            if r.message_id == msg1 && r.status == ContractStatus::Completed {
+                completed1 = true;
+                break;
+            }
+        }
+    }
+    assert!(completed1, "Initial ping should complete");
+
+    // 3. Send crash message to trigger unexpected exit
+    let _msg_crash = caller.send(
+        vec!["resilient_sh.ping".to_string()],
+        "CrashTest",
+        json!({}),
+        json!({"crash": true}),
+    );
+
+    // Drain receipts from crash
+    std::thread::sleep(Duration::from_millis(150));
+    let _ = caller.drain_frames();
+
+    // 4. Wait for Supervisor to auto-restart resilient_sh
+    let mut restarted = false;
+    let mut inst2 = inst1;
+    for _ in 0..50 {
+        if kernel.router().domain_status("resilient_sh") == Some(DomainStatus::Active) {
+            if let Some(id) = kernel.router().domain_instance_id("resilient_sh") {
+                if id > inst1 {
+                    restarted = true;
+                    inst2 = id;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(restarted, "Domain should be automatically restarted and become Active again");
+    assert!(inst2 > inst1, "Restarted instance must have higher generation instance_id");
+    assert!(kernel.supervisor().restart_count("resilient_sh") >= 1);
+
+    // 5. Send message to the new instance and verify it handles it cleanly
+    let msg2 = caller.send(
+        vec!["resilient_sh.ping".to_string()],
+        "PingTest2",
+        json!({}),
+        json!({"crash": false}),
+    );
+    let mut completed2 = false;
+    for _ in 0..4 {
+        if let Ok(KernelToDomainFrame::Receipt(r)) = caller.recv_frame_timeout(Duration::from_secs(2)) {
+            if r.message_id == msg2 && r.status == ContractStatus::Completed {
+                completed2 = true;
+                break;
+            }
+        }
+    }
+    assert!(completed2, "Ping after auto-restart must complete successfully");
+
+    // Clean stop
+    assert!(kernel.supervisor().stop_process_domain("resilient_sh"));
+}
+
+/// 9. Tests that explicit `stop_process_domain` does NOT trigger an automatic restart.
+#[test]
+fn test_explicit_stop_does_not_auto_restart() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+
+    let script = r#"
+        echo '{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{"handlers":["ping"]},"data":{}}'
+        while IFS= read -r line; do
+            :
+        done
+    "#;
+
+    kernel
+        .spawn_process_domain(DomainProcessSpec {
+            domain_id: "stop_test".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            working_dir: None,
+            auto_restart: true,
+            max_restarts: Some(5),
+            restart_delay_ms: 50,
+        })
+        .expect("Spawn stop_test");
+
+    for _ in 0..50 {
+        if kernel.router().domain_status("stop_test") == Some(DomainStatus::Active) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(kernel.router().domain_status("stop_test"), Some(DomainStatus::Active));
+
+    // Explicit stop
+    assert!(kernel.supervisor().stop_process_domain("stop_test"));
+    assert!(kernel.supervisor().is_stopped("stop_test"));
+
+    // Wait longer than restart_delay_ms
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Must remain stopped / faulted, NOT auto-restarted
+    assert_ne!(kernel.router().domain_status("stop_test"), Some(DomainStatus::Active));
+    assert!(kernel.router().active_routes().is_empty());
+}
+
+/// 10. Tests that automatic restart gives up when exceeding `max_restarts`.
+#[test]
+fn test_auto_restart_respects_max_restarts_limit() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+
+    // Command that immediately fails every time
+    kernel
+        .spawn_process_domain(DomainProcessSpec {
+            domain_id: "doomed_domain".to_string(),
+            command: "/bin/sh".to_string(),
+            args: vec!["-c", "exit 1"].iter().map(|s| s.to_string()).collect(),
+            working_dir: None,
+            auto_restart: true,
+            max_restarts: Some(2),
+            restart_delay_ms: 30,
+        })
+        .expect("Spawn doomed_domain");
+
+    // Wait for retries to exhaust
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify it attempted restarts up to limit and stopped
+    let count = kernel.supervisor().restart_count("doomed_domain");
+    assert!(count >= 2, "Expected at least 2 restart attempts, got {}", count);
+    assert_eq!(kernel.router().domain_status("doomed_domain"), Some(DomainStatus::Faulted));
+}
+
 
 

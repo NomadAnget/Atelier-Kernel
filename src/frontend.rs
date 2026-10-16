@@ -38,6 +38,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
             command: "python3".to_string(),
             args: vec!["./domains/order_domain.py".to_string()],
             working_dir: None,
+            ..Default::default()
         });
 
         let _ = self.kernel.spawn_process_domain(DomainProcessSpec {
@@ -45,6 +46,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
             command: "node".to_string(),
             args: vec!["./domains/inventory_domain.js".to_string()],
             working_dir: None,
+            ..Default::default()
         });
 
         // Wait up to 800ms for both child processes to register their handlers over Stdio pipes
@@ -343,6 +345,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
             command: "node".to_string(),
             args: vec!["./domains/inventory_domain.js".to_string()],
             working_dir: None,
+            ..Default::default()
         });
         for _ in 0..40 {
             if self.kernel.router().domain_status("inventory") == Some(DomainStatus::Active) {

@@ -1,0 +1,104 @@
+pub mod frontend;
+pub mod ledger;
+pub mod observer;
+pub mod protocol;
+pub mod router;
+pub mod storage;
+pub mod supervisor;
+pub mod web_frontend;
+
+use std::path::Path;
+use std::sync::Arc;
+
+pub use frontend::InteractiveFrontendDomain;
+pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
+pub use observer::KernelObserver;
+pub use web_frontend::WebFrontendDomain;
+pub use protocol::{
+    ContractStatus, DomainStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
+    KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame, MSG_REGISTER_HANDLERS,
+    MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
+    MSG_UNREGISTER_HANDLERS, MessageReceipt, ObservationEvent, OutboundMessage,
+};
+pub use router::KernelRouter;
+pub use storage::{DomainStorageEngine, StorageError, StoredRecord};
+pub use supervisor::{
+    DomainPipeClient, DomainProcessSpec, DomainSupervisor, KernelBootConfig, SupervisorError,
+};
+
+/// Top-level Atelier Kernel host combining:
+/// 1. Domain Supervisor (OS child process `Stdio` pipe lifecycle & physical identity binding)
+/// 2. Kernel Router (`<domain>.<handler>` routing & `TargetInvalid` pre-send interception)
+/// 3. Kernel Ledger (Kernel-generated `message_id` & three-level idempotent delivery)
+/// 4. Kernel Observer (Dedicated real-time message lifecycle observation)
+/// 5. Domain Storage Engine (Per-domain SQLite table creation & message-driven CRUD)
+pub struct AtelierKernel {
+    ledger: Arc<KernelLedger>,
+    observer: Arc<KernelObserver>,
+    storage: Arc<DomainStorageEngine>,
+    router: Arc<KernelRouter>,
+    supervisor: Arc<DomainSupervisor>,
+}
+
+impl AtelierKernel {
+    /// Creates a new Atelier Kernel backed by an in-memory SQLite database.
+    pub fn new_in_memory() -> Result<Self, StorageError> {
+        let storage = Arc::new(DomainStorageEngine::new_in_memory()?);
+        Ok(Self::from_storage(storage))
+    }
+
+    /// Creates a new Atelier Kernel backed by a persistent SQLite database file.
+    pub fn open_with_db(db_path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let storage = Arc::new(DomainStorageEngine::open_file(db_path)?);
+        Ok(Self::from_storage(storage))
+    }
+
+    fn from_storage(storage: Arc<DomainStorageEngine>) -> Self {
+        let ledger = Arc::new(KernelLedger::new());
+        let observer = Arc::new(KernelObserver::default());
+        let router = Arc::new(KernelRouter::new(
+            Arc::clone(&ledger),
+            Arc::clone(&observer),
+            Arc::clone(&storage),
+        ));
+        let supervisor = Arc::new(DomainSupervisor::new(Arc::clone(&router)));
+
+        Self {
+            ledger,
+            observer,
+            storage,
+            router,
+            supervisor,
+        }
+    }
+
+    pub fn ledger(&self) -> &Arc<KernelLedger> {
+        &self.ledger
+    }
+
+    pub fn observer(&self) -> &Arc<KernelObserver> {
+        &self.observer
+    }
+
+    pub fn storage(&self) -> &Arc<DomainStorageEngine> {
+        &self.storage
+    }
+
+    pub fn router(&self) -> &Arc<KernelRouter> {
+        &self.router
+    }
+
+    pub fn supervisor(&self) -> &Arc<DomainSupervisor> {
+        &self.supervisor
+    }
+
+    /// Spawns an external language-agnostic OS child process Domain connected via `Stdio` pipes.
+    pub fn spawn_process_domain(&self, spec: DomainProcessSpec) -> Result<u32, SupervisorError> {
+        self.supervisor.spawn_process_domain(spec)
+    }
+
+    /// Attaches an in-process Domain endpoint bound to `domain_id`.
+    pub fn attach_domain(&self, domain_id: &str) -> DomainPipeClient {
+        self.supervisor.attach_in_process_domain(domain_id)
+    }
+}

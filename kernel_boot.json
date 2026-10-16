@@ -1,0 +1,26 @@
+{
+  "db_path": "./data/atelier_kernel.db",
+  "web_ui_bind": "127.0.0.1:8787",
+  "domains": [
+    {
+      "domain_id": "order",
+      "command": "python3",
+      "args": ["./domains/order_domain.py"]
+    },
+    {
+      "domain_id": "inventory",
+      "command": "node",
+      "args": ["./domains/inventory_domain.js"]
+    },
+    {
+      "domain_id": "sensor_hub",
+      "command": "python3",
+      "args": ["./domains/sensor_domain.py"]
+    },
+    {
+      "domain_id": "risk",
+      "command": "node",
+      "args": ["./domains/risk_domain.js"]
+    }
+  ]
+}

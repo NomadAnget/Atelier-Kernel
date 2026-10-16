@@ -1,0 +1,22 @@
+[package]
+name = "atelier_kernel"
+version = "0.1.0"
+edition = "2024"
+description = "Atelier Kernel: Single-machine multi-domain microkernel with Stdio pipe supervision, two-layer contract routing, 4-stage receipts, real-time observer, and message-driven domain storage."
+
+[lib]
+name = "atelier_kernel"
+path = "src/lib.rs"
+
+[[bin]]
+name = "atelier-kernel"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+chrono = { version = "0.4.45", features = ["serde"] }
+thiserror = "2.0.21"
+parking_lot = "0.12.5"
+uuid = { version = "1.27.0", features = ["v4", "serde"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }

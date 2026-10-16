@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Atelier Kernel V3.1 — 网页前端域 & 实时内核观察台</title>
+  <style>
+    :root {
+      --bg: #0b0f17;
+      --panel: #131a27;
+      --panel-alt: #182132;
+      --border: #26334d;
+      --text: #e2e8f0;
+      --muted: #8b9bb4;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --purple: #a855f7;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", monospace;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+      padding: 14px;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      background: linear-gradient(90deg, #111827, #17253b);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 18px;
+      margin-bottom: 14px;
+      gap: 12px;
+    }
+    .brand h1 {
+      font-size: 18px;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .badge-kernel {
+      font-size: 11px;
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.4);
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+    }
+    .brand p { font-size: 12px; color: var(--muted); margin-top: 3px; }
+    .stats-bar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      flex-wrap: wrap;
+    }
+    .stat-pill {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+    .stat-pill strong { color: var(--accent); font-size: 14px; margin-left: 4px; }
+    .stat-pill.danger strong { color: var(--red); }
+    .stat-pill.ok strong { color: var(--green); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 430px 1fr;
+      gap: 14px;
+      align-items: start;
+    }
+    @media (max-width: 1180px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    .card-header h2 {
+      font-size: 14px;
+      color: #f8fafc;
+      letter-spacing: 0.3px;
+    }
+    .sub-hint { font-size: 11px; color: var(--muted); }
+
+    button {
+      background: #1e293b;
+      color: var(--text);
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    button:hover { background: #283548; border-color: var(--accent); }
+    button.primary {
+      background: #0284c7;
+      border-color: #38bdf8;
+      color: #fff;
+      font-weight: 600;
+    }
+    button.primary:hover { background: #0369a1; }
+    button.danger {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: rgba(239, 68, 68, 0.5);
+      color: #fca5a5;
+    }
+    button.danger:hover { background: rgba(239, 68, 68, 0.3); }
+    button.success {
+      background: rgba(34, 197, 94, 0.16);
+      border-color: rgba(34, 197, 94, 0.5);
+      color: #86efac;
+    }
+
+    .domain-list { display: flex; flex-direction: column; gap: 8px; }
+    .domain-item {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 9px 11px;
+    }
+    .domain-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 5px;
+    }
+    .domain-name { font-weight: 700; font-size: 13px; color: #fff; }
+    .lang-tag {
+      font-size: 11px;
+      color: var(--muted);
+      background: #0f172a;
+      padding: 1px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+    }
+    .status-dot {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 99px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .status-active { background: rgba(34, 197, 94, 0.18); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.4); }
+    .status-faulted { background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .status-spawning { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
+
+    .route-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+    .route-chip {
+      font-size: 11px;
+      background: #0b1120;
+      color: #93c5fd;
+      border: 1px solid #1e3a5f;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+
+    .preset-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .preset-grid button { text-align: left; padding: 7px 9px; line-height: 1.3; }
+
+    .form-row { margin-bottom: 8px; }
+    .form-row label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 3px; }
+    .form-row input, .form-row textarea, .form-row select {
+      width: 100%;
+      background: #0b0f17;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 8px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .form-row textarea { height: 54px; resize: vertical; }
+
+    /* Pipeline table */
+    .pipeline-list {
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      max-height: 410px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .pipe-row {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 11px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .pipe-row:hover { border-color: var(--accent); }
+    .pipe-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .msg-id { font-family: monospace; color: var(--accent); font-weight: 600; }
+    .flow-arrow { font-family: monospace; color: #f8fafc; background: #0f172a; padding: 2px 7px; border-radius: 4px; }
+    .msg-type-tag { color: #c084fc; font-weight: 600; font-family: monospace; }
+
+    .stages-bar {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 6px;
+    }
+    .stage-step {
+      text-align: center;
+      padding: 3px 6px;
+      border-radius: 5px;
+      font-size: 11px;
+      background: #0b0f17;
+      color: #475569;
+      border: 1px solid #1e293b;
+      font-family: monospace;
+    }
+    .stage-step.done-sent { background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border-color: rgba(56, 189, 248, 0.45); }
+    .stage-step.done-received { background: rgba(168, 85, 247, 0.15); color: #d8b4fe; border-color: rgba(168, 85, 247, 0.45); }
+    .stage-step.done-started { background: rgba(245, 158, 11, 0.18); color: #fcd34d; border-color: rgba(245, 158, 11, 0.45); }
+    .stage-step.done-completed { background: rgba(34, 197, 94, 0.2); color: #4ade80; border-color: rgba(34, 197, 94, 0.5); font-weight: 600; }
+    .stage-invalid {
+      grid-column: span 4;
+      background: rgba(239, 68, 68, 0.18);
+      color: #fca5a5;
+      border: 1px solid rgba(239, 68, 68, 0.5);
+      padding: 4px 10px;
+      border-radius: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      text-align: center;
+    }
+    .pipe-detail {
+      margin-top: 6px;
+      background: #080b11;
+      border: 1px solid #1e293b;
+      border-radius: 5px;
+      padding: 6px 8px;
+      font-family: monospace;
+      font-size: 11px;
+      color: #94a3b8;
+      white-space: pre-wrap;
+      word-break: break-all;
+      display: none;
+    }
+    .pipe-row.expanded .pipe-detail { display: block; }
+
+    /* Raw observer stream */
+    .event-stream {
+      max-height: 290px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 11.5px;
+      background: #080b11;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px;
+    }
+    .ev-line {
+      padding: 4px 6px;
+      border-bottom: 1px solid #141c2b;
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      flex-wrap: wrap;
+    }
+    .ev-line:hover { background: #111827; }
+    .ev-id { color: #64748b; min-width: 48px; }
+    .ev-status {
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 10.5px;
+      font-weight: 600;
+      min-width: 92px;
+      text-align: center;
+    }
+    .st-sent { background: rgba(56, 189, 248, 0.15); color: #7dd3fc; }
+    .st-received { background: rgba(168, 85, 247, 0.15); color: #d8b4fe; }
+    .st-started { background: rgba(245, 158, 11, 0.18); color: #fcd34d; }
+    .st-completed { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
+    .st-target_invalid, .st-contract_invalid, .st-execution_failed {
+      background: rgba(239, 68, 68, 0.22);
+      color: #f87171;
+    }
+    .inbox-list {
+      max-height: 185px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      font-size: 11.5px;
+      font-family: monospace;
+    }
+    .inbox-item {
+      background: #0b111d;
+      border-left: 3px solid var(--accent);
+      padding: 6px 8px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <h1>
+        Atelier Kernel 实时观察与测试前端域
+        <span class="badge-kernel">域身份: web_ui (OS Pipe 物理绑定)</span>
+      </h1>
+      <p>单机多域微内核 • 零网络内部通信 (Stdio JSON-Lines) • 内核生成 message_id • 四阶段回执 • 存储即消息</p>
+    </div>
+    <div class="stats-bar">
+      <div class="stat-pill ok">活跃路由数: <strong id="stat-routes">0</strong></div>
+      <div class="stat-pill">内核观察事件总数: <strong id="stat-events">0</strong></div>
+      <div class="stat-pill danger">TargetInvalid 拦截数: <strong id="stat-invalid">0</strong></div>
+      <button id="btn-toggle-traffic" class="primary" onclick="toggleAutoTraffic()">⏸ 暂停各域随机发送消息</button>
+      <button onclick="triggerRandomBurst()">⚡ 立即触发一波随机跨域消息</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- Left Column: Domain Supervisor & Interactive Message Sender -->
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <h2>1. 托管域生命周期与自动路由表 (`<domain>.<handler>`)</h2>
+          <span class="sub-hint">点击按钮可隨時停止/重启子进程</span>
+        </div>
+        <div id="domain-list" class="domain-list"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>2. 一键功能测试场景（以 `web_ui` 域身份发送）</h2>
+          <span class="sub-hint">覆盖路由 / 幂等 / 存储 CRUD</span>
+        </div>
+        <div class="preset-grid">
+          <button onclick="runPreset('order_create')">① 调 Python 订单域<br><span class="sub-hint">order.create + 自动存库</span></button>
+          <button onclick="runPreset('inventory_deduct')">② 调 Node 库存域<br><span class="sub-hint">inventory.deduct 扣库存</span></button>
+          <button onclick="runPreset('multi_fanout')">③ 多目标并发扇出<br><span class="sub-hint">同时发 2 个有效 + 1 个无效目标</span></button>
+          <button onclick="runPreset('target_invalid')">④ 测试无效目标拦截<br><span class="sub-hint">ghost.missing -> TargetInvalid</span></button>
+          <button onclick="runPreset('idempotent_seq')">⑤ 测试同 seq 幂等防重<br><span class="sub-hint">连发2次同seq，不生成新ID不重投</span></button>
+          <button onclick="runPreset('reverse_push')">⑥ 触发其他域反向推前端<br><span class="sub-hint">order.callback_ui -> web_ui</span></button>
+          <button onclick="runPreset('storage_insert')">⑦ 存储即消息: 新增<br><span class="sub-hint">StorageInsert 写入本域表</span></button>
+          <button onclick="runPreset('storage_evolve')">⑧ 存储即消息: 结构演进<br><span class="sub-hint">StorageUpdate 动态加字段不改表</span></button>
+          <button onclick="runPreset('storage_query')">⑨ 存储即消息: 查询<br><span class="sub-hint">StorageQuery 读取 store_web_ui</span></button>
+          <button onclick="runPreset('storage_isolation')">⑩ 验证跨域表物理隔离<br><span class="sub-hint">尝试越权查 order 表 (返回 0 条)</span></button>
+        </div>
+
+        <div class="card-header" style="margin-top:8px;">
+          <h2>3. 自定义两层消息发送器 (`OutboundMessage`)</h2>
+          <span class="sub-hint">无需填 message_id，由内核自动生成</span>
+        </div>
+        <div class="form-row">
+          <label>目标位置列表 `targets` (逗号分隔，格式: 域.处理器 或 kernel.storage)</label>
+          <input id="inp-targets" value="order.echo, inventory.stock_info" />
+        </div>
+        <div style="display:grid; grid-template-columns: 2fr 1fr; gap:8px;">
+          <div class="form-row">
+            <label>消息类型 `message_type`</label>
+            <input id="inp-type" value="CustomInspect" />
+          </div>
+          <div class="form-row">
+            <label>请求序号 `seq` (0=自动递增)</label>
+            <input id="inp-seq" type="number" value="0" />
+          </div>
+        </div>
+        <div class="form-row">
+          <label>上层契约参数 `params` (标准 JSON Object)</label>
+          <textarea id="inp-params">{"priority": "high", "trace": "manual_test"}</textarea>
+        </div>
+        <div class="form-row">
+          <label>内层实际数据包 `data` (标准 JSON — 结构自由变化，内核无感)</label>
+          <textarea id="inp-data">{"sku": "ATELIER-GEAR-01", "qty": 2, "custom_field_v2": {"nested": true}}</textarea>
+        </div>
+        <button class="primary" style="width:100%; padding:8px;" onclick="sendCustomMessage()">
+          🚀 通过 web_ui 域管道发送消息至内核
+        </button>
+      </div>
+    </div>
+
+    <!-- Right Column: Real-Time Kernel Observer Dashboard -->
+    <div>
+      <div class="card">
+        <div class="card-header">
+          <h2>实时内核观察台 A：四阶段回执状态机追踪 (`Sent → Received → Started → Completed`)</h2>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span class="sub-hint">点击任意消息行展开查看内层 JSON 数据包与回执返回值</span>
+            <select id="filter-domain" onchange="renderAll()" style="background:#0b0f17;color:#e2e8f0;border:1px solid #26334d;border-radius:5px;padding:3px 6px;font-size:11px;">
+              <option value="ALL">全部发送/目标域</option>
+              <option value="web_ui">仅看 web_ui 相关</option>
+              <option value="order">仅看 order (Python)</option>
+              <option value="inventory">仅看 inventory (Node)</option>
+              <option value="sensor_hub">仅看 sensor_hub (Python)</option>
+              <option value="risk">仅看 risk (Node)</option>
+              <option value="kernel.storage">仅看 kernel.storage (存储即消息)</option>
+              <option value="INVALID">仅看 TargetInvalid 拦截</option>
+            </select>
+          </div>
+        </div>
+        <div id="pipeline-list" class="pipeline-list"></div>
+      </div>
+
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px;">
+        <div class="card">
+          <div class="card-header">
+            <h2>实时收件箱：其他域推给 `web_ui.*` 的消息</h2>
+            <span class="sub-hint">自动回传 Received/Started/Completed</span>
+          </div>
+          <div id="webui-inbox" class="inbox-list"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-header">
+            <h2>`web_ui` 域最近操作结果回执</h2>
+            <span class="sub-hint">包含存储查询结果与幂等反馈</span>
+          </div>
+          <div id="webui-receipts" class="inbox-list"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <h2>实时内核观察台 B：`KernelObserver` 全量原始事件广播流</h2>
+          <div style="display:flex; gap:8px;">
+            <button id="btn-pause-stream" onclick="toggleStreamPause()">⏸ 暂停列表刷新</button>
+          </div>
+        </div>
+        <div id="event-stream" class="event-stream"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let autoTraffic = true;
+    let streamPaused = false;
+    let latestSnapshot = null;
+    let expandedKeys = new Set();
+
+    async function fetchSnapshot() {
+      if (streamPaused) return;
+      try {
+        const res = await fetch('/api/snapshot');
+        latestSnapshot = await res.json();
+        renderAll();
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function toggleExpand(key) {
+      if (expandedKeys.has(key)) expandedKeys.delete(key);
+      else expandedKeys.add(key);
+      renderAll();
+    }
+
+    function renderAll() {
+      if (!latestSnapshot) return;
+      const snap = latestSnapshot;
+
+      document.getElementById('stat-routes').textContent = snap.active_routes.length;
+      document.getElementById('stat-events').textContent = snap.total_events;
+      document.getElementById('stat-invalid').textContent = snap.invalid_count;
+
+      // 1. Render Domains
+      const dContainer = document.getElementById('domain-list');
+      dContainer.innerHTML = snap.domains.map(d => {
+        const stClass = d.status === 'active' ? 'status-active'
+                      : d.status === 'faulted' ? 'status-faulted' : 'status-spawning';
+        const routesHtml = d.routes.length
+          ? d.routes.map(r => `<span class="route-chip">${r}</span>`).join('')
+          : `<span class="sub-hint">无挂载路由（发往该域的消息将返回 TargetInvalid）</span>`;
+
+        const ctrlBtn = d.is_process
+          ? (d.status === 'active'
+              ? `<button class="danger" onclick="controlDomain('${d.domain_id}', 'stop')">停止进程</button>`
+              : `<button class="success" onclick="controlDomain('${d.domain_id}', 'start')">拉起进程</button>`)
+          : `<span class="sub-hint">内置前端宿主域</span>`;
+
+        return `
+          <div class="domain-item">
+            <div class="domain-top">
+              <div>
+                <span class="domain-name">${d.domain_id}</span>
+                <span class="lang-tag">${d.runtime}</span>
+              </div>
+              <div style="display:flex; gap:6px; align-items:center;">
+                <span class="status-dot ${stClass}">${d.status.toUpperCase()}</span>
+                ${ctrlBtn}
+              </div>
+            </div>
+            <div class="route-chips">${routesHtml}</div>
+          </div>
+        `;
+      }).join('');
+
+      // 2. Render 4-Stage Pipeline Tracker
+      const filterVal = document.getElementById('filter-domain').value;
+      const pContainer = document.getElementById('pipeline-list');
+      const filteredFlows = snap.flows.filter(f => {
+        if (filterVal === 'ALL') return true;
+        if (filterVal === 'INVALID') return f.latest_status === 'target_invalid' || f.latest_status === 'contract_invalid';
+        return f.source_domain === filterVal || f.target === filterVal || f.target.startsWith(filterVal + '.');
+      });
+
+      pContainer.innerHTML = filteredFlows.map(f => {
+        const key = `${f.message_id}::${f.target}`;
+        const isExpanded = expandedKeys.has(key);
+        let stageBarHtml = '';
+        if (f.latest_status === 'target_invalid') {
+          stageBarHtml = `<div class="stage-invalid">🚫 TargetInvalid（目标不存在或域已停止，内核已前置拦截，未发送消息）</div>`;
+        } else if (f.latest_status === 'contract_invalid') {
+          stageBarHtml = `<div class="stage-invalid">⚠️ ContractInvalid（契约校验失败）</div>`;
+        } else if (f.latest_status === 'execution_failed') {
+          stageBarHtml = `<div class="stage-invalid">💥 ExecutionFailed（目标处理器执行异常或进程崩溃）</div>`;
+        } else {
+          const s1 = f.stages.includes('sent') ? 'done-sent' : '';
+          const s2 = f.stages.includes('received') ? 'done-received' : '';
+          const s3 = f.stages.includes('started') ? 'done-started' : '';
+          const s4 = f.stages.includes('completed') ? 'done-completed' : '';
+          stageBarHtml = `
+            <div class="stages-bar">
+              <div class="stage-step ${s1}">1. Sent 已发出</div>
+              <div class="stage-step ${s2}">2. Received 已接收</div>
+              <div class="stage-step ${s3}">3. Started 开始执行</div>
+              <div class="stage-step ${s4}">4. Completed 完成</div>
+            </div>
+          `;
+        }
+
+        const detailJson = f.details ? JSON.stringify(f.details, null, 2) : '无附加返回数据包';
+        return `
+          <div class="pipe-row ${isExpanded ? 'expanded' : ''}" onclick="toggleExpand('${key}')">
+            <div class="pipe-head">
+              <div>
+                <span class="msg-id">${f.message_id}</span>
+                <span class="sub-hint">(seq:${f.seq})</span>
+              </div>
+              <span class="flow-arrow">${f.source_domain} ➔ ${f.target}</span>
+              <span class="msg-type-tag">${f.message_type}</span>
+            </div>
+            ${stageBarHtml}
+            <div class="pipe-detail">最终状态: ${f.latest_status}\n回执/载荷详情: ${detailJson}</div>
+          </div>
+        `;
+      }).join('');
+
+      // 3. Render web_ui inbox
+      const inboxEl = document.getElementById('webui-inbox');
+      inboxEl.innerHTML = snap.webui_inbox.length
+        ? snap.webui_inbox.map(item => `
+            <div class="inbox-item">
+              <div style="color:#38bdf8;font-weight:600;">[${item.source_domain} ➔ ${item.target}] (${item.message_type})</div>
+              <div style="color:#cbd5e1;margin-top:2px;">${JSON.stringify(item.data)}</div>
+            </div>
+          `).join('')
+        : `<div class="sub-hint">等待其他域向 web_ui.push_alert / metric_tick 发送消息...</div>`;
+
+      // 4. Render web_ui outbound receipts
+      const recEl = document.getElementById('webui-receipts');
+      recEl.innerHTML = snap.webui_receipts.length
+        ? snap.webui_receipts.map(r => `
+            <div class="inbox-item" style="border-left-color: ${r.status === 'completed' ? '#22c55e' : (r.status === 'target_invalid' ? '#ef4444' : '#38bdf8')}">
+              <div><strong>${r.message_id}</strong> ➔ <span style="color:#93c5fd">${r.target}</span> [<span style="color:#fde047">${r.status.toUpperCase()}</span>]</div>
+              ${r.data ? `<div style="color:#94a3b8;margin-top:2px;">${JSON.stringify(r.data)}</div>` : ''}
+            </div>
+          `).join('')
+        : `<div class="sub-hint">点击左侧按钮发送消息后在此展示回执详情...</div>`;
+
+      // 5. Render Raw Observer Stream
+      const evContainer = document.getElementById('event-stream');
+      evContainer.innerHTML = snap.recent_events.map(ev => `
+        <div class="ev-line">
+          <span class="ev-id">#${String(ev.event_id).padStart(4, '0')}</span>
+          <span class="ev-status st-${ev.status}">${ev.status.toUpperCase()}</span>
+          <span style="color:#38bdf8">${ev.message_id}</span>
+          <span style="color:#f8fafc">${ev.source_domain} ➔ ${ev.target}</span>
+          <span style="color:#c084fc">[${ev.message_type}]</span>
+          <span style="color:#64748b">${ev.details ? JSON.stringify(ev.details) : ''}</span>
+        </div>
+      `).join('');
+    }
+
+    async function controlDomain(domainId, action) {
+      await fetch('/api/domain_control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain_id: domainId, action })
+      });
+      await fetchSnapshot();
+    }
+
+    async function toggleAutoTraffic() {
+      autoTraffic = !autoTraffic;
+      const btn = document.getElementById('btn-toggle-traffic');
+      btn.textContent = autoTraffic ? '⏸ 暂停各域随机发送消息' : '▶ 开启各域随机发送消息';
+      btn.className = autoTraffic ? 'primary' : 'success';
+      await fetch('/api/domain_control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain_id: 'all', action: 'toggle_traffic', enabled: autoTraffic })
+      });
+      await fetchSnapshot();
+    }
+
+    async function triggerRandomBurst() {
+      await fetch('/api/domain_control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ domain_id: 'all', action: 'burst' })
+      });
+      await fetchSnapshot();
+    }
+
+    function toggleStreamPause() {
+      streamPaused = !streamPaused;
+      document.getElementById('btn-pause-stream').textContent = streamPaused ? '▶ 继续列表刷新' : '⏸ 暂停列表刷新';
+    }
+
+    async function sendToKernel(payload) {
+      await fetch('/api/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      await fetchSnapshot();
+    }
+
+    async function sendCustomMessage() {
+      const targets = document.getElementById('inp-targets').value
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+      const message_type = document.getElementById('inp-type').value.trim() || 'CustomInvoke';
+      const seq = Number(document.getElementById('inp-seq').value || 0);
+      let params = {};
+      let data = {};
+      try {
+        params = JSON.parse(document.getElementById('inp-params').value || '{}');
+        data = JSON.parse(document.getElementById('inp-data').value || '{}');
+      } catch (e) {
+        alert('JSON 格式有误: ' + e.message);
+        return;
+      }
+      await sendToKernel({ targets, message_type, seq, params, data });
+    }
+
+    async function runPreset(name) {
+      if (name === 'order_create') {
+        await sendToKernel({
+          targets: ['order.create'],
+          message_type: 'CreateOrder',
+          seq: 0,
+          params: { source: 'web_ui_preset' },
+          data: { order_id: 'WEB-ORD-' + Math.floor(Math.random() * 900 + 100), sku: 'ATELIER-GEAR-01', qty: 2 }
+        });
+      } else if (name === 'inventory_deduct') {
+        await sendToKernel({
+          targets: ['inventory.deduct'],
+          message_type: 'DeductStock',
+          seq: 0,
+          params: { warehouse: 'WH-01' },
+          data: { sku: 'ATELIER-GEAR-01', qty: 3 }
+        });
+      } else if (name === 'multi_fanout') {
+        await sendToKernel({
+          targets: ['order.echo', 'inventory.stock_info', 'ghost_domain.missing_handler'],
+          message_type: 'MultiTargetFanout',
+          seq: 0,
+          params: { fanout: true },
+          data: { check: 'multi_domain_composition' }
+        });
+      } else if (name === 'target_invalid') {
+        await sendToKernel({
+          targets: ['non_existent.handler'],
+          message_type: 'TestInvalidTarget',
+          seq: 0,
+          params: {},
+          data: { note: '内核将前置拦截并返回 TargetInvalid' }
+        });
+      } else if (name === 'idempotent_seq') {
+        // Send twice with identical seq = 777777
+        await sendToKernel({
+          targets: ['inventory.deduct'],
+          message_type: 'IdempotentDeductDemo',
+          seq: 777777,
+          params: { demo: 'first_send_seq_777777' },
+          data: { sku: 'ATELIER-CORE-X', qty: 1 }
+        });
+        await sendToKernel({
+          targets: ['inventory.deduct'],
+          message_type: 'IdempotentDeductDemo',
+          seq: 777777,
+          params: { demo: 'duplicate_send_seq_777777' },
+          data: { sku: 'ATELIER-CORE-X', qty: 99 }
+        });
+      } else if (name === 'reverse_push') {
+        await sendToKernel({
+          targets: ['order.callback_ui'],
+          message_type: 'TriggerCallbackToWebUI',
+          seq: 0,
+          params: {},
+          data: { request: 'notify_web_ui' }
+        });
+      } else if (name === 'storage_insert') {
+        await sendToKernel({
+          targets: ['kernel.storage'],
+          message_type: 'StorageInsert',
+          seq: 0,
+          params: { record_id: 'web_card_01', category: 'dashboard_widget', upsert: true },
+          data: { title: '内核状态监控卡片', theme: 'cyber_dark', refresh_ms: 500 }
+        });
+      } else if (name === 'storage_evolve') {
+        await sendToKernel({
+          targets: ['kernel.storage'],
+          message_type: 'StorageUpdate',
+          seq: 0,
+          params: { record_id: 'web_card_01', patch: true },
+          data: {
+            schema_v2_new_field: { charts: ['latency', 'throughput'], pinned: true },
+            refresh_ms: 250
+          }
+        });
+      } else if (name === 'storage_query') {
+        await sendToKernel({
+          targets: ['kernel.storage'],
+          message_type: 'StorageQuery',
+          seq: 0,
+          params: { category: 'dashboard_widget' },
+          data: {}
+        });
+      } else if (name === 'storage_isolation') {
+        await sendToKernel({
+          targets: ['kernel.storage'],
+          message_type: 'StorageQuery',
+          seq: 0,
+          params: { domain: 'order', category: 'sales_order' },
+          data: {}
+        });
+      }
+    }
+
+    fetchSnapshot();
+    setInterval(fetchSnapshot, 400);
+  </script>
+</body>
+</html>

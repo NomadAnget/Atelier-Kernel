@@ -197,10 +197,45 @@ impl DomainSupervisor {
             cmd.current_dir(dir);
         }
 
-        let mut child = cmd.spawn().map_err(|source| SupervisorError::SpawnFailed {
-            domain: domain_id.clone(),
-            source,
-        })?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let alt_cmd = if spec.command == "python3" {
+                    Some("python")
+                } else if spec.command == "python" {
+                    Some("python3")
+                } else {
+                    None
+                };
+
+                if let Some(alt) = alt_cmd {
+                    let mut fallback = Command::new(alt);
+                    fallback
+                        .args(&spec.args)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::inherit());
+                    if let Some(dir) = &spec.working_dir {
+                        fallback.current_dir(dir);
+                    }
+                    fallback.spawn().map_err(|source| SupervisorError::SpawnFailed {
+                        domain: domain_id.clone(),
+                        source,
+                    })?
+                } else {
+                    return Err(SupervisorError::SpawnFailed {
+                        domain: domain_id.clone(),
+                        source: e,
+                    });
+                }
+            }
+            Err(e) => {
+                return Err(SupervisorError::SpawnFailed {
+                    domain: domain_id.clone(),
+                    source: e,
+                });
+            }
+        };
 
         let pid = child.id();
         let child_stdin = child

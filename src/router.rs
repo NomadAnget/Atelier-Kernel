@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::ledger::{KernelLedger, ReceiptTransition};
@@ -29,6 +29,9 @@ struct DomainEntry {
 /// routes 4-stage receipts, and dispatches storage messages.
 pub struct KernelRouter {
     next_instance_id: AtomicU64,
+    /// Per-domain serialization gate that closes the TOCTOU window between checking `instance_id`
+    /// and processing an inbound frame or replacing a domain generation via `attach_domain_pipe`.
+    domain_gates: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     domains: RwLock<HashMap<String, DomainEntry>>,
     /// `<domain>.<handler> -> domain` lookup table.
     routes: RwLock<HashMap<String, String>>,
@@ -45,6 +48,7 @@ impl KernelRouter {
     ) -> Self {
         Self {
             next_instance_id: AtomicU64::new(1),
+            domain_gates: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
             routes: RwLock::new(HashMap::new()),
             ledger,
@@ -65,15 +69,35 @@ impl KernelRouter {
         &self.storage
     }
 
+    /// Returns the per-domain serialization mutex used to guarantee atomic generation isolation.
+    fn domain_gate(&self, domain_id: &str) -> Arc<Mutex<()>> {
+        if let Some(gate) = self.domain_gates.read().get(domain_id) {
+            return Arc::clone(gate);
+        }
+        let mut gates = self.domain_gates.write();
+        Arc::clone(
+            gates
+                .entry(domain_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
     /// Attaches a physical pipe channel (`Kernel -> Domain`) for `domain_id` and returns
     /// the newly assigned process/pipe generation `instance_id`.
-    /// Called by the Kernel Supervisor when spawning a domain process.
+    ///
+    /// Acquires the per-domain serialization gate so a domain replacement can NEVER interleave
+    /// mid-execution of an old instance's `handle_raw_pipe_line_for_instance`.
     pub fn attach_domain_pipe(&self, domain_id: &str, pipe_tx: Sender<KernelToDomainFrame>) -> u64 {
-        let instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
-        self.ledger.clear_session_dedup_for_domain(domain_id);
+        let gate = self.domain_gate(domain_id);
+        let _domain_guard = gate.lock();
+
         let _ = self.storage.ensure_domain_table(domain_id);
         let mut domains = self.domains.write();
         let mut routes = self.routes.write();
+
+        let instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
+        self.ledger.clear_session_dedup_for_domain(domain_id);
+
         let entry = domains
             .entry(domain_id.to_string())
             .or_insert_with(|| DomainEntry {
@@ -130,28 +154,37 @@ impl KernelRouter {
     }
 
     /// Processes a raw JSON line from a specific process generation `instance_id` of `authenticated_domain`.
-    /// Ignores lines coming from stale/replaced reader threads.
+    /// Holds the per-domain serialization gate across both the `instance_id` check and frame execution,
+    /// completely eliminating any TOCTOU window against `attach_domain_pipe`.
     pub fn handle_raw_pipe_line_for_instance(
         &self,
         authenticated_domain: &str,
         instance_id: u64,
         raw_line: &str,
     ) {
+        let gate = self.domain_gate(authenticated_domain);
+        let _domain_guard = gate.lock();
         if self.domain_instance_id(authenticated_domain) != Some(instance_id) {
             return;
         }
-        self.handle_raw_pipe_line(authenticated_domain, raw_line);
+        self.handle_raw_pipe_line_inner(authenticated_domain, raw_line);
     }
 
     /// Processes a raw JSON line coming from the physical stdout pipe of `authenticated_domain`.
     pub fn handle_raw_pipe_line(&self, authenticated_domain: &str, raw_line: &str) {
+        let gate = self.domain_gate(authenticated_domain);
+        let _domain_guard = gate.lock();
+        self.handle_raw_pipe_line_inner(authenticated_domain, raw_line);
+    }
+
+    fn handle_raw_pipe_line_inner(&self, authenticated_domain: &str, raw_line: &str) {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
             return;
         }
         match serde_json::from_str::<DomainToKernelFrame>(trimmed) {
             Ok(frame) => {
-                self.handle_frame(authenticated_domain, frame);
+                self.handle_frame_inner(authenticated_domain, frame);
             }
             Err(err) => {
                 let msg_id = self.ledger.generate_message_id();
@@ -185,9 +218,35 @@ impl KernelRouter {
         }
     }
 
+    /// Processes a structured `DomainToKernelFrame` for a specific `instance_id` of `authenticated_domain`.
+    /// Holds the per-domain serialization gate across both the `instance_id` check and frame execution.
+    pub fn handle_frame_for_instance(
+        &self,
+        authenticated_domain: &str,
+        instance_id: u64,
+        frame: DomainToKernelFrame,
+    ) -> Option<String> {
+        let gate = self.domain_gate(authenticated_domain);
+        let _domain_guard = gate.lock();
+        if self.domain_instance_id(authenticated_domain) != Some(instance_id) {
+            return None;
+        }
+        self.handle_frame_inner(authenticated_domain, frame)
+    }
+
     /// Processes a structured `DomainToKernelFrame` from `authenticated_domain`.
     /// Returns the kernel-assigned `message_id` when the frame is a `Send`.
     pub fn handle_frame(
+        &self,
+        authenticated_domain: &str,
+        frame: DomainToKernelFrame,
+    ) -> Option<String> {
+        let gate = self.domain_gate(authenticated_domain);
+        let _domain_guard = gate.lock();
+        self.handle_frame_inner(authenticated_domain, frame)
+    }
+
+    fn handle_frame_inner(
         &self,
         authenticated_domain: &str,
         frame: DomainToKernelFrame,

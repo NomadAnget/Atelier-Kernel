@@ -276,9 +276,10 @@ impl DomainSupervisor {
     /// to `domain_id` by the Kernel.
     pub fn attach_in_process_domain(&self, domain_id: &str) -> DomainPipeClient {
         let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
-        let _instance_id = self.router.attach_domain_pipe(domain_id, tx);
+        let instance_id = self.router.attach_domain_pipe(domain_id, tx);
         DomainPipeClient {
             domain_id: domain_id.to_string(),
+            instance_id,
             router: Arc::clone(&self.router),
             inbox: Mutex::new(rx),
             next_seq: std::sync::atomic::AtomicU64::new(1),
@@ -302,6 +303,7 @@ impl Drop for DomainSupervisor {
 /// 3. `report_receipt` / `recv_frame`
 pub struct DomainPipeClient {
     domain_id: String,
+    instance_id: u64,
     router: Arc<KernelRouter>,
     inbox: Mutex<Receiver<KernelToDomainFrame>>,
     next_seq: std::sync::atomic::AtomicU64,
@@ -310,6 +312,10 @@ pub struct DomainPipeClient {
 impl DomainPipeClient {
     pub fn domain_id(&self) -> &str {
         &self.domain_id
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -357,7 +363,11 @@ impl DomainPipeClient {
             data,
         };
         self.router
-            .handle_frame(&self.domain_id, DomainToKernelFrame::Send(outbound))
+            .handle_frame_for_instance(
+                &self.domain_id,
+                self.instance_id,
+                DomainToKernelFrame::Send(outbound),
+            )
             .unwrap_or_default()
     }
 
@@ -375,8 +385,11 @@ impl DomainPipeClient {
             status,
             data,
         };
-        self.router
-            .handle_frame(&self.domain_id, DomainToKernelFrame::Receipt(receipt));
+        self.router.handle_frame_for_instance(
+            &self.domain_id,
+            self.instance_id,
+            DomainToKernelFrame::Receipt(receipt),
+        );
     }
 
     /// Helper: Sends a `StorageInsert` message to `kernel.storage`.

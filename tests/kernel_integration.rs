@@ -484,11 +484,16 @@ fn test_stale_instance_fault_does_not_revoke_new_domain_instance() {
         "New instance routes must remain intact"
     );
 
-    // Also verify stale raw pipe line from Instance 1 is ignored
+    // Also verify stale raw pipe line and stale DomainPipeClient from Instance 1 are ignored
     kernel.router().handle_raw_pipe_line_for_instance(
         "worker",
         inst_1,
         r#"{"frame_type":"send","seq":99,"targets":["kernel.registry"],"message_type":"UnregisterHandlers","params":{},"data":{}}"#,
+    );
+    let stale_msg_id = worker_v1.register_handlers(&["zombie_handler"]);
+    assert!(
+        stale_msg_id.is_empty(),
+        "Stale DomainPipeClient frame submission must be rejected"
     );
     assert_eq!(
         kernel.router().active_routes(),

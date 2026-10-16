@@ -91,6 +91,7 @@ pub struct DomainProcessSpec {
 }
 
 struct ManagedProcess {
+    instance_id: u64,
     child: Arc<Mutex<Child>>,
     stopping: Arc<AtomicBool>,
 }
@@ -185,7 +186,7 @@ impl DomainSupervisor {
             .ok_or_else(|| SupervisorError::StdioCaptureFailed(domain_id.clone()))?;
 
         let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
-        self.router.attach_domain_pipe(&domain_id, tx);
+        let instance_id = self.router.attach_domain_pipe(&domain_id, tx);
 
         let stopping = Arc::new(AtomicBool::new(false));
         let child_arc = Arc::new(Mutex::new(child));
@@ -193,6 +194,7 @@ impl DomainSupervisor {
         self.processes.lock().insert(
             domain_id.clone(),
             ManagedProcess {
+                instance_id,
                 child: Arc::clone(&child_arc),
                 stopping: Arc::clone(&stopping),
             },
@@ -201,7 +203,7 @@ impl DomainSupervisor {
         // Writer thread: Kernel -> Domain ChildStdin (JSON-Lines)
         let writer_domain = domain_id.clone();
         thread::Builder::new()
-            .name(format!("kernel-pipe-tx-{writer_domain}"))
+            .name(format!("kernel-pipe-tx-{writer_domain}-{instance_id}"))
             .spawn(move || {
                 let mut stdin = child_stdin;
                 while let Ok(frame) = rx.recv() {
@@ -214,26 +216,32 @@ impl DomainSupervisor {
             })
             .ok();
 
-        // Reader thread: Domain ChildStdout -> Kernel (physically bound to `domain_id`)
+        // Reader thread: Domain ChildStdout -> Kernel (physically bound to `(domain_id, instance_id)`)
         let reader_domain = domain_id;
         let router_ref = Arc::clone(&self.router);
         let stopping_ref = Arc::clone(&stopping);
         thread::Builder::new()
-            .name(format!("kernel-pipe-rx-{reader_domain}"))
+            .name(format!("kernel-pipe-rx-{reader_domain}-{instance_id}"))
             .spawn(move || {
                 let reader = BufReader::new(child_stdout);
                 for line in reader.lines() {
                     match line {
                         Ok(raw_line) => {
-                            router_ref.handle_raw_pipe_line(&reader_domain, &raw_line);
+                            router_ref.handle_raw_pipe_line_for_instance(
+                                &reader_domain,
+                                instance_id,
+                                &raw_line,
+                            );
                         }
                         Err(_) => break,
                     }
                 }
-                // When stdout EOF is reached, if not intentionally stopped by kernel, mark domain as Faulted.
+                // When stdout EOF is reached, if not intentionally stopped by kernel,
+                // mark domain as Faulted ONLY IF `instance_id` is still the current generation.
                 if !stopping_ref.load(Ordering::SeqCst) {
-                    router_ref.mark_domain_faulted(
+                    router_ref.mark_domain_faulted_for_instance(
                         &reader_domain,
+                        Some(instance_id),
                         "domain process exited or closed stdout pipe",
                     );
                 }
@@ -252,8 +260,11 @@ impl DomainSupervisor {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            self.router
-                .mark_domain_faulted(domain_id, "domain stopped by kernel supervisor");
+            self.router.mark_domain_faulted_for_instance(
+                domain_id,
+                Some(managed.instance_id),
+                "domain stopped by kernel supervisor",
+            );
             true
         } else {
             false
@@ -265,7 +276,7 @@ impl DomainSupervisor {
     /// to `domain_id` by the Kernel.
     pub fn attach_in_process_domain(&self, domain_id: &str) -> DomainPipeClient {
         let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
-        self.router.attach_domain_pipe(domain_id, tx);
+        let _instance_id = self.router.attach_domain_pipe(domain_id, tx);
         DomainPipeClient {
             domain_id: domain_id.to_string(),
             router: Arc::clone(&self.router),

@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use parking_lot::RwLock;
@@ -16,6 +17,8 @@ use crate::storage::DomainStorageEngine;
 
 /// Internal registration state of a single managed Domain.
 struct DomainEntry {
+    /// Monotonically increasing process/pipe instance generation ID.
+    instance_id: u64,
     status: DomainStatus,
     pipe_tx: Option<Sender<KernelToDomainFrame>>,
     handlers: HashSet<String>,
@@ -25,6 +28,7 @@ struct DomainEntry {
 /// enforces three-level idempotency, intercepts invalid targets (`TargetInvalid`),
 /// routes 4-stage receipts, and dispatches storage messages.
 pub struct KernelRouter {
+    next_instance_id: AtomicU64,
     domains: RwLock<HashMap<String, DomainEntry>>,
     /// `<domain>.<handler> -> domain` lookup table.
     routes: RwLock<HashMap<String, String>>,
@@ -40,6 +44,7 @@ impl KernelRouter {
         storage: Arc<DomainStorageEngine>,
     ) -> Self {
         Self {
+            next_instance_id: AtomicU64::new(1),
             domains: RwLock::new(HashMap::new()),
             routes: RwLock::new(HashMap::new()),
             ledger,
@@ -60,21 +65,37 @@ impl KernelRouter {
         &self.storage
     }
 
-    /// Attaches a physical pipe channel (`Kernel -> Domain`) for `domain_id`.
+    /// Attaches a physical pipe channel (`Kernel -> Domain`) for `domain_id` and returns
+    /// the newly assigned process/pipe generation `instance_id`.
     /// Called by the Kernel Supervisor when spawning a domain process.
-    pub fn attach_domain_pipe(&self, domain_id: &str, pipe_tx: Sender<KernelToDomainFrame>) {
+    pub fn attach_domain_pipe(&self, domain_id: &str, pipe_tx: Sender<KernelToDomainFrame>) -> u64 {
+        let instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
         self.ledger.clear_session_dedup_for_domain(domain_id);
         let _ = self.storage.ensure_domain_table(domain_id);
         let mut domains = self.domains.write();
+        let mut routes = self.routes.write();
         let entry = domains
             .entry(domain_id.to_string())
             .or_insert_with(|| DomainEntry {
+                instance_id,
                 status: DomainStatus::Spawning,
                 pipe_tx: None,
                 handlers: HashSet::new(),
             });
+        // Clean up any leftover routes from a prior generation before binding the new instance.
+        for h in &entry.handlers {
+            routes.remove(&format!("{domain_id}.{h}"));
+        }
+        entry.handlers.clear();
+        entry.instance_id = instance_id;
         entry.status = DomainStatus::Spawning;
         entry.pipe_tx = Some(pipe_tx);
+        instance_id
+    }
+
+    /// Returns the current active generation `instance_id` for `domain_id`, if attached.
+    pub fn domain_instance_id(&self, domain_id: &str) -> Option<u64> {
+        self.domains.read().get(domain_id).map(|d| d.instance_id)
     }
 
     /// Returns the current lifecycle status of `domain_id`.
@@ -106,6 +127,20 @@ impl KernelRouter {
             .collect();
         list.sort_by(|a, b| a.0.cmp(&b.0));
         list
+    }
+
+    /// Processes a raw JSON line from a specific process generation `instance_id` of `authenticated_domain`.
+    /// Ignores lines coming from stale/replaced reader threads.
+    pub fn handle_raw_pipe_line_for_instance(
+        &self,
+        authenticated_domain: &str,
+        instance_id: u64,
+        raw_line: &str,
+    ) {
+        if self.domain_instance_id(authenticated_domain) != Some(instance_id) {
+            return;
+        }
+        self.handle_raw_pipe_line(authenticated_domain, raw_line);
     }
 
     /// Processes a raw JSON line coming from the physical stdout pipe of `authenticated_domain`.
@@ -304,6 +339,7 @@ impl KernelRouter {
                         domains
                             .entry(source_domain.to_string())
                             .or_insert_with(|| DomainEntry {
+                                instance_id: self.next_instance_id.fetch_add(1, Ordering::Relaxed),
                                 status: DomainStatus::Active,
                                 pipe_tx: None,
                                 handlers: HashSet::new(),
@@ -473,14 +509,14 @@ impl KernelRouter {
     fn dispatch_domain_target(&self, source_domain: &str, seq: u64, msg: KernelMessage) {
         let target = msg.target.clone();
 
-        // Check route table and target domain active pipe.
+        // Check route table and target domain active pipe along with its generation `instance_id`.
         let target_pipe_opt = {
             let routes = self.routes.read();
             let domains = self.domains.read();
             routes.get(&target).and_then(|target_domain| {
                 domains.get(target_domain).and_then(|entry| {
                     if entry.status == DomainStatus::Active {
-                        entry.pipe_tx.clone()
+                        entry.pipe_tx.clone().map(|tx| (entry.instance_id, tx))
                     } else {
                         None
                     }
@@ -488,7 +524,7 @@ impl KernelRouter {
             })
         };
 
-        let Some(target_pipe) = target_pipe_opt else {
+        let Some((target_instance_id, target_pipe)) = target_pipe_opt else {
             // Core Rule: Target does not exist or is not ready -> DO NOT SEND, return `TargetInvalid`.
             let err_data = Some(json!({
                 "error": "target_not_found_or_inactive",
@@ -540,9 +576,13 @@ impl KernelRouter {
             .send(KernelToDomainFrame::Deliver(msg.clone()))
             .is_err()
         {
-            // Target pipe broke right as we tried to send.
+            // Target pipe broke right as we tried to send; only fault if `target_instance_id` is still current.
             if let Some((target_domain, _)) = parse_target_address(&target) {
-                self.mark_domain_faulted(target_domain, "target stdio pipe broken on send");
+                self.mark_domain_faulted_for_instance(
+                    target_domain,
+                    Some(target_instance_id),
+                    "target stdio pipe broken on send",
+                );
             }
             return;
         }
@@ -599,19 +639,39 @@ impl KernelRouter {
         }
     }
 
-    /// Atomically revokes a faulted/stopped domain's routes and fails all in-flight deliveries targeting it.
-    pub fn mark_domain_faulted(&self, domain_id: &str, reason: &str) {
+    /// Atomically revokes a faulted/stopped domain's routes and fails all in-flight deliveries targeting it,
+    /// without checking generation `instance_id`.
+    pub fn mark_domain_faulted(&self, domain_id: &str, reason: &str) -> bool {
+        self.mark_domain_faulted_for_instance(domain_id, None, reason)
+    }
+
+    /// Atomically revokes a faulted/stopped domain's routes ONLY IF `expected_instance_id` (when provided)
+    /// matches the currently active generation `instance_id` of `domain_id`.
+    /// Prevents a stale reader thread from an old process generation from revoking a newly respawned domain's routes.
+    pub fn mark_domain_faulted_for_instance(
+        &self,
+        domain_id: &str,
+        expected_instance_id: Option<u64>,
+        reason: &str,
+    ) -> bool {
         {
             let mut domains = self.domains.write();
             let mut routes = self.routes.write();
-            if let Some(entry) = domains.get_mut(domain_id) {
-                entry.status = DomainStatus::Faulted;
-                entry.pipe_tx = None;
-                for h in &entry.handlers {
-                    routes.remove(&format!("{domain_id}.{h}"));
-                }
-                entry.handlers.clear();
+            let Some(entry) = domains.get_mut(domain_id) else {
+                return false;
+            };
+            if let Some(expected_id) = expected_instance_id
+                && entry.instance_id != expected_id
+            {
+                // Stale fault notification from an older process instance; ignore safely.
+                return false;
             }
+            entry.status = DomainStatus::Faulted;
+            entry.pipe_tx = None;
+            for h in &entry.handlers {
+                routes.remove(&format!("{domain_id}.{h}"));
+            }
+            entry.handlers.clear();
         }
 
         let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
@@ -627,6 +687,7 @@ impl KernelRouter {
             );
             self.send_to_domain_pipe(&source_domain, KernelToDomainFrame::Receipt(receipt));
         }
+        true
     }
 
     fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {

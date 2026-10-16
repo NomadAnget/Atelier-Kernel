@@ -381,3 +381,80 @@ fn test_os_process_stdio_supervision_and_observer() {
     );
     assert!(observer_rx.try_recv().is_ok());
 }
+
+/// 5. Tests that a delayed fault or pipe read from a stale process generation (`instance_id`)
+///    cannot revoke routes or inject frames into a newly respawned instance of the same domain.
+#[test]
+fn test_stale_instance_fault_does_not_revoke_new_domain_instance() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+
+    // Instance 1 attaches and registers `worker.job_v1`
+    let worker_v1 = kernel.attach_domain("worker");
+    let inst_1 = kernel
+        .router()
+        .domain_instance_id("worker")
+        .expect("Expected instance_id for worker v1");
+    worker_v1.register_handlers(&["job_v1"]);
+    let _ = worker_v1.drain_frames();
+    assert_eq!(
+        kernel.router().domain_status("worker"),
+        Some(DomainStatus::Active)
+    );
+
+    // Instance 2 attaches (simulating process restart) and registers `worker.job_v2`
+    let worker_v2 = kernel.attach_domain("worker");
+    let inst_2 = kernel
+        .router()
+        .domain_instance_id("worker")
+        .expect("Expected instance_id for worker v2");
+    assert!(inst_2 > inst_1);
+    worker_v2.register_handlers(&["job_v2"]);
+    let _ = worker_v2.drain_frames();
+
+    // Now simulate delayed reader thread exit from Instance 1 calling `mark_domain_faulted_for_instance`
+    let revoked = kernel.router().mark_domain_faulted_for_instance(
+        "worker",
+        Some(inst_1),
+        "delayed EOF from old reader thread",
+    );
+    assert!(
+        !revoked,
+        "Stale instance_id fault report must be ignored by KernelRouter"
+    );
+    assert_eq!(
+        kernel.router().domain_status("worker"),
+        Some(DomainStatus::Active),
+        "New instance must remain Active"
+    );
+    assert_eq!(
+        kernel.router().active_routes(),
+        vec!["worker.job_v2".to_string()],
+        "New instance routes must remain intact"
+    );
+
+    // Also verify stale raw pipe line from Instance 1 is ignored
+    kernel.router().handle_raw_pipe_line_for_instance(
+        "worker",
+        inst_1,
+        r#"{"frame_type":"send","seq":99,"targets":["kernel.registry"],"message_type":"UnregisterHandlers","params":{},"data":{}}"#,
+    );
+    assert_eq!(
+        kernel.router().active_routes(),
+        vec!["worker.job_v2".to_string()],
+        "Stale instance pipe line must not affect current instance"
+    );
+
+    // Faulting with the current `inst_2` succeeds as expected
+    let revoked_current = kernel.router().mark_domain_faulted_for_instance(
+        "worker",
+        Some(inst_2),
+        "current instance exited",
+    );
+    assert!(revoked_current);
+    assert_eq!(
+        kernel.router().domain_status("worker"),
+        Some(DomainStatus::Faulted)
+    );
+    assert!(kernel.router().active_routes().is_empty());
+}
+

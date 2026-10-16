@@ -35,6 +35,7 @@ echo "==> [4/4] Building Precompiled Rust Kernel Release Binary & Runtime Bundle
 cp "${ROOT_DIR}/target/release/atelier-kernel" "${RUNTIME_OUT}/atelier-kernel"
 chmod +x "${RUNTIME_OUT}/atelier-kernel"
 cp "${ROOT_DIR}/kernel_boot.json" "${RUNTIME_OUT}/kernel_boot.template.json"
+cp "${ROOT_DIR}/VARIANT_GUIDE.md" "${RUNTIME_OUT}/VARIANT_GUIDE.md"
 
 cat > "${RUNTIME_OUT}/README.md" <<'EOF'
 # Atelier Kernel Runtime Bundle

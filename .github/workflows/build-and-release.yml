@@ -91,6 +91,7 @@ jobs:
           mkdir -p dist/kernel-runtime-${{ matrix.target_label }}
           cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
           cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
+          cp VARIANT_GUIDE.md dist/kernel-runtime-${{ matrix.target_label }}/VARIANT_GUIDE.md
           python3 sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
           (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
           tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}

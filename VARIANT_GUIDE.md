@@ -265,3 +265,7 @@ domain.logger.phase("INFO", "finish", `库存 ${sku} 扣减完毕`);
      ```
      GitHub Actions 将自动创建 Release 页面并挂载全部平台运行包与 SDK 安装包。
 
+# v0.1.2: unexpected process exit recovery
+
+Each external domain accepts `auto_restart` (default true), `max_restarts` (default 10, null means unlimited), and `restart_delay_ms` (default 500). Unexpected process exit fails in-flight deliveries, revokes old routes, and schedules a fresh process generation; the restarted domain must register its handlers again. Explicit supervisor stop disables restart until explicitly started. More than five seconds of process uptime resets the consecutive restart counter. Delay is fixed, not exponential. Automatic restart restores process availability; it does not replay failed business requests or repair application defects. If spawning a replacement fails, the current implementation logs the failure without scheduling another attempt.
+

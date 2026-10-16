@@ -66,6 +66,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -99,7 +104,8 @@ jobs:
       - name: End-to-End Variant Smoke Test (--init + --smoke-test)
         shell: bash
         run: |
-          pip install dist/kernel-runtime-${{ matrix.target_label }}/sdk/atelier_sdk-0.1.0-py3-none-any.whl
+          python3 -m pip install dist/kernel-runtime-${{ matrix.target_label }}/sdk/atelier_sdk-0.1.0-py3-none-any.whl
+          export PYTHONPATH="$(pwd)/dist/kernel-runtime-${{ matrix.target_label }}/sdk/atelier_sdk-0.1.0-py3-none-any.whl"
           ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --init ./ci-smoke-variant
           ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --config ./ci-smoke-variant/kernel_boot.json --smoke-test
           rm -rf ./ci-smoke-variant

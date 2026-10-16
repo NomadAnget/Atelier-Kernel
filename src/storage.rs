@@ -25,6 +25,8 @@ pub enum StorageError {
     MissingParameter(&'static str),
     #[error("record '{0}' already exists in domain '{1}'")]
     DuplicateRecord(String, String),
+    #[error("cross-domain write forbidden: domain '{0}' cannot modify storage of domain '{1}'")]
+    CrossDomainWriteForbidden(String, String),
 }
 
 /// Stored row representation returned by `StorageQuery`.
@@ -45,6 +47,13 @@ pub struct StoredRecord {
 /// Upper-layer contract metadata defines the fixed table structure (`store_<domain>`),
 /// while the inner `data` packet is stored as standard JSON so business data structure
 /// evolution never alters kernel behavior or database schema.
+///
+/// Access policy:
+/// - **Write isolation**: `StorageInsert`, `StorageUpdate`, and `StorageDelete` can ONLY modify
+///   the sender's own table (`store_<source_domain>`). Attempting to specify another domain in
+///   `params.domain` or `params.target_domain` is rejected with `CrossDomainWriteForbidden`.
+/// - **Read sharing**: `StorageQuery` defaults to `store_<source_domain>`, but allows reading
+///   another domain's table by specifying `params.domain` or `params.target_domain`.
 pub struct DomainStorageEngine {
     conn: Mutex<Connection>,
 }
@@ -95,18 +104,50 @@ impl DomainStorageEngine {
         Ok(table)
     }
 
-    /// Executes a CRUD message sent to `kernel.storage` against the authenticated `msg.source_domain` table.
+    /// Executes a CRUD message sent to `kernel.storage`.
+    ///
+    /// - `StorageQuery` allows reading either the sender's own table or another domain's table
+    ///   specified via `params.domain` / `params.target_domain`.
+    /// - `StorageInsert`, `StorageUpdate`, and `StorageDelete` strictly enforce write isolation
+    ///   to `msg.source_domain`.
     pub fn execute_message(&self, msg: &KernelMessage) -> Result<Value, StorageError> {
-        let domain = &msg.source_domain;
-        let table = self.ensure_domain_table(domain)?;
+        let source_domain = &msg.source_domain;
+        let requested_domain = Self::requested_target_domain(msg);
 
         match msg.message_type.as_str() {
-            MSG_STORAGE_INSERT => self.handle_insert(domain, &table, msg),
-            MSG_STORAGE_QUERY => self.handle_query(&table, msg),
-            MSG_STORAGE_UPDATE => self.handle_update(&table, msg),
-            MSG_STORAGE_DELETE => self.handle_delete(&table, msg),
+            MSG_STORAGE_QUERY => {
+                let query_domain = requested_domain.unwrap_or(source_domain);
+                let table = self.ensure_domain_table(query_domain)?;
+                self.handle_query(query_domain, &table, msg)
+            }
+            MSG_STORAGE_INSERT | MSG_STORAGE_UPDATE | MSG_STORAGE_DELETE => {
+                if let Some(target_domain) = requested_domain
+                    && target_domain != source_domain
+                {
+                    return Err(StorageError::CrossDomainWriteForbidden(
+                        source_domain.clone(),
+                        target_domain.to_string(),
+                    ));
+                }
+                let table = self.ensure_domain_table(source_domain)?;
+                match msg.message_type.as_str() {
+                    MSG_STORAGE_INSERT => self.handle_insert(source_domain, &table, msg),
+                    MSG_STORAGE_UPDATE => self.handle_update(&table, msg),
+                    MSG_STORAGE_DELETE => self.handle_delete(&table, msg),
+                    _ => unreachable!(),
+                }
+            }
             other => Err(StorageError::UnsupportedStorageOperation(other.to_string())),
         }
+    }
+
+    fn requested_target_domain(msg: &KernelMessage) -> Option<&str> {
+        msg.params
+            .get("target_domain")
+            .or_else(|| msg.params.get("domain"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     fn handle_insert(
@@ -214,7 +255,12 @@ impl DomainStorageEngine {
         }))
     }
 
-    fn handle_query(&self, table: &str, msg: &KernelMessage) -> Result<Value, StorageError> {
+    fn handle_query(
+        &self,
+        domain: &str,
+        table: &str,
+        msg: &KernelMessage,
+    ) -> Result<Value, StorageError> {
         let record_id = msg.params.get("record_id").and_then(Value::as_str);
         let category = msg.params.get("category").and_then(Value::as_str);
         let filter = msg.params.get("filter").and_then(Value::as_object);
@@ -271,6 +317,7 @@ impl DomainStorageEngine {
         }
 
         Ok(json!({
+            "domain": domain,
             "count": matched.len(),
             "items": matched,
         }))

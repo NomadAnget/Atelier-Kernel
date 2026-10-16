@@ -21,7 +21,7 @@
 9. **四阶段标准回执、实时观察与“存储即消息”**：
    - 每条消息流转严格产出 **已发出（`Sent`）$\rightarrow$ 已接收（`Received`）$\rightarrow$ 开始执行（`Started`）$\rightarrow$ 执行完成（`Completed`）** 四阶段回执，发送端可接收全部状态。
    - 内核内置专门的**消息观察组件（Observer）**，实时观测全系统所有消息状态。
-   - 内核以“域”为单位利用上层契约元数据自动建表，内层存标准 JSON 数据包；存储操作以 `message_type` 表示，**增、删、改、查（CRUD）完全等同于向内核发送一条标准消息**。
+    - 内核以“域”为单位利用上层契约元数据自动建表，内层存标准 JSON 数据包；存储操作以 `message_type` 表示，**增、删、改、查（CRUD）完全等同于向内核发送一条标准消息**。写入操作（`StorageInsert` / `StorageUpdate` / `StorageDelete`）严格绑定物理管道所属域（禁止跨表写入），读取操作（`StorageQuery`）支持查询本域或通过 `params.domain` / `params.target_domain` 读取其他域表数据。
 
 ---
 
@@ -32,6 +32,6 @@
 | **核心协议与两层契约** | `src/protocol.rs` | 定义 `DomainToKernelFrame`、`KernelToDomainFrame`、`OutboundMessage`、`KernelMessage`、`MessageReceipt`、`ContractStatus` 及 `ObservationEvent`。 |
 | **ID 生成与三级幂等账本** | `src/ledger.rs` | 生成全局单调 `message_id`；维护 `(source_domain, seq)` 提交幂等表与 `(message_id, target)` 四阶段单向状态机。 |
 | **实时消息观察组件** | `src/observer.rs` | 独立旁路观察器 `KernelObserver`，支持多订阅者实时流式观测与历史事件检索，不阻塞主投递链路。 |
-| **按域存储引擎** | `src/storage.rs` | 基于 SQLite 的按域建表与隔离引擎，响应 `StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete` 消息并产生标准四阶段回执。 |
+| **按域存储引擎** | `src/storage.rs` | 基于 SQLite 的按域建表与“写隔离、读可跨表”存储引擎，响应 `StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete` 消息并产生标准四阶段回执。 |
 | **契约校验与自动路由器** | `src/router.rs` | 维护 `<domain>.<handler>` 路由表、执行 `TargetInvalid` 零盲发拦截、多目标独立分发、回执归属校验与状态推进。 |
 | **域宿主与管道生命周期** | `src/supervisor.rs` | 通过 OS `Stdio` 管道拉起多语言子进程、物理绑定 `domain_id` 身份、监控崩溃退出并自动触发 `ExecutionFailed` 恢复。 |

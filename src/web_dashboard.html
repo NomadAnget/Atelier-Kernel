@@ -371,8 +371,8 @@
           <button onclick="runPreset('reverse_push')">⑥ 触发其他域反向推前端<br><span class="sub-hint">order.callback_ui -> web_ui</span></button>
           <button onclick="runPreset('storage_insert')">⑦ 存储即消息: 新增<br><span class="sub-hint">StorageInsert 写入本域表</span></button>
           <button onclick="runPreset('storage_evolve')">⑧ 存储即消息: 结构演进<br><span class="sub-hint">StorageUpdate 动态加字段不改表</span></button>
-          <button onclick="runPreset('storage_query')">⑨ 存储即消息: 查询<br><span class="sub-hint">StorageQuery 读取 store_web_ui</span></button>
-          <button onclick="runPreset('storage_isolation')">⑩ 验证跨域表物理隔离<br><span class="sub-hint">尝试越权查 order 表 (返回 0 条)</span></button>
+          <button onclick="runPreset('storage_query')">⑨ 存储即消息: 跨域读取<br><span class="sub-hint">StorageQuery 读取 order 域表</span></button>
+          <button onclick="runPreset('storage_isolation')">⑩ 验证跨域写入拦截<br><span class="sub-hint">尝试越权改写 order 表 -> 拒绝</span></button>
         </div>
 
         <div class="card-header" style="margin-top:8px;">
@@ -754,16 +754,16 @@
           targets: ['kernel.storage'],
           message_type: 'StorageQuery',
           seq: 0,
-          params: { category: 'dashboard_widget' },
+          params: { domain: 'order', limit: 20 },
           data: {}
         });
       } else if (name === 'storage_isolation') {
         await sendToKernel({
           targets: ['kernel.storage'],
-          message_type: 'StorageQuery',
+          message_type: 'StorageInsert',
           seq: 0,
-          params: { domain: 'order', category: 'sales_order' },
-          data: {}
+          params: { domain: 'order', record_id: 'forged_order_999', category: 'sales_order' },
+          data: { forged: true }
         });
       }
     }

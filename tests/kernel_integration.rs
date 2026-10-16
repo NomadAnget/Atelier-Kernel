@@ -250,12 +250,11 @@ fn test_storage_as_messaging_and_domain_isolation() {
         "dark"
     );
 
-    // 4. Cross-domain isolation check: `analytics` domain queries for `u_1001` (even trying to pass `"domain": "user"`)
+    // 4. Default query without specifying `domain` queries `analytics`'s own isolated table (`store_analytics`)
     other_domain.storage_query(json!({
-        "domain": "user",
         "record_id": "u_1001"
     }));
-    let other_completed = other_domain
+    let own_query_completed = other_domain
         .drain_frames()
         .into_iter()
         .find_map(|f| match f {
@@ -263,12 +262,65 @@ fn test_storage_as_messaging_and_domain_isolation() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(
-        other_completed["count"], 0,
-        "Physical pipe identity must isolate per-domain tables"
+    assert_eq!(own_query_completed["domain"], "analytics");
+    assert_eq!(own_query_completed["count"], 0);
+
+    // 5. Cross-domain READ is allowed: `analytics` domain queries `user` domain's storage (`"domain": "user"`)
+    other_domain.storage_query(json!({
+        "domain": "user",
+        "record_id": "u_1001"
+    }));
+    let cross_read_completed = other_domain
+        .drain_frames()
+        .into_iter()
+        .find_map(|f| match f {
+            KernelToDomainFrame::Receipt(r) if r.status == ContractStatus::Completed => r.data,
+            _ => None,
+        })
+        .expect("Cross-domain StorageQuery should succeed");
+    assert_eq!(cross_read_completed["domain"], "user");
+    assert_eq!(cross_read_completed["count"], 1);
+    assert_eq!(cross_read_completed["items"][0]["data"]["name"], "Lin");
+
+    // 6. Cross-domain WRITE is strictly forbidden: `analytics` cannot Insert, Update, or Delete in `user` storage
+    other_domain.storage_update(
+        json!({"domain": "user", "record_id": "u_1001", "patch": true}),
+        json!({"role": "hacked"}),
+    );
+    let cross_update_failed = other_domain
+        .drain_frames()
+        .into_iter()
+        .find_map(|f| match f {
+            KernelToDomainFrame::Receipt(r) if r.status == ContractStatus::ExecutionFailed => {
+                r.data
+            }
+            _ => None,
+        })
+        .expect("Cross-domain StorageUpdate must be rejected with ExecutionFailed");
+    assert!(
+        cross_update_failed
+            .to_string()
+            .contains("cross-domain write forbidden")
     );
 
-    // 5. Delete record via `StorageDelete` message
+    other_domain.storage_delete(json!({"target_domain": "user", "record_id": "u_1001"}));
+    let cross_delete_failed = other_domain
+        .drain_frames()
+        .into_iter()
+        .find_map(|f| match f {
+            KernelToDomainFrame::Receipt(r) if r.status == ContractStatus::ExecutionFailed => {
+                r.data
+            }
+            _ => None,
+        })
+        .expect("Cross-domain StorageDelete must be rejected with ExecutionFailed");
+    assert!(
+        cross_delete_failed
+            .to_string()
+            .contains("cross-domain write forbidden")
+    );
+
+    // 7. Owner domain (`user`) can delete its own record via `StorageDelete`
     user_domain.storage_delete(json!({"record_id": "u_1001"}));
     let delete_completed = user_domain
         .drain_frames()

@@ -31,9 +31,9 @@ from atelier_sdk import AtelierDomain
 domain = AtelierDomain()
 
 @domain.handler("ping")
-def on_ping(msg):
+async def on_ping(msg):
     domain.logger.info("Received ping from %s", msg.source_domain)
-    domain.storage_insert(record_id="last_ping", category="health", data=msg.data)
+    await domain.storage_insert_async(record_id="last_ping", category="health", data=msg.data)
     domain.logger.phase("INFO", "finish", "Handled ping request")
     return {"pong": True, "from": "sample_py", "received": msg.data}
 
@@ -56,7 +56,10 @@ fn init_variant_skeleton(target_dir: &str) -> Result<(), Box<dyn std::error::Err
         fs::write(&sample_py_path, SAMPLE_PY_DOMAIN)?;
     }
 
-    println!("Initialized Atelier Kernel variant skeleton at: {}", root.display());
+    println!(
+        "Initialized Atelier Kernel variant skeleton at: {}",
+        root.display()
+    );
     println!("  - Config:  {}", cfg_path.display());
     println!("  - Domain:  {}", sample_py_path.display());
     println!("Run with: atelier-kernel --config {}", cfg_path.display());
@@ -81,7 +84,9 @@ fn run_variant_smoke_test(
     for (domain_id, res) in spawn_results {
         match res {
             Ok(pid) => println!("[SmokeTest] Spawned domain '{}' (pid={})", domain_id, pid),
-            Err(err) => return Err(format!("Failed to spawn domain '{}': {}", domain_id, err).into()),
+            Err(err) => {
+                return Err(format!("Failed to spawn domain '{}': {}", domain_id, err).into());
+            }
         }
     }
 
@@ -110,7 +115,10 @@ fn run_variant_smoke_test(
     }
 
     let active_routes = kernel.router().active_routes();
-    println!("[SmokeTest] All configured domains Active! Registered routes: {:?}", active_routes);
+    println!(
+        "[SmokeTest] All configured domains Active! Registered routes: {:?}",
+        active_routes
+    );
 
     // 2. Attach probe domain and send a message to the first registered route of each domain
     let probe = kernel.attach_domain("smoke_verifier");
@@ -129,11 +137,17 @@ fn run_variant_smoke_test(
         json!({ "hello": "variant_verification" }),
     );
     println!(
-        "[SmokeTest] Dispatched probe message '{}' to targets {:?}",
+        "[SmokeTest] Dispatched probe messages '{:?}' to targets {:?}",
         msg_id, target_routes
     );
 
     let mut completed_targets = HashSet::new();
+    let mut logical_ids = HashSet::new();
+    if msg_id.len() != target_routes.len()
+        || msg_id.iter().collect::<HashSet<_>>().len() != target_routes.len()
+    {
+        return Err("Fan-out must allocate a distinct message ID per target".into());
+    }
     let mut seen_stages_per_target: std::collections::HashMap<String, Vec<ContractStatus>> =
         std::collections::HashMap::new();
 
@@ -148,8 +162,15 @@ fn run_variant_smoke_test(
         }
         for frame in probe.drain_frames() {
             if let KernelToDomainFrame::Receipt(r) = frame
-                && r.message_id == msg_id
+                && msg_id.contains(&r.message_id)
             {
+                if r.logical_id.is_empty() || r.logical_id == r.message_id {
+                    return Err("Receipt must carry distinct logical_id and message_id".into());
+                }
+                logical_ids.insert(r.logical_id.clone());
+                if logical_ids.len() != 1 {
+                    return Err("Fan-out receipts must share the submission logical_id".into());
+                }
                 seen_stages_per_target
                     .entry(r.target.clone())
                     .or_default()
@@ -178,7 +199,10 @@ fn run_variant_smoke_test(
 
     // Verify every target went through Sent -> Received -> Started -> Completed
     for route in &target_routes {
-        let stages = seen_stages_per_target.get(route).cloned().unwrap_or_default();
+        let stages = seen_stages_per_target
+            .get(route)
+            .cloned()
+            .unwrap_or_default();
         if stages
             != vec![
                 ContractStatus::Sent,
@@ -187,11 +211,7 @@ fn run_variant_smoke_test(
                 ContractStatus::Completed,
             ]
         {
-            return Err(format!(
-                "Unexpected receipt stages for '{}': {:?}",
-                route, stages
-            )
-            .into());
+            return Err(format!("Unexpected receipt stages for '{}': {:?}", route, stages).into());
         }
     }
 
@@ -202,15 +222,25 @@ fn run_variant_smoke_test(
 
     // Verify SQLite hub_logs persistence
     thread::sleep(Duration::from_millis(250));
-    let persisted_logs = kernel.logger().query_logs(20, None, None, None, None, None)?;
-    println!("[SmokeTest] Verified hub_logs persistence: recorded {} structured log entries in SQLite", persisted_logs.len());
+    let persisted_logs = kernel
+        .logger()
+        .query_logs(20, None, None, None, None, None)?;
+    println!(
+        "[SmokeTest] Verified hub_logs persistence: recorded {} structured log entries in SQLite",
+        persisted_logs.len()
+    );
 
-    println!("[SmokeTest] Variant smoke test PASSED (registration + 4-stage messaging + unified hub_logs verified)!");
+    println!(
+        "[SmokeTest] Variant smoke test PASSED (registration + 4-stage messaging + unified hub_logs verified)!"
+    );
     Ok(())
 }
 
 fn print_help() {
-    println!("Atelier Kernel v{} — Single-Machine Multi-Domain Microkernel Runtime", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Atelier Kernel v{} — Single-Machine Multi-Domain Microkernel Runtime",
+        env!("CARGO_PKG_VERSION")
+    );
     println!();
     println!("USAGE:");
     println!("  atelier-kernel [OPTIONS]");
@@ -218,7 +248,9 @@ fn print_help() {
     println!("OPTIONS:");
     println!("  --config <path>   Path to boot configuration JSON (default: ./kernel_boot.json)");
     println!("  --headless        Run pure microkernel supervisor without Web UI dashboard");
-    println!("  --smoke-test      Boot variant, verify domain registration & 4-stage messaging, and exit");
+    println!(
+        "  --smoke-test      Boot variant, verify domain registration & 4-stage messaging, and exit"
+    );
     println!("  --cli             Run interactive CLI REPL frontend domain");
     println!("  --auto, -a        Run automated 7-stage kernel verification suite and exit");
     println!("  --init <dir>      Initialize a new product variant directory with config template");

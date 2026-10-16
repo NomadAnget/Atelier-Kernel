@@ -38,6 +38,7 @@ struct DomainControlRequest {
 
 #[derive(Debug, Clone, Serialize)]
 struct FlowSummary {
+    logical_id: String,
     message_id: String,
     seq: u64,
     source_domain: String,
@@ -148,7 +149,10 @@ impl WebFrontendDomain {
         println!("  Atelier Kernel V3.1 — 网页前端域 (`web_ui`) & 实时内核观察页面已启动！");
         println!("  👉 请在浏览器打开: http://{bind_addr}");
         println!("----------------------------------------------------------------------------");
-        println!("  当前已挂载域与自动路由列表: {:?}", self.kernel.router().active_routes());
+        println!(
+            "  当前已挂载域与自动路由列表: {:?}",
+            self.kernel.router().active_routes()
+        );
         println!("============================================================================");
 
         for stream in listener.incoming().flatten() {
@@ -190,12 +194,9 @@ impl WebFrontendDomain {
                 "text/html; charset=utf-8",
                 DASHBOARD_HTML.as_bytes(),
             ),
-            ("HEAD", "/") | ("HEAD", "/index.html") => self.write_response(
-                &mut stream,
-                "200 OK",
-                "text/html; charset=utf-8",
-                b"",
-            ),
+            ("HEAD", "/") | ("HEAD", "/index.html") => {
+                self.write_response(&mut stream, "200 OK", "text/html; charset=utf-8", b"")
+            }
             ("GET", p) if p.starts_with("/api/snapshot") => {
                 let snap = self.build_snapshot_json();
                 let bytes = serde_json::to_vec(&snap).unwrap_or_default();
@@ -220,7 +221,11 @@ impl WebFrontendDomain {
                         self.client
                             .send(req.targets, req.message_type, params, req.data)
                     };
-                    let resp = json!({ "ok": true, "message_id": msg_id });
+                    let logical_id = msg_id
+                        .first()
+                        .map(|id| self.kernel.ledger().logical_id_for_message(id));
+                    let resp =
+                        json!({ "ok": true, "logical_id": logical_id, "message_ids": msg_id });
                     let bytes = serde_json::to_vec(&resp).unwrap_or_default();
                     self.write_response(&mut stream, "200 OK", "application/json", &bytes)
                 } else {
@@ -245,12 +250,8 @@ impl WebFrontendDomain {
                     )
                 }
             }
-            ("GET", p) if p.starts_with("/api/logs/stream") => {
-                self.handle_logs_stream(stream)
-            }
-            ("GET", p) if p.starts_with("/api/logs") => {
-                self.handle_query_logs(&mut stream, p)
-            }
+            ("GET", p) if p.starts_with("/api/logs/stream") => self.handle_logs_stream(stream),
+            ("GET", p) if p.starts_with("/api/logs") => self.handle_query_logs(&mut stream, p),
             _ => self.write_response(&mut stream, "404 Not Found", "text/plain", b"Not Found"),
         }
     }
@@ -433,6 +434,7 @@ impl WebFrontendDomain {
             let entry = flow_map.entry(key.clone()).or_insert_with(|| {
                 flow_order.push(key);
                 FlowSummary {
+                    logical_id: ev.logical_id.clone(),
                     message_id: ev.message_id.clone(),
                     seq: ev.seq,
                     source_domain: ev.source_domain.clone(),

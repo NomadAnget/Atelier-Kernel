@@ -9,7 +9,8 @@ use serde_json::json;
 #[test]
 fn test_log_origin_additive_migration_and_restart() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tmp").join(format!("origin-migration-{}", uuid::Uuid::new_v4()));
+        .join("tmp")
+        .join(format!("origin-migration-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("logs.db");
     {
@@ -19,8 +20,17 @@ fn test_log_origin_additive_migration_and_restart() {
     for _ in 0..2 {
         let kernel = AtelierKernel::open_with_db(&path).unwrap();
         kernel.logger().set_console_enabled(false);
-        let rows = kernel.logger().query_logs(100, None, None, None, None, None).unwrap();
-        assert_eq!(rows.iter().find(|r| r.message == "legacy").unwrap().source_domain, None);
+        let rows = kernel
+            .logger()
+            .query_logs(100, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .find(|r| r.message == "legacy")
+                .unwrap()
+                .source_domain,
+            None
+        );
     }
 }
 
@@ -32,7 +42,7 @@ fn test_registration_routing_and_target_invalid_interception() {
     let worker = kernel.attach_domain("billing");
 
     // Before registration, `billing` is in `Spawning` state -> sending to `billing.charge` must return `TargetInvalid` without sending.
-    let pre_msg_id = sender.send(
+    let pre_msg_id = sender.send_one(
         vec!["billing.charge".to_string()],
         "ChargeOrder",
         json!({}),
@@ -64,7 +74,7 @@ fn test_registration_routing_and_target_invalid_interception() {
     );
 
     // Send a multi-target message: one valid (`billing.charge`) and one non-existent (`billing.non_existent`)
-    let multi_msg_id = sender.send(
+    let multi_msg_ids = sender.send(
         vec![
             "billing.charge".to_string(),
             "billing.non_existent".to_string(),
@@ -79,7 +89,9 @@ fn test_registration_routing_and_target_invalid_interception() {
     assert_eq!(worker_frames.len(), 1);
     match &worker_frames[0] {
         KernelToDomainFrame::Deliver(msg) => {
-            assert_eq!(msg.message_id, multi_msg_id);
+            assert_eq!(msg.message_id, multi_msg_ids[0]);
+            assert_ne!(multi_msg_ids[0], multi_msg_ids[1]);
+            assert_ne!(msg.logical_id, msg.message_id);
             assert_eq!(msg.source_domain, "gateway");
             assert_eq!(msg.target, "billing.charge");
         }
@@ -118,7 +130,7 @@ fn test_four_stage_receipts_and_kernel_idempotency() {
     let _ = rogue.drain_frames();
 
     // Order sends a message with explicit `seq = 42`
-    let msg_id_1 = order.send_with_seq(
+    let msg_id_1 = order.send_one_with_seq(
         42,
         vec!["inventory.reserve".to_string()],
         "ReserveStock",
@@ -128,7 +140,7 @@ fn test_four_stage_receipts_and_kernel_idempotency() {
 
     // Level 1 Idempotency: Resending with the same `(domain="order", seq=42)` must NOT re-deliver to `inventory`
     // and must return the exact same `message_id`!
-    let msg_id_2 = order.send_with_seq(
+    let msg_id_2 = order.send_one_with_seq(
         42,
         vec!["inventory.reserve".to_string()],
         "ReserveStock",
@@ -155,11 +167,26 @@ fn test_four_stage_receipts_and_kernel_idempotency() {
     );
 
     // Inventory reports `Received` twice -> Kernel Level 3 Idempotency must only forward once
-    inventory.report_receipt(&msg_id_1, "inventory.reserve", ContractStatus::Received, None);
-    inventory.report_receipt(&msg_id_1, "inventory.reserve", ContractStatus::Received, None);
+    inventory.report_receipt(
+        &msg_id_1,
+        "inventory.reserve",
+        ContractStatus::Received,
+        None,
+    );
+    inventory.report_receipt(
+        &msg_id_1,
+        "inventory.reserve",
+        ContractStatus::Received,
+        None,
+    );
 
     // Inventory reports `Started`
-    inventory.report_receipt(&msg_id_1, "inventory.reserve", ContractStatus::Started, None);
+    inventory.report_receipt(
+        &msg_id_1,
+        "inventory.reserve",
+        ContractStatus::Started,
+        None,
+    );
 
     // Inventory reports `Completed` with output data, plus a late `Started` and duplicate `Completed`
     inventory.report_receipt(
@@ -168,7 +195,12 @@ fn test_four_stage_receipts_and_kernel_idempotency() {
         ContractStatus::Completed,
         Some(json!({"reserved_id": "RES-777"})),
     );
-    inventory.report_receipt(&msg_id_1, "inventory.reserve", ContractStatus::Started, None);
+    inventory.report_receipt(
+        &msg_id_1,
+        "inventory.reserve",
+        ContractStatus::Started,
+        None,
+    );
     inventory.report_receipt(
         &msg_id_1,
         "inventory.reserve",
@@ -345,7 +377,8 @@ fn test_storage_as_messaging_and_domain_isolation() {
         .into_iter()
         .find_map(|f| match f {
             KernelToDomainFrame::Receipt(r)
-                if r.message_type == MSG_STORAGE_DELETE && r.status == ContractStatus::Completed =>
+                if r.message_type == MSG_STORAGE_DELETE
+                    && r.status == ContractStatus::Completed =>
             {
                 r.data
             }
@@ -404,7 +437,7 @@ fn test_os_process_stdio_supervision_and_observer() {
     assert!(active, "External child process domain should become Active");
 
     // Caller sends message to `ext_sh.echo`
-    let msg_id = caller.send(
+    let msg_id = caller.send_one(
         vec!["ext_sh.echo".to_string()],
         "EchoTest",
         json!({"mode": "stdio"}),
@@ -549,8 +582,20 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
     let rx = kernel.logger().subscribe();
 
     // 1. Log structured lifecycle events with `phase`
-    kernel.logger().phase("INFO", "ENGINES", "model_runner", "start", "Initializing neural weights");
-    kernel.logger().phase("INFO", "ENGINES", "model_runner", "finish", "Weights loaded successfully");
+    kernel.logger().phase(
+        "INFO",
+        "ENGINES",
+        "model_runner",
+        "start",
+        "Initializing neural weights",
+    );
+    kernel.logger().phase(
+        "INFO",
+        "ENGINES",
+        "model_runner",
+        "finish",
+        "Weights loaded successfully",
+    );
 
     // 2. Log high-frequency heartbeat with `console_only = true`
     kernel.logger().reinject(atelier_kernel::LogRecord {
@@ -621,28 +666,56 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
     // - 1 pipe log ("Order #1001 processed")
     // NOTE: console_only heartbeat was NOT sent to subscribers!
     assert_eq!(received_records.len(), 5);
-    assert_eq!(received_records.iter().find(|r| r.message == "Order #1001 processed").unwrap().source_domain.as_deref(), Some("order"));
-    assert!(!received_records.iter().any(|r| r.message == "tick-heartbeat"));
+    assert_eq!(
+        received_records
+            .iter()
+            .find(|r| r.message == "Order #1001 processed")
+            .unwrap()
+            .source_domain
+            .as_deref(),
+        Some("order")
+    );
+    assert!(
+        !received_records
+            .iter()
+            .any(|r| r.message == "tick-heartbeat")
+    );
 
     // Wait briefly for LogStore async writer batch to flush to disk
     std::thread::sleep(Duration::from_millis(350));
 
     // 5. Query persisted `hub_logs`
-    let stored_logs = kernel.logger().query_logs(100, None, None, None, None, None).unwrap();
+    let stored_logs = kernel
+        .logger()
+        .query_logs(100, None, None, None, None, None)
+        .unwrap();
 
     // Verify hub_logs contains only true historical logs, NOT ephemeral progress and NOT console_only!
-    assert!(!stored_logs.iter().any(|l| l.message.contains("Downloading")));
+    assert!(
+        !stored_logs
+            .iter()
+            .any(|l| l.message.contains("Downloading"))
+    );
     assert!(!stored_logs.iter().any(|l| l.message == "tick-heartbeat"));
 
-    let start_log = stored_logs.iter().find(|l| l.message == "Initializing neural weights").expect("start log persisted");
+    let start_log = stored_logs
+        .iter()
+        .find(|l| l.message == "Initializing neural weights")
+        .expect("start log persisted");
     assert_eq!(start_log.phase, "start");
     assert_eq!(start_log.source_domain.as_deref(), Some("kernel"));
     assert_eq!(start_log.layer, "ENGINES");
 
-    let finish_log = stored_logs.iter().find(|l| l.message == "Weights loaded successfully").expect("finish log persisted");
+    let finish_log = stored_logs
+        .iter()
+        .find(|l| l.message == "Weights loaded successfully")
+        .expect("finish log persisted");
     assert_eq!(finish_log.phase, "finish");
 
-    let pipe_log = stored_logs.iter().find(|l| l.message == "Order #1001 processed").expect("pipe log persisted");
+    let pipe_log = stored_logs
+        .iter()
+        .find(|l| l.message == "Order #1001 processed")
+        .expect("pipe log persisted");
     assert_eq!(pipe_log.component, "order");
     assert_eq!(pipe_log.phase, "finish");
     assert_eq!(pipe_log.source_domain.as_deref(), Some("order"));
@@ -705,7 +778,7 @@ fn test_domain_auto_restart_on_unexpected_exit() {
     let inst1 = kernel.router().domain_instance_id("resilient_sh").unwrap();
 
     // 2. Normal ping check
-    let msg1 = caller.send(
+    let msg1 = caller.send_one(
         vec!["resilient_sh.ping".to_string()],
         "PingTest",
         json!({}),
@@ -713,7 +786,9 @@ fn test_domain_auto_restart_on_unexpected_exit() {
     );
     let mut completed1 = false;
     for _ in 0..4 {
-        if let Ok(KernelToDomainFrame::Receipt(r)) = caller.recv_frame_timeout(Duration::from_secs(2)) {
+        if let Ok(KernelToDomainFrame::Receipt(r)) =
+            caller.recv_frame_timeout(Duration::from_secs(2))
+        {
             if r.message_id == msg1 && r.status == ContractStatus::Completed {
                 completed1 = true;
                 break;
@@ -723,7 +798,7 @@ fn test_domain_auto_restart_on_unexpected_exit() {
     assert!(completed1, "Initial ping should complete");
 
     // 3. Send crash message to trigger unexpected exit
-    let _msg_crash = caller.send(
+    let _msg_crash = caller.send_one(
         vec!["resilient_sh.ping".to_string()],
         "CrashTest",
         json!({}),
@@ -749,12 +824,18 @@ fn test_domain_auto_restart_on_unexpected_exit() {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert!(restarted, "Domain should be automatically restarted and become Active again");
-    assert!(inst2 > inst1, "Restarted instance must have higher generation instance_id");
+    assert!(
+        restarted,
+        "Domain should be automatically restarted and become Active again"
+    );
+    assert!(
+        inst2 > inst1,
+        "Restarted instance must have higher generation instance_id"
+    );
     assert!(kernel.supervisor().restart_count("resilient_sh") >= 1);
 
     // 5. Send message to the new instance and verify it handles it cleanly
-    let msg2 = caller.send(
+    let msg2 = caller.send_one(
         vec!["resilient_sh.ping".to_string()],
         "PingTest2",
         json!({}),
@@ -762,14 +843,19 @@ fn test_domain_auto_restart_on_unexpected_exit() {
     );
     let mut completed2 = false;
     for _ in 0..4 {
-        if let Ok(KernelToDomainFrame::Receipt(r)) = caller.recv_frame_timeout(Duration::from_secs(2)) {
+        if let Ok(KernelToDomainFrame::Receipt(r)) =
+            caller.recv_frame_timeout(Duration::from_secs(2))
+        {
             if r.message_id == msg2 && r.status == ContractStatus::Completed {
                 completed2 = true;
                 break;
             }
         }
     }
-    assert!(completed2, "Ping after auto-restart must complete successfully");
+    assert!(
+        completed2,
+        "Ping after auto-restart must complete successfully"
+    );
 
     // Clean stop
     assert!(kernel.supervisor().stop_process_domain("resilient_sh"));
@@ -806,7 +892,10 @@ fn test_explicit_stop_does_not_auto_restart() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    assert_eq!(kernel.router().domain_status("stop_test"), Some(DomainStatus::Active));
+    assert_eq!(
+        kernel.router().domain_status("stop_test"),
+        Some(DomainStatus::Active)
+    );
 
     // Explicit stop
     assert!(kernel.supervisor().stop_process_domain("stop_test"));
@@ -816,7 +905,10 @@ fn test_explicit_stop_does_not_auto_restart() {
     std::thread::sleep(Duration::from_millis(150));
 
     // Must remain stopped / faulted, NOT auto-restarted
-    assert_ne!(kernel.router().domain_status("stop_test"), Some(DomainStatus::Active));
+    assert_ne!(
+        kernel.router().domain_status("stop_test"),
+        Some(DomainStatus::Active)
+    );
     assert!(kernel.router().active_routes().is_empty());
 }
 
@@ -843,9 +935,13 @@ fn test_auto_restart_respects_max_restarts_limit() {
 
     // Verify it attempted restarts up to limit and stopped
     let count = kernel.supervisor().restart_count("doomed_domain");
-    assert!(count >= 2, "Expected at least 2 restart attempts, got {}", count);
-    assert_eq!(kernel.router().domain_status("doomed_domain"), Some(DomainStatus::Faulted));
+    assert!(
+        count >= 2,
+        "Expected at least 2 restart attempts, got {}",
+        count
+    );
+    assert_eq!(
+        kernel.router().domain_status("doomed_domain"),
+        Some(DomainStatus::Faulted)
+    );
 }
-
-
-

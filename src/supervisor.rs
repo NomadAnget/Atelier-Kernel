@@ -96,8 +96,7 @@ impl KernelBootConfig {
                         spec.working_dir = Some(base_dir.to_string_lossy().to_string());
                     }
                     Some(dir) if std::path::Path::new(dir).is_relative() => {
-                        spec.working_dir =
-                            Some(base_dir.join(dir).to_string_lossy().to_string());
+                        spec.working_dir = Some(base_dir.join(dir).to_string_lossy().to_string());
                     }
                     _ => {}
                 }
@@ -152,7 +151,11 @@ impl Default for DomainProcessSpec {
 }
 
 impl DomainProcessSpec {
-    pub fn new(domain_id: impl Into<String>, command: impl Into<String>, args: Vec<String>) -> Self {
+    pub fn new(
+        domain_id: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+    ) -> Self {
         Self {
             domain_id: domain_id.into(),
             command: command.into(),
@@ -254,10 +257,12 @@ impl DomainSupervisorInner {
                     if let Some(dir) = &spec.working_dir {
                         fallback.current_dir(dir);
                     }
-                    fallback.spawn().map_err(|source| SupervisorError::SpawnFailed {
-                        domain: domain_id.clone(),
-                        source,
-                    })?
+                    fallback
+                        .spawn()
+                        .map_err(|source| SupervisorError::SpawnFailed {
+                            domain: domain_id.clone(),
+                            source,
+                        })?
                 } else {
                     return Err(SupervisorError::SpawnFailed {
                         domain: domain_id.clone(),
@@ -301,10 +306,12 @@ impl DomainSupervisorInner {
 
         {
             let mut trackers = self.restart_trackers.lock();
-            let tracker = trackers.entry(domain_id.clone()).or_insert_with(|| RestartTracker {
-                consecutive_restarts: 0,
-                last_spawn_instant: None,
-            });
+            let tracker = trackers
+                .entry(domain_id.clone())
+                .or_insert_with(|| RestartTracker {
+                    consecutive_restarts: 0,
+                    last_spawn_instant: None,
+                });
             tracker.last_spawn_instant = Some(Instant::now());
         }
 
@@ -670,7 +677,10 @@ impl DomainSupervisor {
     }
 
     /// Boots all domains declared in `config.domains`.
-    pub fn boot_from_config(&self, config: &KernelBootConfig) -> Vec<(String, Result<u32, SupervisorError>)> {
+    pub fn boot_from_config(
+        &self,
+        config: &KernelBootConfig,
+    ) -> Vec<(String, Result<u32, SupervisorError>)> {
         let mut results = Vec::new();
         for spec in &config.domains {
             let domain_id = spec.domain_id.clone();
@@ -777,8 +787,11 @@ impl DomainPipeClient {
 
     /// Primitive 1: Registers the list of message handlers this domain can process.
     pub fn register_handlers(&self, handlers: &[&str]) -> String {
-        let handler_list: Vec<Value> = handlers.iter().map(|h| Value::String((*h).into())).collect();
-        self.send(
+        let handler_list: Vec<Value> = handlers
+            .iter()
+            .map(|h| Value::String((*h).into()))
+            .collect();
+        self.send_one(
             vec![KERNEL_REGISTRY_TARGET.to_string()],
             MSG_REGISTER_HANDLERS,
             json!({ "handlers": handler_list }),
@@ -787,14 +800,14 @@ impl DomainPipeClient {
     }
 
     /// Primitive 2: Sends a two-layer message to one or more `"<domain>.<handler>"` targets.
-    /// Returns the kernel-assigned `message_id`.
+    /// Returns ordered kernel-assigned child `message_id`s.
     pub fn send(
         &self,
         targets: Vec<String>,
         message_type: impl Into<String>,
         params: Value,
         data: Value,
-    ) -> String {
+    ) -> Vec<String> {
         let seq = self.next_seq();
         self.send_with_seq(seq, targets, message_type, params, data)
     }
@@ -807,7 +820,7 @@ impl DomainPipeClient {
         message_type: impl Into<String>,
         params: Value,
         data: Value,
-    ) -> String {
+    ) -> Vec<String> {
         let outbound = OutboundMessage {
             seq,
             targets,
@@ -821,6 +834,36 @@ impl DomainPipeClient {
                 self.instance_id,
                 DomainToKernelFrame::Send(outbound),
             )
+            .unwrap_or_default()
+    }
+
+    /// Convenience for an explicitly single-target submission.
+    pub fn send_one(
+        &self,
+        targets: Vec<String>,
+        message_type: impl Into<String>,
+        params: Value,
+        data: Value,
+    ) -> String {
+        assert_eq!(targets.len(), 1, "send_one requires one target");
+        self.send(targets, message_type, params, data)
+            .into_iter()
+            .next()
+            .unwrap_or_default()
+    }
+
+    pub fn send_one_with_seq(
+        &self,
+        seq: u64,
+        targets: Vec<String>,
+        message_type: impl Into<String>,
+        params: Value,
+        data: Value,
+    ) -> String {
+        assert_eq!(targets.len(), 1, "send_one_with_seq requires one target");
+        self.send_with_seq(seq, targets, message_type, params, data)
+            .into_iter()
+            .next()
             .unwrap_or_default()
     }
 
@@ -847,7 +890,7 @@ impl DomainPipeClient {
 
     /// Helper: Sends a `StorageInsert` message to `kernel.storage`.
     pub fn storage_insert(&self, params: Value, data: Value) -> String {
-        self.send(
+        self.send_one(
             vec![KERNEL_STORAGE_TARGET.to_string()],
             MSG_STORAGE_INSERT,
             params,
@@ -857,7 +900,7 @@ impl DomainPipeClient {
 
     /// Helper: Sends a `StorageQuery` message to `kernel.storage`.
     pub fn storage_query(&self, params: Value) -> String {
-        self.send(
+        self.send_one(
             vec![KERNEL_STORAGE_TARGET.to_string()],
             MSG_STORAGE_QUERY,
             params,
@@ -867,7 +910,7 @@ impl DomainPipeClient {
 
     /// Helper: Sends a `StorageUpdate` message to `kernel.storage`.
     pub fn storage_update(&self, params: Value, data: Value) -> String {
-        self.send(
+        self.send_one(
             vec![KERNEL_STORAGE_TARGET.to_string()],
             MSG_STORAGE_UPDATE,
             params,
@@ -877,7 +920,7 @@ impl DomainPipeClient {
 
     /// Helper: Sends a `StorageDelete` message to `kernel.storage`.
     pub fn storage_delete(&self, params: Value) -> String {
-        self.send(
+        self.send_one(
             vec![KERNEL_STORAGE_TARGET.to_string()],
             MSG_STORAGE_DELETE,
             params,

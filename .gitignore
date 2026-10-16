@@ -1,6 +1,7 @@
 /target/
 /data/
 /dist/
+/tmp/
 __pycache__/
 *.pyc
 *.egg-info/

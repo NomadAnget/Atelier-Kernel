@@ -195,12 +195,14 @@ impl KernelRouter {
                 self.handle_frame_inner(authenticated_domain, frame);
             }
             Err(err) => {
-                let msg_id = self.ledger.generate_message_id();
+                let (_, ids, _) = self.ledger.allocate_submission(authenticated_domain, 0, 1);
+                let msg_id = ids[0].clone();
                 let err_data = Some(json!({
                     "error": "invalid_json_frame",
                     "reason": err.to_string(),
                 }));
                 let receipt = MessageReceipt {
+                    logical_id: self.ledger.logical_id_for_message(&msg_id),
                     message_id: msg_id.clone(),
                     seq: 0,
                     target: "kernel.contract".to_string(),
@@ -213,6 +215,7 @@ impl KernelRouter {
                     authenticated_domain,
                     "kernel.contract",
                     &msg_id,
+                    &self.ledger.logical_id_for_message(&msg_id),
                     0,
                     "MalformedFrame",
                     ContractStatus::ContractInvalid,
@@ -233,7 +236,7 @@ impl KernelRouter {
         authenticated_domain: &str,
         instance_id: u64,
         frame: DomainToKernelFrame,
-    ) -> Option<String> {
+    ) -> Option<Vec<String>> {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
         if self.domain_instance_id(authenticated_domain) != Some(instance_id) {
@@ -243,12 +246,12 @@ impl KernelRouter {
     }
 
     /// Processes a structured `DomainToKernelFrame` from `authenticated_domain`.
-    /// Returns the kernel-assigned `message_id` when the frame is a `Send`.
+    /// Returns ordered kernel-assigned child IDs when the frame is a `Send`.
     pub fn handle_frame(
         &self,
         authenticated_domain: &str,
         frame: DomainToKernelFrame,
-    ) -> Option<String> {
+    ) -> Option<Vec<String>> {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
         self.handle_frame_inner(authenticated_domain, frame)
@@ -258,7 +261,7 @@ impl KernelRouter {
         &self,
         authenticated_domain: &str,
         frame: DomainToKernelFrame,
-    ) -> Option<String> {
+    ) -> Option<Vec<String>> {
         match frame {
             DomainToKernelFrame::Send(outbound) => {
                 Some(self.handle_outbound_message(authenticated_domain, outbound))
@@ -288,83 +291,74 @@ impl KernelRouter {
         &self,
         authenticated_domain: &str,
         outbound: OutboundMessage,
-    ) -> String {
-        // 1. Validate outer contract metadata.
-        if outbound.targets.is_empty()
+    ) -> Vec<String> {
+        let invalid = outbound.targets.is_empty()
             || outbound.message_type.trim().is_empty()
-            || !outbound.params.is_object()
-        {
-            let msg_id = self.ledger.generate_message_id();
-            let err_data = Some(json!({
-                "error": "contract_validation_failed",
-                "reason": "targets must be non-empty, message_type must be non-empty, and params must be a JSON object",
-            }));
-            let (rec, _) = self.ledger.record_initial_target_state(
-                &msg_id,
-                outbound.seq,
-                authenticated_domain,
-                "kernel.contract",
-                &outbound.message_type,
-                ContractStatus::ContractInvalid,
-                err_data.clone(),
-            );
-            self.observer.emit(
-                authenticated_domain,
-                "kernel.contract",
-                &msg_id,
-                outbound.seq,
-                &outbound.message_type,
-                ContractStatus::ContractInvalid,
-                err_data,
-            );
-            self.send_to_domain_pipe(
-                authenticated_domain,
-                KernelToDomainFrame::Receipt(rec.to_receipt()),
-            );
-            return msg_id;
-        }
-
-        // 2. Level 1 Idempotency: allocate kernel `message_id` or deduplicate by `(authenticated_domain, seq)`.
-        let (message_id, is_duplicate_submission) = self
-            .ledger
-            .allocate_or_get_message_id(authenticated_domain, outbound.seq);
-
-        if is_duplicate_submission {
-            // Replay current authoritative receipts for this `message_id` without re-delivering!
-            for receipt in self.ledger.receipts_for_message(&message_id) {
+            || !outbound.params.is_object();
+        let mut seen = HashSet::new();
+        let targets: Vec<String> = if invalid {
+            vec!["kernel.contract".into()]
+        } else {
+            outbound
+                .targets
+                .iter()
+                .filter(|t| seen.insert((*t).clone()))
+                .cloned()
+                .collect()
+        };
+        let (logical_id, ids, duplicate) =
+            self.ledger
+                .allocate_submission(authenticated_domain, outbound.seq, targets.len());
+        if duplicate {
+            for receipt in self.ledger.receipts_for_logical(&logical_id) {
                 self.send_to_domain_pipe(
                     authenticated_domain,
                     KernelToDomainFrame::Receipt(receipt),
                 );
             }
-            return message_id;
+            return ids;
         }
-
-        // 3. Deduplicate target list while preserving order.
-        let mut seen_targets = HashSet::new();
-        let unique_targets: Vec<String> = outbound
-            .targets
-            .iter()
-            .filter(|t| seen_targets.insert((*t).clone()))
-            .cloned()
-            .collect();
-
         let ingress_ts = now_millis();
-
-        // 4. Route each target independently.
-        for target in &unique_targets {
+        for (target, message_id) in targets.iter().zip(&ids) {
             let kernel_msg = KernelMessage {
+                logical_id: logical_id.clone(),
                 message_id: message_id.clone(),
                 source_domain: authenticated_domain.to_string(),
                 target: target.clone(),
-                targets: unique_targets.clone(),
+                targets: targets.clone(),
                 message_type: outbound.message_type.clone(),
                 params: outbound.params.clone(),
                 timestamp: ingress_ts,
                 data: outbound.data.clone(),
             };
-
-            if target == KERNEL_REGISTRY_TARGET {
+            if invalid {
+                let data = Some(
+                    json!({"error":"contract_validation_failed","reason":"targets must be non-empty, message_type must be non-empty, and params must be a JSON object"}),
+                );
+                let (record, _) = self.ledger.record_initial_target_state(
+                    message_id,
+                    outbound.seq,
+                    authenticated_domain,
+                    target,
+                    &outbound.message_type,
+                    ContractStatus::ContractInvalid,
+                    data.clone(),
+                );
+                self.observer.emit(
+                    authenticated_domain,
+                    target,
+                    message_id,
+                    &self.ledger.logical_id_for_message(message_id),
+                    outbound.seq,
+                    &outbound.message_type,
+                    ContractStatus::ContractInvalid,
+                    data,
+                );
+                self.send_to_domain_pipe(
+                    authenticated_domain,
+                    KernelToDomainFrame::Receipt(record.to_receipt()),
+                );
+            } else if target == KERNEL_REGISTRY_TARGET {
                 self.dispatch_kernel_registry(authenticated_domain, outbound.seq, &kernel_msg);
             } else if target == KERNEL_STORAGE_TARGET {
                 self.dispatch_kernel_storage(authenticated_domain, outbound.seq, &kernel_msg);
@@ -372,8 +366,7 @@ impl KernelRouter {
                 self.dispatch_domain_target(authenticated_domain, outbound.seq, kernel_msg);
             }
         }
-
-        message_id
+        ids
     }
 
     /// Dispatches a message targeting `kernel.registry` (`RegisterHandlers` / `UnregisterHandlers`).
@@ -383,17 +376,17 @@ impl KernelRouter {
 
         match msg.message_type.as_str() {
             MSG_REGISTER_HANDLERS => {
-                let handlers_opt = msg
-                    .params
-                    .get("handlers")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(Value::as_str)
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty() && !s.contains('.'))
-                            .collect::<Vec<String>>()
-                    });
+                let handlers_opt =
+                    msg.params
+                        .get("handlers")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty() && !s.contains('.'))
+                                .collect::<Vec<String>>()
+                        });
 
                 let Some(handlers) = handlers_opt.filter(|h| !h.is_empty()) else {
                     self.complete_kernel_internal_target(
@@ -527,6 +520,7 @@ impl KernelRouter {
             source_domain,
             &msg.target,
             &msg.message_id,
+            &self.ledger.logical_id_for_message(&msg.message_id),
             seq,
             &msg.message_type,
             ContractStatus::Sent,
@@ -546,6 +540,7 @@ impl KernelRouter {
                     source_domain,
                     &msg.target,
                     &msg.message_id,
+                    &self.ledger.logical_id_for_message(&msg.message_id),
                     seq,
                     &msg.message_type,
                     stage,
@@ -574,6 +569,7 @@ impl KernelRouter {
                 source_domain,
                 &msg.target,
                 &msg.message_id,
+                &self.ledger.logical_id_for_message(&msg.message_id),
                 receipt.seq,
                 &msg.message_type,
                 final_status,
@@ -623,6 +619,7 @@ impl KernelRouter {
                     source_domain,
                     &target,
                     &msg.message_id,
+                    &self.ledger.logical_id_for_message(&msg.message_id),
                     seq,
                     &msg.message_type,
                     ContractStatus::TargetInvalid,
@@ -671,6 +668,7 @@ impl KernelRouter {
             source_domain,
             &target,
             &msg.message_id,
+            &self.ledger.logical_id_for_message(&msg.message_id),
             seq,
             &msg.message_type,
             ContractStatus::Sent,
@@ -703,6 +701,7 @@ impl KernelRouter {
                     &source_domain,
                     &receipt.target,
                     &receipt.message_id,
+                    &self.ledger.logical_id_for_message(&receipt.message_id),
                     receipt.seq,
                     &receipt.message_type,
                     receipt.status,
@@ -759,6 +758,7 @@ impl KernelRouter {
                 &source_domain,
                 &receipt.target,
                 &receipt.message_id,
+                &self.ledger.logical_id_for_message(&receipt.message_id),
                 receipt.seq,
                 &receipt.message_type,
                 receipt.status,

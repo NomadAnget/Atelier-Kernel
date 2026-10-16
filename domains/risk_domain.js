@@ -23,7 +23,7 @@ domain.handler("audit", () => ({
   total_evaluated: evaluatedCount,
 }));
 
-domain.handler("set_auto_traffic", (msg) => {
+domain.handler("set_auto_traffic", async (msg) => {
   if (typeof msg.data.enabled === "boolean") {
     autoTrafficEnabled = msg.data.enabled;
   }
@@ -33,23 +33,27 @@ domain.handler("set_auto_traffic", (msg) => {
   };
 });
 
-setInterval(() => {
+const timer = setInterval(() => {
+  void tick().catch(error => domain.logger.error(String(error)));
+}, 3400);
+async function tick() {
   if (!autoTrafficEnabled) return;
   evaluatedCount++;
   if (Math.random() < 0.6) {
-    domain.send(
+    await submit(
       ["order.echo"],
       "RiskHeartbeatPing",
       { audit_round: evaluatedCount },
       { auditor: "risk (Node.js)", check: "ok" }
     );
   } else {
-    domain.storageInsert(`audit_${evaluatedCount % 8}`, "risk_audit", {
+    await domain.storageInsertAsync(`audit_${evaluatedCount % 8}`, "risk_audit", {
       audit_round: evaluatedCount,
       status: "clean",
       ts: Date.now(),
     });
   }
-}, 3400);
+}
 
-domain.run();
+async function submit(...args) { return domain.waitResults(await domain.send(...args)); }
+domain.runAsync({onClose:()=>clearInterval(timer)}).catch(error=>{process.stderr.write(String(error));process.exitCode=1;});

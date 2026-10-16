@@ -51,7 +51,8 @@ impl<'a> InteractiveFrontendDomain<'a> {
 
         // Wait up to 800ms for both child processes to register their handlers over Stdio pipes
         for _ in 0..40 {
-            let order_ok = self.kernel.router().domain_status("order") == Some(DomainStatus::Active);
+            let order_ok =
+                self.kernel.router().domain_status("order") == Some(DomainStatus::Active);
             let inv_ok =
                 self.kernel.router().domain_status("inventory") == Some(DomainStatus::Active);
             if order_ok && inv_ok {
@@ -72,23 +73,57 @@ impl<'a> InteractiveFrontendDomain<'a> {
             // Process any incoming messages delivered to `frontend.*` before prompting
             self.process_incoming_deliveries();
 
-            println!("\n┌──────────────────────────────────────────────────────────────────────────┐");
-            println!("│                 Atelier Kernel 交互式测试前端域 (domain: frontend)       │");
-            println!("├──────────────────────────────────────────────────────────────────────────┤");
-            println!("│  [1] 查看所有域生命周期状态 & <domain>.<handler> 自动路由表               │");
-            println!("│  [2] 测试跨域调用 Python 域 (order.create) + 四阶段回执 + 自动落盘        │");
-            println!("│  [3] 测试跨域调用 Node.js 域 (inventory.deduct) + 四阶段回执             │");
-            println!("│  [4] 测试多目标扇出 (同时发往 Python域 + Node域 + 不存在的目标)          │");
-            println!("│  [5] 测试无效目标前置拦截 (TargetInvalid 零盲发验证)                     │");
-            println!("│  [6] 测试内核生成 message_id 与三级幂等投递 (同 seq 防重 & 回执去重)     │");
-            println!("│  [7] 测试“存储即消息” CRUD + 内层 JSON 结构动态演进 + 跨域表物理隔离     │");
-            println!("│  [8] 测试其他域反向推送消息给前端域 (order.callback_ui -> frontend.notify)│");
-            println!("│  [9] 测试内核接管域生命周期 (停止 Node 库存域 -> 拦截 -> 重新拉起恢复)   │");
-            println!("│  [10] 查看实时消息观察组件 (KernelObserver 全链路实时状态流)             │");
-            println!("│  [c] 自定义发送任意两层结构消息 (手动输入 targets / type / params / data)│");
-            println!("│  [a] 一键自动运行 1~10 全部功能测试演示                                  │");
-            println!("│  [0] 退出测试前端                                                        │");
-            println!("└──────────────────────────────────────────────────────────────────────────┘");
+            println!(
+                "\n┌──────────────────────────────────────────────────────────────────────────┐"
+            );
+            println!(
+                "│                 Atelier Kernel 交互式测试前端域 (domain: frontend)       │"
+            );
+            println!(
+                "├──────────────────────────────────────────────────────────────────────────┤"
+            );
+            println!(
+                "│  [1] 查看所有域生命周期状态 & <domain>.<handler> 自动路由表               │"
+            );
+            println!(
+                "│  [2] 测试跨域调用 Python 域 (order.create) + 四阶段回执 + 自动落盘        │"
+            );
+            println!(
+                "│  [3] 测试跨域调用 Node.js 域 (inventory.deduct) + 四阶段回执             │"
+            );
+            println!(
+                "│  [4] 测试多目标扇出 (同时发往 Python域 + Node域 + 不存在的目标)          │"
+            );
+            println!(
+                "│  [5] 测试无效目标前置拦截 (TargetInvalid 零盲发验证)                     │"
+            );
+            println!(
+                "│  [6] 测试内核生成 message_id 与三级幂等投递 (同 seq 防重 & 回执去重)     │"
+            );
+            println!(
+                "│  [7] 测试“存储即消息” CRUD + 内层 JSON 结构动态演进 + 跨域表物理隔离     │"
+            );
+            println!(
+                "│  [8] 测试其他域反向推送消息给前端域 (order.callback_ui -> frontend.notify)│"
+            );
+            println!(
+                "│  [9] 测试内核接管域生命周期 (停止 Node 库存域 -> 拦截 -> 重新拉起恢复)   │"
+            );
+            println!(
+                "│  [10] 查看实时消息观察组件 (KernelObserver 全链路实时状态流)             │"
+            );
+            println!(
+                "│  [c] 自定义发送任意两层结构消息 (手动输入 targets / type / params / data)│"
+            );
+            println!(
+                "│  [a] 一键自动运行 1~10 全部功能测试演示                                  │"
+            );
+            println!(
+                "│  [0] 退出测试前端                                                        │"
+            );
+            println!(
+                "└──────────────────────────────────────────────────────────────────────────┘"
+            );
             print!("请输入选项编号 (如 1~10, c, a, 0): ");
             let _ = io::stdout().flush();
 
@@ -173,7 +208,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
             json!({"channel": "interactive_frontend"}),
             json!({"order_id": "ORD-2026-01", "sku": "ATELIER-GEAR-01", "qty": 2}),
         );
-        println!("  -> 内核已生成全局唯一 message_id: {msg_id}");
+        println!("  -> 内核已生成全局唯一 message_id: {msg_id:?}");
         self.collect_and_print_receipts(&msg_id, 1, Duration::from_secs(2));
     }
 
@@ -186,7 +221,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
             json!({"warehouse": "WH-MAIN"}),
             json!({"sku": "ATELIER-GEAR-01", "qty": 5}),
         );
-        println!("  -> 内核已生成全局唯一 message_id: {msg_id}");
+        println!("  -> 内核已生成全局唯一 message_id: {msg_id:?}");
         self.collect_and_print_receipts(&msg_id, 1, Duration::from_secs(2));
     }
 
@@ -205,8 +240,10 @@ impl<'a> InteractiveFrontendDomain<'a> {
             json!({"trace": "fanout_test"}),
             json!({"query": "status_check"}),
         );
-        println!("  -> 内核已生成全局唯一 message_id: {msg_id}");
-        println!("  -> 等待 3 个目标各自独立返回回执（2 个走完四阶段，1 个立即返回 TargetInvalid）:");
+        println!("  -> 内核已生成全局唯一 message_id: {msg_id:?}");
+        println!(
+            "  -> 等待 3 个目标各自独立返回回执（2 个走完四阶段，1 个立即返回 TargetInvalid）:"
+        );
         self.collect_and_print_receipts(&msg_id, 3, Duration::from_secs(2));
     }
 
@@ -219,7 +256,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
             json!({}),
             json!({"hello": "world"}),
         );
-        println!("  -> 发送至 `non_existent_domain.do_work`，内核分配 message_id: {msg_id}");
+        println!("  -> 发送至 `non_existent_domain.do_work`，内核分配 message_id: {msg_id:?}");
         self.collect_and_print_receipts(&msg_id, 1, Duration::from_millis(500));
     }
 
@@ -227,7 +264,9 @@ impl<'a> InteractiveFrontendDomain<'a> {
     pub fn action_idempotency_test(&self) {
         println!("\n--- [6] 测试内核生成 `message_id` 与三级幂等投递保证 ---");
         let fixed_seq = 888_888;
-        println!("  Step A: 使用固定请求序号 seq={fixed_seq} 首次向 `inventory.deduct` 发送扣减 1 件库存...");
+        println!(
+            "  Step A: 使用固定请求序号 seq={fixed_seq} 首次向 `inventory.deduct` 发送扣减 1 件库存..."
+        );
         let msg_id_first = self.client.send_with_seq(
             fixed_seq,
             vec!["inventory.deduct".to_string()],
@@ -247,8 +286,10 @@ impl<'a> InteractiveFrontendDomain<'a> {
             json!({"idempotency_demo": true}),
             json!({"sku": "ATELIER-CORE-X", "qty": 99}),
         );
-        println!("  -> 首次 message_id = {msg_id_first}");
-        println!("  -> 重复提交返回的 message_id = {msg_id_duplicate} (完全一致，未生成新ID，未重复投递！)");
+        println!("  -> 首次 message_id = {msg_id_first:?}");
+        println!(
+            "  -> 重复提交返回的 message_id = {msg_id_duplicate:?} (完全一致，未生成新ID，未重复投递！)"
+        );
         for frame in self.client.drain_frames() {
             if let KernelToDomainFrame::Receipt(r) = frame {
                 println!(
@@ -271,10 +312,12 @@ impl<'a> InteractiveFrontendDomain<'a> {
             json!({"record_id": "ui_cfg_01", "category": "ui_state", "upsert": true}),
             json!({"layout": "grid", "zoom": 100}),
         );
-        self.collect_and_print_receipts(&ins_id, 1, Duration::from_millis(500));
+        self.collect_and_print_receipts(&[ins_id], 1, Duration::from_millis(500));
 
         // 2. Evolve inner `data` JSON structure (add nested panels & hotkeys) via `StorageUpdate`
-        println!("  2) 发送 `StorageUpdate` 动态演进内层 `data` JSON 结构 (新增嵌套字段，内核表结构零修改)...");
+        println!(
+            "  2) 发送 `StorageUpdate` 动态演进内层 `data` JSON 结构 (新增嵌套字段，内核表结构零修改)..."
+        );
         let upd_id = self.client.storage_update(
             json!({"record_id": "ui_cfg_01", "patch": true}),
             json!({
@@ -283,12 +326,12 @@ impl<'a> InteractiveFrontendDomain<'a> {
                 "recent_targets": ["order.create", "inventory.deduct"]
             }),
         );
-        self.collect_and_print_receipts(&upd_id, 1, Duration::from_millis(500));
+        self.collect_and_print_receipts(&[upd_id], 1, Duration::from_millis(500));
 
         // 3. Query back the evolved JSON record via `StorageQuery`
         println!("  3) 发送 `StorageQuery` 查询演进后的记录...");
         let qry_id = self.client.storage_query(json!({"record_id": "ui_cfg_01"}));
-        self.collect_and_print_receipts(&qry_id, 1, Duration::from_millis(500));
+        self.collect_and_print_receipts(&[qry_id], 1, Duration::from_millis(500));
 
         // 4. Verify cross-domain storage isolation: `frontend` tries to read `ORD-2026-01` from `order` domain
         println!(
@@ -297,17 +340,21 @@ impl<'a> InteractiveFrontendDomain<'a> {
         let iso_id = self
             .client
             .storage_query(json!({"domain": "order", "record_id": "ORD-2026-01"}));
-        self.collect_and_print_receipts(&iso_id, 1, Duration::from_millis(500));
+        self.collect_and_print_receipts(&[iso_id], 1, Duration::from_millis(500));
 
         // 5. Delete temporary record via `StorageDelete`
         println!("  5) 发送 `StorageDelete` 删除测试记录 `ui_cfg_01`...");
-        let del_id = self.client.storage_delete(json!({"record_id": "ui_cfg_01"}));
-        self.collect_and_print_receipts(&del_id, 1, Duration::from_millis(500));
+        let del_id = self
+            .client
+            .storage_delete(json!({"record_id": "ui_cfg_01"}));
+        self.collect_and_print_receipts(&[del_id], 1, Duration::from_millis(500));
     }
 
     /// Action [8]: Reverse message from Python `order` domain back to `frontend.notify`.
     pub fn action_reverse_callback_to_frontend(&self) {
-        println!("\n--- [8] 测试双向互调：`order.callback_ui` 主动向 `frontend.notify` 推送消息 ---");
+        println!(
+            "\n--- [8] 测试双向互调：`order.callback_ui` 主动向 `frontend.notify` 推送消息 ---"
+        );
         let msg_id = self.client.send(
             vec!["order.callback_ui".to_string()],
             "TriggerCallback",
@@ -322,7 +369,9 @@ impl<'a> InteractiveFrontendDomain<'a> {
 
     /// Action [9]: Supervisor lifecycle management (stop a domain -> verify `TargetInvalid` -> respawn -> verify recovery).
     pub fn action_lifecycle_stop_and_respawn(&self) {
-        println!("\n--- [9] 测试内核接管域生命周期 (停止子进程 -> 自动摘除路由拦截 -> 重新拉起恢复) ---");
+        println!(
+            "\n--- [9] 测试内核接管域生命周期 (停止子进程 -> 自动摘除路由拦截 -> 重新拉起恢复) ---"
+        );
         println!("  1) 内核 Supervisor 停止 `inventory` (Node.js) 域子进程...");
         self.kernel.supervisor().stop_process_domain("inventory");
         println!(
@@ -330,7 +379,9 @@ impl<'a> InteractiveFrontendDomain<'a> {
             self.kernel.router().domain_status("inventory")
         );
 
-        println!("  2) 尝试向已停止的 `inventory.deduct` 发送消息（应立即被拦截并返回 TargetInvalid）:");
+        println!(
+            "  2) 尝试向已停止的 `inventory.deduct` 发送消息（应立即被拦截并返回 TargetInvalid）:"
+        );
         let fail_id = self.client.send(
             vec!["inventory.deduct".to_string()],
             "DeductWhileStopped",
@@ -339,7 +390,9 @@ impl<'a> InteractiveFrontendDomain<'a> {
         );
         self.collect_and_print_receipts(&fail_id, 1, Duration::from_millis(500));
 
-        println!("  3) 内核 Supervisor 重新拉起 `inventory` (Node.js) 子进程并等待其发送注册消息...");
+        println!(
+            "  3) 内核 Supervisor 重新拉起 `inventory` (Node.js) 子进程并等待其发送注册消息..."
+        );
         let _ = self.kernel.spawn_process_domain(DomainProcessSpec {
             domain_id: "inventory".to_string(),
             command: "node".to_string(),
@@ -381,12 +434,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
         for ev in &events[start..] {
             println!(
                 "  #{:03} | msg={} | {} -> {} | type={} | status={:?}",
-                ev.event_id,
-                ev.message_id,
-                ev.source_domain,
-                ev.target,
-                ev.message_type,
-                ev.status
+                ev.event_id, ev.message_id, ev.source_domain, ev.target, ev.message_type, ev.status
             );
         }
     }
@@ -452,7 +500,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
 
         let target_count = targets.len();
         let msg_id = self.client.send(targets, msg_type, params, data);
-        println!("  -> 内核已生成 message_id: {msg_id}");
+        println!("  -> 内核已生成 message_id: {msg_id:?}");
         self.collect_and_print_receipts(&msg_id, target_count, Duration::from_secs(2));
     }
 
@@ -461,7 +509,7 @@ impl<'a> InteractiveFrontendDomain<'a> {
     /// while also automatically handling any incoming `Deliver` frames addressed to `frontend.*`.
     fn collect_and_print_receipts(
         &self,
-        expected_message_id: &str,
+        expected_message_ids: &[String],
         target_count: usize,
         timeout: Duration,
     ) {
@@ -476,14 +524,16 @@ impl<'a> InteractiveFrontendDomain<'a> {
             {
                 Ok(KernelToDomainFrame::Receipt(r)) => {
                     let data_summary = match &r.data {
-                        Some(v) => format!(" | data={}", serde_json::to_string(v).unwrap_or_default()),
+                        Some(v) => {
+                            format!(" | data={}", serde_json::to_string(v).unwrap_or_default())
+                        }
                         None => String::new(),
                     };
                     println!(
                         "     [回执] msg={} | target={:<22} | status={:<15?}{}",
                         r.message_id, r.target, r.status, data_summary
                     );
-                    if r.message_id == expected_message_id && r.status.is_terminal() {
+                    if expected_message_ids.contains(&r.message_id) && r.status.is_terminal() {
                         terminal_seen += 1;
                     }
                 }

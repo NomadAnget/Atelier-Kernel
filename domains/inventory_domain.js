@@ -14,7 +14,7 @@ const stockLedger = {
   "CHRONO-MOD-7": 45,
 };
 
-domain.handler("deduct", (msg) => {
+domain.handler("deduct", async (msg) => {
   const sku = msg.data.sku || "ATELIER-GEAR-01";
   const qty = Number(msg.data.qty || 1);
   domain.logger.phase("INFO", "start", `Deducting ${qty}x ${sku} from inventory`, { layer: "DOMAIN" });
@@ -29,7 +29,7 @@ domain.handler("deduct", (msg) => {
     });
   }
   stockLedger[sku] = current - qty;
-  domain.storageInsert(sku, "stock_item", {
+  await domain.storageInsertAsync(sku, "stock_item", {
     sku,
     remaining: stockLedger[sku],
     updated_by: "inventory (Node.js)",
@@ -45,7 +45,7 @@ domain.handler("deduct", (msg) => {
   };
 });
 
-domain.handler("restock", (msg) => {
+domain.handler("restock", async (msg) => {
   const sku = msg.data.sku || "ATELIER-GEAR-01";
   const qty = Number(msg.data.qty || 10);
   stockLedger[sku] = (stockLedger[sku] ?? 0) + qty;
@@ -62,7 +62,7 @@ domain.handler("stock_info", () => ({
   stock: stockLedger,
 }));
 
-domain.handler("set_auto_traffic", (msg) => {
+domain.handler("set_auto_traffic", async (msg) => {
   if (typeof msg.data.enabled === "boolean") {
     autoTrafficEnabled = msg.data.enabled;
   }
@@ -72,7 +72,10 @@ domain.handler("set_auto_traffic", (msg) => {
   };
 });
 
-setInterval(() => {
+const timer = setInterval(() => {
+  void tick().catch(error => domain.logger.error(String(error)));
+}, 2800);
+async function tick() {
   if (!autoTrafficEnabled) return;
   const skus = Object.keys(stockLedger);
   const sku = skus[Math.floor(Math.random() * skus.length)];
@@ -80,19 +83,20 @@ setInterval(() => {
     if (stockLedger[sku] < 120) {
       stockLedger[sku] += 5;
     }
-    domain.storageInsert(sku, "stock_snapshot", {
+    await domain.storageInsertAsync(sku, "stock_snapshot", {
       sku,
       remaining: stockLedger[sku],
       checked_at: Date.now(),
     });
   } else {
-    domain.send(
+    await submit(
       ["web_ui.metric_tick"],
       "StockTelemetry",
       { warehouse: "WH-NODE-01" },
       { sku, stock: stockLedger[sku], total_skus: skus.length }
     );
   }
-}, 2800);
+}
 
-domain.run();
+async function submit(...args) { return domain.waitResults(await domain.send(...args)); }
+domain.runAsync({onClose:()=>clearInterval(timer)}).catch(error=>{process.stderr.write(String(error));process.exitCode=1;});

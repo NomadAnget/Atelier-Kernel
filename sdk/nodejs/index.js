@@ -8,6 +8,14 @@
  */
 const readline = require("readline");
 
+class DomainRequestError extends Error {
+  constructor(status, data = null, messageId = null) {
+    super(data?.reason || data?.error || status);
+    this.name = 'DomainRequestError';
+    this.status = status; this.data = data; this.message_id = messageId;
+  }
+}
+
 class DomainExecutionFailed extends Error {
   constructor(payload) {
     super(JSON.stringify(payload));
@@ -73,6 +81,7 @@ class AtelierDomain {
     this._handlers = new Map();
     this._receiptCallbacks = [];
     this._stageDelayMs = stageDelayMs;
+    this._pending = new Map(); this._closed = false; this._running = false;
     this.logger = new DomainLogger(this, "DOMAIN", domain);
   }
 
@@ -98,15 +107,16 @@ class AtelierDomain {
   /**
    * Sends a two-layer message to one or more `<domain>.<handler>` targets.
    */
-  send(targets, messageType, params = {}, data = {}, seq = null) {
+  _submit(targets, messageType, params = {}, data = {}, seq = null) {
     const assignedSeq = seq && seq > 0 ? seq : this._seqCounter++;
+    this._seqCounter = Math.max(this._seqCounter, assignedSeq + 1);
     this._writeFrame({
       frame_type: "send",
       seq: assignedSeq,
       targets,
       message_type: messageType,
-      params: params || {},
-      data: data || {},
+      params: params ?? {},
+      data: data ?? {},
     });
     return assignedSeq;
   }
@@ -116,7 +126,7 @@ class AtelierDomain {
    */
   storageInsert(recordId, category, data, upsert = true) {
     return this.send(
-      ["kernel.storage"],
+      "kernel.storage",
       "StorageInsert",
       { record_id: recordId, category, upsert },
       data
@@ -128,7 +138,7 @@ class AtelierDomain {
    */
   storageUpdate(recordId, data, patch = true) {
     return this.send(
-      ["kernel.storage"],
+      "kernel.storage",
       "StorageUpdate",
       { record_id: recordId, patch },
       data
@@ -149,7 +159,7 @@ class AtelierDomain {
       if (arg1 !== undefined) params.record_id = arg1;
       if (arg2 !== undefined) params.category = arg2;
     }
-    return this.send(["kernel.storage"], "StorageDelete", params, {});
+    return this.send("kernel.storage", "StorageDelete", params, {});
   }
 
   /**
@@ -172,7 +182,7 @@ class AtelierDomain {
       if (category !== undefined) params.category = category;
       if (filter !== undefined) params.filter = filter;
     }
-    return this.send(["kernel.storage"], "StorageQuery", params, {});
+    return this.send("kernel.storage", "StorageQuery", params, {});
   }
 
   /**
@@ -202,89 +212,11 @@ class AtelierDomain {
   /**
    * Registers all declared handlers with `kernel.registry` and starts the stdin event loop.
    */
-  run() {
-    if (this._handlers.size > 0) {
-      this.send(
-        ["kernel.registry"],
-        "RegisterHandlers",
-        { handlers: Array.from(this._handlers.keys()) },
-        {}
-      );
-    }
-
-    const rl = readline.createInterface({
-      input: process.stdin,
-      terminal: false,
-    });
-
-    rl.on("line", async (rawLine) => {
-      const line = rawLine.trim();
-      if (!line) return;
-      let frame;
-      try {
-        frame = JSON.parse(line);
-      } catch (_) {
-        return;
-      }
-
-      if (frame.frame_type === "receipt") {
-        for (const cb of this._receiptCallbacks) {
-          try {
-            cb(frame);
-          } catch (_) {}
-        }
-        return;
-      }
-
-      if (frame.frame_type !== "deliver") return;
-
-      const msgId = frame.message_id;
-      const target = frame.target;
-      const handlerName = target.includes(".") ? target.split(".")[1] : target;
-
-      // Stage 2 (`Received`) and Stage 3 (`Started`)
-      this.reportReceipt(msgId, target, "received", null);
-      this.reportReceipt(msgId, target, "started", null);
-      if (this._stageDelayMs > 0) {
-        await new Promise((resolve) => setTimeout(resolve, this._stageDelayMs));
-      }
-
-      const handlerFn = this._handlers.get(handlerName);
-      if (!handlerFn) {
-        this.reportReceipt(msgId, target, "execution_failed", {
-          error: `Unknown handler: ${handlerName}`,
-        });
-        return;
-      }
-
-      try {
-        const msg = {
-          message_id: msgId,
-          source_domain: frame.source_domain,
-          target,
-          targets: frame.targets || [target],
-          message_type: frame.message_type || "",
-          params: frame.params || {},
-          data: frame.data || {},
-        };
-        const result = await handlerFn(msg, this);
-        this.reportReceipt(msgId, target, "completed", result ?? null);
-      } catch (err) {
-        if (err instanceof DomainExecutionFailed) {
-          this.reportReceipt(msgId, target, "execution_failed", err.payload);
-        } else {
-          this.reportReceipt(msgId, target, "execution_failed", {
-            error: "handler_exception",
-            reason: err && err.message ? err.message : String(err),
-          });
-        }
-      }
-    });
-  }
 }
 
 module.exports = {
-  AtelierDomain,
+  ...require("./runtime").enhance(AtelierDomain, DomainRequestError, DomainExecutionFailed),
   DomainExecutionFailed,
   DomainLogger,
+  DomainRequestError,
 };

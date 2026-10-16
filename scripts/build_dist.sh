@@ -52,8 +52,8 @@ cat > "${RUNTIME_OUT}/README.md" <<'EOF'
    ```
 2. Install the Domain SDKs for your domain languages:
    ```bash
-   pip install ../sdk/atelier_sdk-0.1.0-py3-none-any.whl
-   npm install ../sdk/atelier-sdk-0.1.0.tgz
+   pip install ../sdk/atelier_sdk-0.1.3-py3-none-any.whl
+   npm install ../sdk/atelier-sdk-0.1.3.tgz
    ```
 3. Boot your variant with Web Observer UI:
    ```bash
@@ -74,15 +74,15 @@ echo "==> [5/5] Running End-to-End Variant Smoke Test (--init + --smoke-test)...
 SMOKE_DIR="${DIST_DIR}/_smoke_variant"
 rm -rf "${SMOKE_DIR}"
 "${RUNTIME_OUT}/atelier-kernel" --init "${SMOKE_DIR}"
-PYTHONPATH="${SDK_OUT}/atelier_sdk-0.1.0-py3-none-any.whl" \
+PYTHONPATH="${SDK_OUT}/atelier_sdk-0.1.3-py3-none-any.whl" \
   "${RUNTIME_OUT}/atelier-kernel" --config "${SMOKE_DIR}/kernel_boot.json" --smoke-test
 rm -rf "${SMOKE_DIR}"
 
 echo ""
 echo "================================================================"
 echo "Atelier Kernel Automated Packaging & Verification Complete!"
-echo "  - Python SDK Wheel:   ${SDK_OUT}/atelier_sdk-0.1.0-py3-none-any.whl"
-echo "  - Node.js SDK NPM:    ${SDK_OUT}/atelier-sdk-0.1.0.tgz"
+echo "  - Python SDK Wheel:   ${SDK_OUT}/atelier_sdk-0.1.3-py3-none-any.whl"
+echo "  - Node.js SDK NPM:    ${SDK_OUT}/atelier-sdk-0.1.3.tgz"
 echo "  - Kernel Binary:      ${RUNTIME_OUT}/atelier-kernel"
 echo "  - Config Template:    ${RUNTIME_OUT}/kernel_boot.template.json"
 echo "  - Full Release Tar:   ${DIST_DIR}/${ARCHIVE_NAME}"

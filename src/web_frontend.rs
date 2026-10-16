@@ -190,6 +190,12 @@ impl WebFrontendDomain {
                 "text/html; charset=utf-8",
                 DASHBOARD_HTML.as_bytes(),
             ),
+            ("HEAD", "/") | ("HEAD", "/index.html") => self.write_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                b"",
+            ),
             ("GET", p) if p.starts_with("/api/snapshot") => {
                 let snap = self.build_snapshot_json();
                 let bytes = serde_json::to_vec(&snap).unwrap_or_default();

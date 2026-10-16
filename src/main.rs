@@ -13,7 +13,7 @@ use serde_json::json;
 
 const DEFAULT_TEMPLATE_JSON: &str = r#"{
   "db_path": "./data/atelier_kernel.db",
-  "web_ui_bind": "127.0.0.1:8787",
+  "web_ui_bind": "0.0.0.0:8787",
   "domains": [
     {
       "domain_id": "sample_py",

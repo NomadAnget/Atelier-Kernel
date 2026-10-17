@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "atelier_kernel"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "parking_lot",

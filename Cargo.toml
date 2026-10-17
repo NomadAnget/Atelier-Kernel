@@ -1,6 +1,6 @@
 [package]
 name = "atelier_kernel"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "Atelier Kernel: Single-machine multi-domain microkernel with Stdio pipe supervision, two-layer contract routing, 4-stage receipts, real-time observer, and message-driven domain storage."
 

@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 MSG_REGISTER_HANDLERS = "RegisterHandlers"
 MSG_UNREGISTER_HANDLERS = "UnregisterHandlers"

@@ -26,6 +26,8 @@ connection states new/open/draining/closed are private, not kernel domain states
 shutdown drains local handler calls and pending waits within a deadline, then
 cancels cooperatively and calls the cleanup hook. It cannot kill arbitrary native
 work; process termination and restart remain the kernel supervisor's job.
+An IPC bridge that exits early cancels its cleanup deadline timer; a finished
+connection must not retain the Node event loop until shutdown_grace expires.
 
 Async storage helpers send existing kernel.storage CRUD messages and return kernel
 response data. They do not implement storage, transactions, migration or paging.

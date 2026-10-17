@@ -41,7 +41,7 @@ async def begin(): d._submit(['worker.manual'],'Manual',seq=10000)
 asyncio.run(d.run_async(on_start=begin,on_close=end))
 '''
 JS = '''const {AtelierDomain}=require(process.argv[2]);
-const d=new AtelierDomain({domain:'test'});
+const d=new AtelierDomain({domain:'test',shutdownGrace:8});
 d.handler('relay',async msg=>{
   const action=msg.data.action;
   if(action==='stats')return {pending:d._pending.size};
@@ -56,7 +56,12 @@ d.handler('relay',async msg=>{
     return {status:'completed',token:frame.data.token,bytes:(frame.data.blob||'').length};
   } catch(e){return {status:e.status,data:e.data,message_id:e.message_id};}
 });
-d.runAsync({onStart:()=>d._submit(['worker.manual'],'Manual',{}, {},10000),onClose:async()=>{
+d.runAsync({onStart:()=>{
+ // Exercise the Windows bridge-exit cleanup branch on Unix too. An already
+ // exited bridge must not keep the process alive for its eight-second deadline.
+ if(!d._ipcBridge){d._ipcBridge={};d._ipcBridgeExit=Promise.resolve();}
+ return d._submit(['worker.manual'],'Manual',{}, {},10000);
+},onClose:async()=>{
  try{await d.request('worker.echo','AfterClose');}catch(e){d.logger.info(JSON.stringify({closed:e.status,pending:d._pending.size}));}
 }}).catch(e=>{process.stderr.write(String(e));process.exitCode=1;});
 '''

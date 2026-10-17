@@ -213,7 +213,12 @@ function enhance(Base,RequestError,ExecutionFailed) {
         this._ipcOutput?.removeListener('drain',this._drain);this._ipcOutput?.removeListener('error',this._outputError);
         if(this._ipcBridge){
           try{this._ipcOutput?.end();}catch(_){}
-          await Promise.race([this._ipcBridgeExit,sleep(Math.max(50,this._limits.shutdownGrace*1000))]);
+          let bridgeTimer;
+          try{
+            await Promise.race([this._ipcBridgeExit,new Promise(resolve=>{
+              bridgeTimer=setTimeout(resolve,Math.max(50,this._limits.shutdownGrace*1000));
+            })]);
+          }finally{clearTimeout(bridgeTimer);}
         }
         this._ipcInput?.pause();this._ipcInput?.destroy();this._ipcOutput?.destroy();this._state='closed';this._startupError?this._rejectRun(this._startupError):this._resolveRun();
       })().catch(error=>{this._state='closed';this._rejectRun(error);});return this._finishing;

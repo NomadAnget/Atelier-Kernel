@@ -190,6 +190,76 @@ class DomainLogger {
   }
 }
 
+class DomainTelemetry {
+  /**
+   * Native telemetry facility for reporting metrics to the Kernel.
+   */
+  constructor(domain) {
+    this._domain = domain;
+  }
+
+  emit(metricName, value, tags = {}) {
+    return this._domain._submit(
+      [KERNEL_TELEMETRY_TARGET],
+      metricName,
+      { tags: tags || {} },
+      { name: metricName, value, tags: tags || {} }
+    );
+  }
+
+  async emitAsync(metricName, value, tags = {}, options = {}) {
+    return (await this._domain.request(
+      KERNEL_TELEMETRY_TARGET,
+      metricName,
+      { tags: tags || {} },
+      { name: metricName, value, tags: tags || {} },
+      options
+    )).data;
+  }
+}
+
+class DomainStorageClient {
+  /**
+   * Native storage facility providing safe per-domain CRUD operations.
+   */
+  constructor(domain) {
+    this._domain = domain;
+  }
+
+  insert(recordId, category, data, upsert = true) {
+    return this._domain.storageInsert(recordId, category, data, upsert);
+  }
+
+  update(recordId, data, patch = true) {
+    return this._domain.storageUpdate(recordId, data, patch);
+  }
+
+  delete(arg1, arg2) {
+    return this._domain.storageDelete(arg1, arg2);
+  }
+
+  query(arg1, recordId, category, filter, limit = 500) {
+    return this._domain.storageQuery(arg1, recordId, category, filter, limit);
+  }
+}
+
+class DomainRegistryClient {
+  /**
+   * Native registry facility for business service discovery.
+   */
+  constructor(domain) {
+    this._domain = domain;
+  }
+
+  queryHandlers(options = {}) {
+    return this._domain.queryHandlersAsync(options);
+  }
+
+  getDescription(target, options = {}) {
+    return this._domain.getHandlerDescriptionAsync(target, options);
+  }
+}
+
 class AtelierDomain {
   constructor({ domain = "", stageDelayMs = 0 } = {}) {
     this._domainName = domain;
@@ -197,9 +267,15 @@ class AtelierDomain {
     this._handlers = new Map();
     this._handlerDocs = new Map();
     this._receiptCallbacks = [];
+    this._logListeners = [];
+    this._telemetryListeners = [];
+    this._notifyListeners = [];
     this._stageDelayMs = stageDelayMs;
     this._pending = new Map(); this._closed = false; this._running = false;
     this.logger = new DomainLogger(this, "DOMAIN", domain);
+    this.telemetry = new DomainTelemetry(this);
+    this.storage = new DomainStorageClient(this);
+    this.registry = new DomainRegistryClient(this);
   }
 
   /**
@@ -228,6 +304,76 @@ class AtelierDomain {
   onReceipt(fn) {
     this._receiptCallbacks.push(fn);
     return this;
+  }
+
+  /**
+   * Registers a callback to listen to the real-time system log stream.
+   */
+  onLog(callback, options = {}) {
+    const level = options.level;
+    const sourceDomain = options.sourceDomain || options.source_domain;
+    this._logListeners.push({ callback, level, sourceDomain });
+    if (this._state === "open") {
+      const params = {};
+      if (level) params.level = level;
+      if (sourceDomain) params.source_domain = sourceDomain;
+      this._submit([KERNEL_LOGGER_TARGET], "SubscribeLogs", params, {});
+    }
+    return this;
+  }
+
+  /**
+   * Registers a callback to listen to the real-time telemetry stream.
+   */
+  onTelemetry(callback) {
+    this._telemetryListeners.push(callback);
+    if (this._state === "open") {
+      this._submit([KERNEL_TELEMETRY_TARGET], "SubscribeTelemetry", {}, {});
+    }
+    return this;
+  }
+
+  /**
+   * Registers a callback to listen to system alerts and notifications.
+   */
+  onNotify(callback) {
+    this._notifyListeners.push(callback);
+    if (this._state === "open") {
+      this._submit([KERNEL_NOTIFY_TARGET], "SubscribeNotify", {}, {});
+    }
+    return this;
+  }
+
+  /**
+   * Emits a system notification or alert to `kernel.notify`.
+   */
+  notify(level, message, title = "", details = {}) {
+    return this._submit(
+      [KERNEL_NOTIFY_TARGET],
+      title || "Notification",
+      { severity: String(level).toLowerCase(), level: String(level).toLowerCase() },
+      { title, message, details: details || {} }
+    );
+  }
+
+  /**
+   * Emits a system notification or alert to `kernel.notify` asynchronously.
+   */
+  async notifyAsync(level, message, title = "", details = {}, options = {}) {
+    return (await this.request(
+      KERNEL_NOTIFY_TARGET,
+      title || "Notification",
+      { severity: String(level).toLowerCase(), level: String(level).toLowerCase() },
+      { title, message, details: details || {} },
+      options
+    )).data;
+  }
+
+  /**
+   * Discovers active business domain handlers (excludes kernel internal processors).
+   */
+  discoverHandlers(options = {}) {
+    return this.queryHandlersAsync(options);
   }
 
   /**
@@ -401,6 +547,15 @@ const MSG_UNREGISTER_HANDLERS = "UnregisterHandlers";
 const MSG_QUERY_HANDLERS = "QueryHandlers";
 const MSG_QUERY_LOGS = "QueryLogs";
 const MSG_QUERY_PROGRESS = "QueryProgress";
+const MSG_SUBSCRIBE_LOGS = "SubscribeLogs";
+const MSG_UNSUBSCRIBE_LOGS = "UnsubscribeLogs";
+const MSG_SUBSCRIBE_TELEMETRY = "SubscribeTelemetry";
+const MSG_UNSUBSCRIBE_TELEMETRY = "UnsubscribeTelemetry";
+const MSG_SUBSCRIBE_NOTIFY = "SubscribeNotify";
+const MSG_UNSUBSCRIBE_NOTIFY = "UnsubscribeNotify";
+const MSG_SYSTEM_LOG_EVENT = "LogEvent";
+const MSG_SYSTEM_TELEMETRY_EVENT = "TelemetryEvent";
+const MSG_SYSTEM_NOTIFY_EVENT = "NotifyEvent";
 const MSG_STORAGE_INSERT = "StorageInsert";
 const MSG_STORAGE_QUERY = "StorageQuery";
 const MSG_STORAGE_UPDATE = "StorageUpdate";
@@ -413,7 +568,10 @@ module.exports = {
   ...require("./runtime").enhance(AtelierDomain, DomainRequestError, DomainExecutionFailed),
   DomainExecutionFailed,
   DomainLogger,
+  DomainRegistryClient,
   DomainRequestError,
+  DomainStorageClient,
+  DomainTelemetry,
   KERNEL_LOGGER_TARGET,
   KERNEL_NOTIFY_TARGET,
   KERNEL_REGISTRY_TARGET,
@@ -430,5 +588,14 @@ module.exports = {
   MSG_STORAGE_INSERT,
   MSG_STORAGE_QUERY,
   MSG_STORAGE_UPDATE,
+  MSG_SUBSCRIBE_LOGS,
+  MSG_SUBSCRIBE_NOTIFY,
+  MSG_SUBSCRIBE_TELEMETRY,
+  MSG_SYSTEM_LOG_EVENT,
+  MSG_SYSTEM_NOTIFY_EVENT,
+  MSG_SYSTEM_TELEMETRY_EVENT,
   MSG_UNREGISTER_HANDLERS,
+  MSG_UNSUBSCRIBE_LOGS,
+  MSG_UNSUBSCRIBE_NOTIFY,
+  MSG_UNSUBSCRIBE_TELEMETRY,
 };

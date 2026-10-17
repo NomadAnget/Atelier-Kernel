@@ -1,22 +1,88 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
+use std::thread;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::ledger::{KernelLedger, ReceiptTransition};
-use crate::logging::KernelLogHub;
+use crate::logging::{KernelLogHub, LogRecord};
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DomainStatus, DomainToKernelFrame, HandlerDescriptor, InboundReceipt,
     KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET,
     KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_HANDLERS,
-    MSG_QUERY_LOGS, MSG_QUERY_PROGRESS, MSG_REGISTER_HANDLERS, MSG_UNREGISTER_HANDLERS,
-    MessageReceipt, OutboundMessage, now_millis, parse_target_address,
+    MSG_QUERY_LOGS, MSG_QUERY_PROGRESS, MSG_REGISTER_HANDLERS, MSG_SUBSCRIBE_LOGS,
+    MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_TELEMETRY, MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT,
+    MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
+    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_TELEMETRY, MessageReceipt, OutboundMessage,
+    now_millis, parse_target_address,
 };
 use crate::storage::DomainStorageEngine;
+
+/// Filter options registered by a domain subscribing to kernel log events.
+#[derive(Debug, Clone)]
+pub struct LogSubscriptionFilter {
+    pub min_level: Option<u8>,
+    pub source_domain: Option<String>,
+}
+
+fn level_to_weight(level: &str) -> u8 {
+    match level.trim().to_uppercase().as_str() {
+        "DEBUG" => 10,
+        "INFO" => 20,
+        "WARN" | "WARNING" => 30,
+        "ERROR" => 40,
+        "CRITICAL" | "FATAL" => 50,
+        _ => 0,
+    }
+}
+
+impl LogSubscriptionFilter {
+    pub fn new(level: Option<&str>, source_domain: Option<&str>) -> Self {
+        let min_level = level.and_then(|l| {
+            let trimmed = l.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("ALL") {
+                None
+            } else {
+                let w = level_to_weight(trimmed);
+                if w > 0 { Some(w) } else { None }
+            }
+        });
+        let source_domain = source_domain.and_then(|d| {
+            let trimmed = d.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        Self {
+            min_level,
+            source_domain,
+        }
+    }
+
+    pub fn matches(&self, record: &LogRecord) -> bool {
+        if let Some(min_w) = self.min_level {
+            let rec_w = level_to_weight(&record.level);
+            if rec_w > 0 && rec_w < min_w {
+                return false;
+            }
+        }
+        if let Some(expected_domain) = &self.source_domain {
+            let matches_src = record.source_domain.as_deref() == Some(expected_domain.as_str())
+                || record.component.eq_ignore_ascii_case(expected_domain);
+            if !matches_src {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// Internal registration state of a single managed Domain.
 struct DomainEntry {
@@ -39,7 +105,7 @@ pub struct KernelRouter {
     /// Per-domain serialization gate that closes the TOCTOU window between checking `instance_id`
     /// and processing an inbound frame or replacing a domain generation via `attach_domain_pipe`.
     domain_gates: RwLock<HashMap<String, Arc<Mutex<()>>>>,
-    domains: RwLock<HashMap<String, DomainEntry>>,
+    domains: Arc<RwLock<HashMap<String, DomainEntry>>>,
     /// `<domain>.<handler> -> domain` lookup table.
     routes: RwLock<HashMap<String, String>>,
     ledger: Arc<KernelLedger>,
@@ -48,6 +114,16 @@ pub struct KernelRouter {
     logger: Arc<KernelLogHub>,
     /// In-memory ring buffer of recent notifications and telemetry frames for observation consoles.
     ui_inbox: RwLock<Vec<KernelMessage>>,
+    /// Active domain subscriptions for kernel log events.
+    log_subscribers: Arc<RwLock<HashMap<String, LogSubscriptionFilter>>>,
+    /// Active domain subscriptions for kernel telemetry events.
+    telemetry_subscribers: Arc<RwLock<HashSet<String>>>,
+    /// Active domain subscriptions for kernel notification events.
+    notify_subscribers: Arc<RwLock<HashSet<String>>>,
+    /// Shutdown signal for the background log fanout thread.
+    stop_log_pump: Arc<AtomicBool>,
+    /// Handle to the background log fanout worker thread.
+    log_pump_handle: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl KernelRouter {
@@ -57,18 +133,98 @@ impl KernelRouter {
         storage: Arc<DomainStorageEngine>,
         logger: Arc<KernelLogHub>,
     ) -> Self {
+        let domains = Arc::new(RwLock::new(HashMap::<String, DomainEntry>::new()));
+        let log_subscribers = Arc::new(RwLock::new(HashMap::<String, LogSubscriptionFilter>::new()));
+        let telemetry_subscribers = Arc::new(RwLock::new(HashSet::new()));
+        let notify_subscribers = Arc::new(RwLock::new(HashSet::new()));
+        let stop_log_pump = Arc::new(AtomicBool::new(false));
+
+        let rx = logger.subscribe();
+        let log_subs_worker = Arc::clone(&log_subscribers);
+        let domains_worker = Arc::clone(&domains);
+        let stop_flag = Arc::clone(&stop_log_pump);
+
+        let pump_handle = thread::Builder::new()
+            .name("kernel-log-fanout".to_string())
+            .spawn(move || {
+                static COUNTER: AtomicU64 = AtomicU64::new(1);
+                while !stop_flag.load(Ordering::Relaxed) {
+                    match rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(record) => {
+                            let subs = log_subs_worker.read().clone();
+                            if subs.is_empty() {
+                                continue;
+                            }
+                            let data = match serde_json::to_value(&record) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            for (domain_id, filter) in subs {
+                                if !filter.matches(&record) {
+                                    continue;
+                                }
+                                let domains_guard = domains_worker.read();
+                                if let Some(entry) = domains_guard.get(&domain_id) {
+                                    if entry.status != DomainStatus::Faulted && entry.status != DomainStatus::Stopped {
+                                        if let Some(tx) = &entry.pipe_tx {
+                                            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+                                            let now = now_millis();
+                                            let msg = KernelMessage {
+                                                logical_id: format!("sys_log_{}_{}", now, id),
+                                                message_id: format!("sys_log_{}_{}", now, id),
+                                                source_domain: record
+                                                    .source_domain
+                                                    .clone()
+                                                    .unwrap_or_else(|| "kernel".to_string()),
+                                                target: KERNEL_LOGGER_TARGET.to_string(),
+                                                targets: vec![KERNEL_LOGGER_TARGET.to_string()],
+                                                message_type: MSG_SYSTEM_LOG_EVENT.to_string(),
+                                                params: json!({}),
+                                                timestamp: now,
+                                                data: data.clone(),
+                                            };
+                                            let _ = tx.send(KernelToDomainFrame::Deliver(msg));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .ok();
+
         Self {
             receipt_publication: Mutex::new(()),
             next_instance_id: AtomicU64::new(1),
             domain_gates: RwLock::new(HashMap::new()),
-            domains: RwLock::new(HashMap::new()),
+            domains,
             routes: RwLock::new(HashMap::new()),
             ledger,
             observer,
             storage,
             logger,
             ui_inbox: RwLock::new(Vec::new()),
+            log_subscribers,
+            telemetry_subscribers,
+            notify_subscribers,
+            stop_log_pump,
+            log_pump_handle: Mutex::new(pump_handle),
         }
+    }
+
+    pub fn log_subscribers_count(&self) -> usize {
+        self.log_subscribers.read().len()
+    }
+
+    pub fn telemetry_subscribers_count(&self) -> usize {
+        self.telemetry_subscribers.read().len()
+    }
+
+    pub fn notify_subscribers_count(&self) -> usize {
+        self.notify_subscribers.read().len()
     }
 
     pub fn ledger(&self) -> &Arc<KernelLedger> {
@@ -146,6 +302,11 @@ impl KernelRouter {
         entry.instance_id = instance_id;
         entry.status = DomainStatus::Spawning;
         entry.pipe_tx = Some(pipe_tx);
+
+        self.log_subscribers.write().remove(domain_id);
+        self.telemetry_subscribers.write().remove(domain_id);
+        self.notify_subscribers.write().remove(domain_id);
+
         instance_id
     }
 
@@ -687,6 +848,38 @@ impl KernelRouter {
         self.emit_kernel_internal_stages(source_domain, seq, msg);
 
         match msg.message_type.as_str() {
+            MSG_SUBSCRIBE_LOGS => {
+                let level = msg.params.get("level").and_then(Value::as_str);
+                let filter_domain = msg
+                    .params
+                    .get("source_domain")
+                    .or_else(|| msg.params.get("domain"))
+                    .and_then(Value::as_str);
+                let filter = LogSubscriptionFilter::new(level, filter_domain);
+                self.log_subscribers.write().insert(source_domain.to_string(), filter);
+
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "subscribed",
+                        "target": KERNEL_LOGGER_TARGET,
+                    })),
+                );
+            }
+            MSG_UNSUBSCRIBE_LOGS => {
+                self.log_subscribers.write().remove(source_domain);
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "unsubscribed",
+                        "target": KERNEL_LOGGER_TARGET,
+                    })),
+                );
+            }
             MSG_QUERY_LOGS => {
                 let limit = msg
                     .params
@@ -763,56 +956,179 @@ impl KernelRouter {
     /// Dispatches a high-frequency metric/telemetry stream targeting `kernel.telemetry`.
     fn dispatch_kernel_telemetry(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         self.emit_kernel_internal_stages(source_domain, seq, msg);
-        self.push_ui_inbox(msg.clone());
 
-        self.complete_kernel_internal_target(
-            source_domain,
-            msg,
-            ContractStatus::Completed,
-            Some(json!({
-                "status": "recorded",
-                "telemetry_type": msg.message_type,
-                "source": source_domain,
-            })),
-        );
+        match msg.message_type.as_str() {
+            MSG_SUBSCRIBE_TELEMETRY => {
+                self.telemetry_subscribers.write().insert(source_domain.to_string());
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "subscribed",
+                        "target": KERNEL_TELEMETRY_TARGET,
+                    })),
+                );
+            }
+            MSG_UNSUBSCRIBE_TELEMETRY => {
+                self.telemetry_subscribers.write().remove(source_domain);
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "unsubscribed",
+                        "target": KERNEL_TELEMETRY_TARGET,
+                    })),
+                );
+            }
+            _ => {
+                self.push_ui_inbox(msg.clone());
+
+                let subs: Vec<String> = self.telemetry_subscribers.read().iter().cloned().collect();
+                if !subs.is_empty() {
+                    static COUNTER: AtomicU64 = AtomicU64::new(1);
+                    let telem_data = if msg.data.is_object() && !msg.data.as_object().unwrap().is_empty() {
+                        let mut d = msg.data.clone();
+                        if let Some(obj) = d.as_object_mut() {
+                            obj.entry("metric_name".to_string()).or_insert_with(|| json!(msg.message_type));
+                            obj.entry("source_domain".to_string()).or_insert_with(|| json!(source_domain));
+                        }
+                        d
+                    } else {
+                        json!({
+                            "metric_name": msg.message_type,
+                            "source_domain": source_domain,
+                            "params": msg.params,
+                            "data": msg.data,
+                        })
+                    };
+                    for sub_domain in subs {
+                        let now = now_millis();
+                        let sub_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+                        let event_msg = KernelMessage {
+                            logical_id: format!("sys_telem_{}_{}", now, sub_id),
+                            message_id: format!("sys_telem_{}_{}", now, sub_id),
+                            source_domain: source_domain.to_string(),
+                            target: KERNEL_TELEMETRY_TARGET.to_string(),
+                            targets: vec![KERNEL_TELEMETRY_TARGET.to_string()],
+                            message_type: MSG_SYSTEM_TELEMETRY_EVENT.to_string(),
+                            params: msg.params.clone(),
+                            timestamp: now,
+                            data: telem_data.clone(),
+                        };
+                        self.send_to_domain_pipe(&sub_domain, KernelToDomainFrame::Deliver(event_msg));
+                    }
+                }
+
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "recorded",
+                        "telemetry_type": msg.message_type,
+                        "source": source_domain,
+                    })),
+                );
+            }
+        }
     }
 
     /// Dispatches an asynchronous system notification or alert targeting `kernel.notify`.
     fn dispatch_kernel_notify(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         self.emit_kernel_internal_stages(source_domain, seq, msg);
-        self.push_ui_inbox(msg.clone());
 
-        let severity = msg
-            .params
-            .get("severity")
-            .or_else(|| msg.params.get("level"))
-            .and_then(Value::as_str)
-            .unwrap_or("info");
+        match msg.message_type.as_str() {
+            MSG_SUBSCRIBE_NOTIFY => {
+                self.notify_subscribers.write().insert(source_domain.to_string());
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "subscribed",
+                        "target": KERNEL_NOTIFY_TARGET,
+                    })),
+                );
+            }
+            MSG_UNSUBSCRIBE_NOTIFY => {
+                self.notify_subscribers.write().remove(source_domain);
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "unsubscribed",
+                        "target": KERNEL_NOTIFY_TARGET,
+                    })),
+                );
+            }
+            _ => {
+                self.push_ui_inbox(msg.clone());
 
-        let text = msg
-            .data
-            .get("text")
-            .or_else(|| msg.data.get("greeting"))
-            .or_else(|| msg.data.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or(&msg.message_type);
+                let severity = msg
+                    .params
+                    .get("severity")
+                    .or_else(|| msg.params.get("level"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("info");
 
-        match severity.to_lowercase().as_str() {
-            "warn" | "warning" => self.logger.warning("NOTIFY", source_domain, text),
-            "error" | "critical" => self.logger.error("NOTIFY", source_domain, text),
-            _ => self.logger.info("NOTIFY", source_domain, text),
+                let text = msg
+                    .data
+                    .get("text")
+                    .or_else(|| msg.data.get("greeting"))
+                    .or_else(|| msg.data.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(&msg.message_type);
+
+                match severity.to_lowercase().as_str() {
+                    "warn" | "warning" => self.logger.warning("NOTIFY", source_domain, text),
+                    "error" | "critical" => self.logger.error("NOTIFY", source_domain, text),
+                    _ => self.logger.info("NOTIFY", source_domain, text),
+                }
+
+                let subs: Vec<String> = self.notify_subscribers.read().iter().cloned().collect();
+                if !subs.is_empty() {
+                    static COUNTER: AtomicU64 = AtomicU64::new(1);
+                    let alert_data = json!({
+                        "notification_type": msg.message_type,
+                        "source_domain": source_domain,
+                        "severity": severity,
+                        "message": text,
+                        "details": msg.data,
+                        "params": msg.params,
+                    });
+                    for sub_domain in subs {
+                        let now = now_millis();
+                        let sub_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+                        let event_msg = KernelMessage {
+                            logical_id: format!("sys_notify_{}_{}", now, sub_id),
+                            message_id: format!("sys_notify_{}_{}", now, sub_id),
+                            source_domain: source_domain.to_string(),
+                            target: KERNEL_NOTIFY_TARGET.to_string(),
+                            targets: vec![KERNEL_NOTIFY_TARGET.to_string()],
+                            message_type: MSG_SYSTEM_NOTIFY_EVENT.to_string(),
+                            params: msg.params.clone(),
+                            timestamp: now,
+                            data: alert_data.clone(),
+                        };
+                        self.send_to_domain_pipe(&sub_domain, KernelToDomainFrame::Deliver(event_msg));
+                    }
+                }
+
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "delivered",
+                        "notification_type": msg.message_type,
+                        "source": source_domain,
+                    })),
+                );
+            }
         }
-
-        self.complete_kernel_internal_target(
-            source_domain,
-            msg,
-            ContractStatus::Completed,
-            Some(json!({
-                "status": "delivered",
-                "notification_type": msg.message_type,
-                "source": source_domain,
-            })),
-        );
     }
 
     /// Emits `Sent -> Received -> Started` receipts for kernel built-in targets (`kernel.registry`, `kernel.storage`, `kernel.logger`, etc.).
@@ -1071,6 +1387,10 @@ impl KernelRouter {
             entry.handlers.clear();
         }
 
+        self.log_subscribers.write().remove(domain_id);
+        self.telemetry_subscribers.write().remove(domain_id);
+        self.notify_subscribers.write().remove(domain_id);
+
         let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
         for (source_domain, receipt) in failed_deliveries {
             self.observer.emit(
@@ -1096,6 +1416,15 @@ impl KernelRouter {
             .and_then(|d| d.pipe_tx.clone());
         if let Some(tx) = pipe_opt {
             let _ = tx.send(frame);
+        }
+    }
+}
+
+impl Drop for KernelRouter {
+    fn drop(&mut self) {
+        self.stop_log_pump.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.log_pump_handle.lock().take() {
+            let _ = handle.join();
         }
     }
 }

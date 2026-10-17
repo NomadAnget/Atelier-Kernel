@@ -2014,3 +2014,197 @@ fn test_kernel_built_in_processors_logger_telemetry_notify() {
         "Both legacy web_ui.* aliases must route and complete successfully"
     );
 }
+
+/// 17. Tests kernel native event subscriptions (`kernel.logger`, `kernel.telemetry`, `kernel.notify`),
+/// real-time log stream filtering, telemetry and alert broadcast, auto-cleanup on domain fault,
+/// and verifies `available_handlers` strictly excludes kernel processors.
+#[test]
+fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
+    use atelier_kernel::{
+        MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_TELEMETRY,
+        MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_TELEMETRY_EVENT,
+    };
+
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    kernel.logger().set_console_enabled(false);
+
+    let sub_client = kernel.attach_domain("subscriber_domain");
+
+    // 1. Initial subscription counts must be 0
+    assert_eq!(kernel.router().log_subscribers_count(), 0);
+    assert_eq!(kernel.router().telemetry_subscribers_count(), 0);
+    assert_eq!(kernel.router().notify_subscribers_count(), 0);
+
+    // 2. Subscribe to logs with level filter: WARNING
+    let sub_log_ids = sub_client.send(
+        vec![KERNEL_LOGGER_TARGET.to_string()],
+        MSG_SUBSCRIBE_LOGS,
+        json!({ "level": "WARNING" }),
+        json!({}),
+    );
+    let sub_log_receipts = sub_client.drain_frames();
+    assert!(
+        sub_log_receipts.into_iter().any(|f| match f {
+            KernelToDomainFrame::Receipt(r) =>
+                r.message_id == sub_log_ids[0] && r.status == ContractStatus::Completed,
+            _ => false,
+        }),
+        "SubscribeLogs must complete successfully"
+    );
+    assert_eq!(kernel.router().log_subscribers_count(), 1);
+
+    // 3. Emit logs: DEBUG, INFO (should be filtered out), WARNING, ERROR (should be received)
+    kernel.logger().debug("CORE", "sys", "This is debug text");
+    kernel.logger().info("CORE", "sys", "This is info text");
+    kernel.logger().warning("ORDER", "order_svc", "Low stock warning");
+    kernel.logger().error("PAYMENT", "pay_svc", "Payment gateway timeout");
+
+    // Poll up to 600ms for log event frames
+    let start_wait = std::time::Instant::now();
+    let mut received_logs = Vec::new();
+    while start_wait.elapsed() < Duration::from_millis(600) {
+        let frames = sub_client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Deliver(m) = f {
+                if m.target == KERNEL_LOGGER_TARGET && m.message_type == MSG_SYSTEM_LOG_EVENT {
+                    received_logs.push(m);
+                }
+            }
+        }
+        if received_logs.len() >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(received_logs.len(), 2, "Must receive exactly 2 logs matching level >= WARNING");
+    let messages: Vec<&str> = received_logs
+        .iter()
+        .filter_map(|m| m.data.get("message").and_then(|v| v.as_str()))
+        .collect();
+    assert!(messages.contains(&"Low stock warning"));
+    assert!(messages.contains(&"Payment gateway timeout"));
+
+    // 4. Subscribe to Telemetry
+    let _ = sub_client.send(
+        vec![KERNEL_TELEMETRY_TARGET.to_string()],
+        MSG_SUBSCRIBE_TELEMETRY,
+        json!({}),
+        json!({}),
+    );
+    let _ = sub_client.drain_frames();
+    assert_eq!(kernel.router().telemetry_subscribers_count(), 1);
+
+    // 5. Another domain emits telemetry
+    let emitter_client = kernel.attach_domain("sensor_domain");
+    let _ = emitter_client.send(
+        vec![KERNEL_TELEMETRY_TARGET.to_string()],
+        "MetricTick",
+        json!({ "sensor_id": "temp_01" }),
+        json!({ "value": 24.5 }),
+    );
+    let _ = emitter_client.drain_frames();
+
+    // Check subscriber received telemetry event
+    let start_telem = std::time::Instant::now();
+    let mut received_telem = Vec::new();
+    while start_telem.elapsed() < Duration::from_millis(600) {
+        let frames = sub_client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Deliver(m) = f {
+                if m.target == KERNEL_TELEMETRY_TARGET && m.message_type == MSG_SYSTEM_TELEMETRY_EVENT {
+                    received_telem.push(m);
+                }
+            }
+        }
+        if !received_telem.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(received_telem.len(), 1, "Subscriber must receive the emitted telemetry event");
+    assert_eq!(received_telem[0].source_domain, "sensor_domain");
+    assert_eq!(
+        received_telem[0].data.get("value").and_then(|v| v.as_f64()),
+        Some(24.5)
+    );
+
+    // 6. Subscribe to Notify
+    let _ = sub_client.send(
+        vec![KERNEL_NOTIFY_TARGET.to_string()],
+        MSG_SUBSCRIBE_NOTIFY,
+        json!({}),
+        json!({}),
+    );
+    let _ = sub_client.drain_frames();
+    assert_eq!(kernel.router().notify_subscribers_count(), 1);
+
+    // Emitter emits alert
+    let _ = emitter_client.send(
+        vec![KERNEL_NOTIFY_TARGET.to_string()],
+        "SystemAlert",
+        json!({ "severity": "error" }),
+        json!({ "message": "High disk pressure" }),
+    );
+    let _ = emitter_client.drain_frames();
+
+    // Check subscriber received notify event
+    let start_notify = std::time::Instant::now();
+    let mut received_notify = Vec::new();
+    while start_notify.elapsed() < Duration::from_millis(600) {
+        let frames = sub_client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Deliver(m) = f {
+                if m.target == KERNEL_NOTIFY_TARGET && m.message_type == MSG_SYSTEM_NOTIFY_EVENT {
+                    received_notify.push(m);
+                }
+            }
+        }
+        if !received_notify.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(received_notify.len(), 1, "Subscriber must receive the notify alert");
+    assert_eq!(
+        received_notify[0].data.get("severity").and_then(|v| v.as_str()),
+        Some("error")
+    );
+    assert_eq!(
+        received_notify[0].data.get("message").and_then(|v| v.as_str()),
+        Some("High disk pressure")
+    );
+
+    // 7. Auto-cleanup on domain fault / termination
+    kernel.router().mark_domain_faulted("subscriber_domain", "process terminated");
+    assert_eq!(
+        kernel.router().log_subscribers_count(),
+        0,
+        "Log subscriptions must be wiped when domain faults"
+    );
+    assert_eq!(
+        kernel.router().telemetry_subscribers_count(),
+        0,
+        "Telemetry subscriptions must be wiped when domain faults"
+    );
+    assert_eq!(
+        kernel.router().notify_subscribers_count(),
+        0,
+        "Notify subscriptions must be wiped when domain faults"
+    );
+
+    // 8. Constitutional guarantee: available_handlers strictly excludes all kernel.* processors
+    let all_handlers = kernel.router().available_handlers(None, None, None, true);
+    for h in all_handlers {
+        assert!(
+            !h.target.starts_with("kernel."),
+            "available_handlers must never contain kernel processor: {}",
+            h.target
+        );
+        assert!(
+            !h.domain.starts_with("kernel"),
+            "available_handlers must never contain kernel domain: {}",
+            h.domain
+        );
+    }
+}

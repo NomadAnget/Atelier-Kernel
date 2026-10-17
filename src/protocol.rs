@@ -22,6 +22,21 @@ pub const MSG_QUERY_HANDLERS: &str = "QueryHandlers";
 /// Built-in logging message types.
 pub const MSG_QUERY_LOGS: &str = "QueryLogs";
 pub const MSG_QUERY_PROGRESS: &str = "QueryProgress";
+pub const MSG_SUBSCRIBE_LOGS: &str = "SubscribeLogs";
+pub const MSG_UNSUBSCRIBE_LOGS: &str = "UnsubscribeLogs";
+
+/// Built-in telemetry message types.
+pub const MSG_SUBSCRIBE_TELEMETRY: &str = "SubscribeTelemetry";
+pub const MSG_UNSUBSCRIBE_TELEMETRY: &str = "UnsubscribeTelemetry";
+
+/// Built-in notification message types.
+pub const MSG_SUBSCRIBE_NOTIFY: &str = "SubscribeNotify";
+pub const MSG_UNSUBSCRIBE_NOTIFY: &str = "UnsubscribeNotify";
+
+/// Built-in system event message types pushed to subscribed domain pipes.
+pub const MSG_SYSTEM_LOG_EVENT: &str = "LogEvent";
+pub const MSG_SYSTEM_TELEMETRY_EVENT: &str = "TelemetryEvent";
+pub const MSG_SYSTEM_NOTIFY_EVENT: &str = "NotifyEvent";
 
 /// Built-in storage CRUD message types ("Storage as Messaging").
 pub const MSG_STORAGE_INSERT: &str = "StorageInsert";

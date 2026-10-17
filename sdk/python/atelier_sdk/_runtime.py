@@ -38,7 +38,33 @@ def _claim_ipc_fds():
         _CLAIMED_IPC_FDS=(r_fd,w_fd)
         return _CLAIMED_IPC_FDS
 
-_claim_ipc_fds()
+_LEVEL_WEIGHTS = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARN": 30,
+    "WARNING": 30,
+    "ERROR": 40,
+    "CRITICAL": 50,
+    "FATAL": 50,
+}
+
+def _level_matches(rec_level: str, filter_level: str) -> bool:
+    if not filter_level or filter_level.upper() == "ALL":
+        return True
+    w_min = _LEVEL_WEIGHTS.get(filter_level.upper(), 0)
+    w_rec = _LEVEL_WEIGHTS.get(rec_level.upper(), 0)
+    if w_min > 0 and w_rec > 0:
+        return w_rec >= w_min
+    return rec_level.upper() == filter_level.upper()
+
+def _domain_matches(record, expected_domain: str) -> bool:
+    if not expected_domain:
+        return True
+    exp = expected_domain.lower()
+    src = str(record.get("source_domain") or "").lower()
+    comp = str(record.get("component") or "").lower()
+    return src == exp or comp == exp
+
 
 class AsyncRuntime(MessageClient):
     def _require_ipc_fds(self):
@@ -118,6 +144,27 @@ class AsyncRuntime(MessageClient):
 
     async def query_progress_async(self,timeout=30):
         return (await self.request('kernel.logger','QueryProgress',{},{},timeout))['data']
+
+    async def subscribe_logs_async(self, level=None, source_domain=None, timeout=30):
+        params = {}
+        if level is not None: params['level'] = level
+        if source_domain is not None: params['source_domain'] = source_domain
+        return (await self.request('kernel.logger', 'SubscribeLogs', params, {}, timeout))['data']
+
+    async def unsubscribe_logs_async(self, timeout=30):
+        return (await self.request('kernel.logger', 'UnsubscribeLogs', {}, {}, timeout))['data']
+
+    async def subscribe_telemetry_async(self, timeout=30):
+        return (await self.request('kernel.telemetry', 'SubscribeTelemetry', {}, {}, timeout))['data']
+
+    async def unsubscribe_telemetry_async(self, timeout=30):
+        return (await self.request('kernel.telemetry', 'UnsubscribeTelemetry', {}, {}, timeout))['data']
+
+    async def subscribe_notify_async(self, timeout=30):
+        return (await self.request('kernel.notify', 'SubscribeNotify', {}, {}, timeout))['data']
+
+    async def unsubscribe_notify_async(self, timeout=30):
+        return (await self.request('kernel.notify', 'UnsubscribeNotify', {}, {}, timeout))['data']
 
     def _write_line(self,line):
         if self._state=='closed':raise DomainRequestError('connection_closed')
@@ -208,10 +255,55 @@ class AsyncRuntime(MessageClient):
                 except Exception as error:self._diagnostic('SDK receipt callback failed: %s',error)
             return
         if frame.get('frame_type')!='deliver':return
+        target = frame.get('target', '')
+        if isinstance(target, str) and target.startswith('kernel.') and not frame.get('source_domain'):
+            frame['source_domain'] = 'kernel'
         if not all(isinstance(frame.get(k),str) and frame[k] for k in ('message_id','target','source_domain')):raise ValueError('malformed delivery')
         if self._state=='draining':self._reply_error(frame,'shutting_down','domain is shutting down');return
+
+        target = frame.get('target', '')
+        msg_type = frame.get('message_type', '')
+        if target == 'kernel.logger' or msg_type in ('LogEvent', 'LogRecord'):
+            self._dispatch_system_log(frame)
+            return
+        if target == 'kernel.telemetry' or msg_type in ('TelemetryEvent',):
+            self._dispatch_system_telemetry(frame)
+            return
+        if target == 'kernel.notify' or msg_type in ('NotifyEvent',):
+            self._dispatch_system_notify(frame)
+            return
+
         self.report_receipt(frame['message_id'],frame['target'],'received')
         self._dispatch(frame)
+
+    def _dispatch_system_log(self, frame):
+        record = frame.get('data') or {}
+        for listener, lvl, src_dom in getattr(self, '_log_listeners', []):
+            if lvl and not _level_matches(record.get('level', ''), lvl):
+                continue
+            if src_dom and not _domain_matches(record, src_dom):
+                continue
+            self._invoke_event_listener(listener, record)
+
+    def _dispatch_system_telemetry(self, frame):
+        metric = frame.get('data') or {}
+        for listener in getattr(self, '_telemetry_listeners', []):
+            self._invoke_event_listener(listener, metric)
+
+    def _dispatch_system_notify(self, frame):
+        alert = frame.get('data') or {}
+        for listener in getattr(self, '_notify_listeners', []):
+            self._invoke_event_listener(listener, alert)
+
+    def _invoke_event_listener(self, listener, payload):
+        try:
+            res = listener(payload)
+            if inspect.isawaitable(res):
+                task = asyncio.create_task(res)
+                self._callbacks.add(task)
+                task.add_done_callback(self._callbacks.discard)
+        except Exception as e:
+            self._diagnostic("SDK system event listener error: %s", e)
 
     async def run_async(self,on_start=None,on_close=None):
         if self._state!='new':raise RuntimeError('domain receive session already started or closed')
@@ -255,6 +347,16 @@ class AsyncRuntime(MessageClient):
                 self._startup_error=error;self._diagnostic('SDK startup failed: %s',error);self.close()
         threading.Thread(target=writer,name='atelier-sdk-ipc-tx',daemon=True).start()
         if self._handlers:self._submit(['kernel.registry'],'RegisterHandlers',{'handlers':list(self._handlers),'descriptions':dict(getattr(self,'_handler_docs',{}))},{})
+        if getattr(self, '_log_listeners', None):
+            for _, lvl, src_dom in self._log_listeners:
+                p = {}
+                if lvl: p['level'] = lvl
+                if src_dom: p['source_domain'] = src_dom
+                self._submit(['kernel.logger'], 'SubscribeLogs', params=p, data={})
+        if getattr(self, '_telemetry_listeners', None):
+            self._submit(['kernel.telemetry'], 'SubscribeTelemetry', params={}, data={})
+        if getattr(self, '_notify_listeners', None):
+            self._submit(['kernel.notify'], 'SubscribeNotify', params={}, data={})
         self._startup=asyncio.create_task(start())
         threading.Thread(target=reader,name='atelier-sdk-ipc-rx',daemon=True).start()
         try:

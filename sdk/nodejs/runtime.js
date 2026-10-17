@@ -70,6 +70,22 @@ function _claimIpcFds(){
 }
 _claimIpcFds();
 
+const _LEVEL_WEIGHTS = { DEBUG: 10, INFO: 20, WARN: 30, WARNING: 30, ERROR: 40, CRITICAL: 50, FATAL: 50 };
+function _nodeLevelMatches(recLevel, filterLevel) {
+  if (!filterLevel || String(filterLevel).toUpperCase() === 'ALL') return true;
+  const wMin = _LEVEL_WEIGHTS[String(filterLevel).toUpperCase()] || 0;
+  const wRec = _LEVEL_WEIGHTS[String(recLevel).toUpperCase()] || 0;
+  if (wMin > 0 && wRec > 0) return wRec >= wMin;
+  return String(recLevel).toUpperCase() === String(filterLevel).toUpperCase();
+}
+function _nodeDomainMatches(record, expectedDomain) {
+  if (!expectedDomain) return true;
+  const exp = String(expectedDomain).toLowerCase();
+  const src = String(record?.source_domain || '').toLowerCase();
+  const comp = String(record?.component || '').toLowerCase();
+  return src === exp || comp === exp;
+}
+
 function enhance(Base,RequestError,ExecutionFailed) {
   class RuntimeDomain extends Base {
     _requireIpcFds(){
@@ -124,6 +140,12 @@ function enhance(Base,RequestError,ExecutionFailed) {
     async storageQueryAsync({domain,recordId,record_id,category,filter,filter_map,limit=500}={},options={}){const params={limit};for(const [key,value] of Object.entries({domain,record_id:recordId??record_id,category,filter:filter??filter_map}))if(value!==undefined)params[key]=value;return (await this.request('kernel.storage','StorageQuery',params,{},options)).data;}
     async queryLogsAsync({domain,domainId,domain_id,source_domain,level,layer,component,phase,sinceTs,since_ts,limit=200}={},options={}){const params={limit};const d=domain??domainId??domain_id??source_domain;if(d!==undefined)params.domain_id=d;if(level!==undefined)params.level=level;if(layer!==undefined)params.layer=layer;if(component!==undefined)params.component=component;if(phase!==undefined)params.phase=phase;const ts=sinceTs??since_ts;if(ts!==undefined)params.since_ts=ts;return (await this.request('kernel.logger','QueryLogs',params,{},options)).data;}
     async queryProgressAsync(options={}){return (await this.request('kernel.logger','QueryProgress',{},{},options)).data;}
+    async subscribeLogsAsync({level,sourceDomain,source_domain}={},options={}){const params={};if(level!==undefined)params.level=level;const d=sourceDomain??source_domain;if(d!==undefined)params.source_domain=d;return (await this.request('kernel.logger','SubscribeLogs',params,{},options)).data;}
+    async unsubscribeLogsAsync(options={}){return (await this.request('kernel.logger','UnsubscribeLogs',{},{},options)).data;}
+    async subscribeTelemetryAsync(options={}){return (await this.request('kernel.telemetry','SubscribeTelemetry',{},{},options)).data;}
+    async unsubscribeTelemetryAsync(options={}){return (await this.request('kernel.telemetry','UnsubscribeTelemetry',{},{},options)).data;}
+    async subscribeNotifyAsync(options={}){return (await this.request('kernel.notify','SubscribeNotify',{},{},options)).data;}
+    async unsubscribeNotifyAsync(options={}){return (await this.request('kernel.notify','UnsubscribeNotify',{},{},options)).data;}
     _writeFrame(frame) {
       if(this._state==='closed')throw new RequestError('connection_closed');
       let line;
@@ -166,6 +188,9 @@ function enhance(Base,RequestError,ExecutionFailed) {
         try{this._receive(frame);}catch(error){this._diagnostic(`SDK dispatch failed: ${error}`);this.close();}
       });
       if(this._handlers.size)this._submit(['kernel.registry'],'RegisterHandlers',{handlers:[...this._handlers.keys()],descriptions:Object.fromEntries(this._handlerDocs||[])},{});
+      if(this._logListeners&&this._logListeners.length){for(const {level,sourceDomain} of this._logListeners){const p={};if(level!==undefined)p.level=level;if(sourceDomain!==undefined)p.source_domain=sourceDomain;this._submit(['kernel.logger'],'SubscribeLogs',p,{});}}
+      if(this._telemetryListeners&&this._telemetryListeners.length){this._submit(['kernel.telemetry'],'SubscribeTelemetry',{},{});}
+      if(this._notifyListeners&&this._notifyListeners.length){this._submit(['kernel.notify'],'SubscribeNotify',{},{});}
       this._startup=Promise.resolve().then(async()=>{if(onStart)await onStart();}).catch(error=>{this._startupError=error;this._diagnostic(`SDK startup failed: ${error}`);this.close();});
       return this._runPromise;
     }
@@ -177,9 +202,58 @@ function enhance(Base,RequestError,ExecutionFailed) {
         return;
       }
       if(frame.frame_type!=='deliver')return;
+      const target=frame.target||'';
+      if(typeof target==='string'&&target.startsWith('kernel.')&&!frame.source_domain){
+        frame.source_domain='kernel';
+      }
       if(['message_id','target','source_domain'].some(k=>typeof frame[k]!=='string'||!frame[k]))throw new Error('malformed delivery');
       if(this._state==='draining'){this._replyError(frame,'shutting_down','domain is shutting down');return;}
+
+      const msgType=frame.message_type||'';
+      if(target==='kernel.logger'||msgType==='LogEvent'||msgType==='LogRecord'){
+        this._dispatchSystemLog(frame);
+        return;
+      }
+      if(target==='kernel.telemetry'||msgType==='TelemetryEvent'){
+        this._dispatchSystemTelemetry(frame);
+        return;
+      }
+      if(target==='kernel.notify'||msgType==='NotifyEvent'){
+        this._dispatchSystemNotify(frame);
+        return;
+      }
+
       this.reportReceipt(frame.message_id,frame.target,'received');this._dispatch(frame);
+    }
+    _dispatchSystemLog(frame){
+      const record=frame.data||{};
+      for(const {callback,level,sourceDomain} of (this._logListeners||[])){
+        if(level&&!_nodeLevelMatches(record.level,level))continue;
+        if(sourceDomain&&!_nodeDomainMatches(record,sourceDomain))continue;
+        this._invokeEventListener(callback,record);
+      }
+    }
+    _dispatchSystemTelemetry(frame){
+      const metric=frame.data||{};
+      for(const callback of (this._telemetryListeners||[])){
+        this._invokeEventListener(callback,metric);
+      }
+    }
+    _dispatchSystemNotify(frame){
+      const alert=frame.data||{};
+      for(const callback of (this._notifyListeners||[])){
+        this._invokeEventListener(callback,alert);
+      }
+    }
+    _invokeEventListener(callback,payload){
+      try{
+        const res=callback(payload);
+        if(res&&typeof res.then==='function'){
+          res.catch(error=>this._diagnostic(`SDK system event listener error: ${error}`));
+        }
+      }catch(error){
+        this._diagnostic(`SDK system event listener error: ${error}`);
+      }
     }
     _dispatch(frame){
       const controller=new AbortController();

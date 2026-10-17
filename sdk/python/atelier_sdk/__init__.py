@@ -31,6 +31,15 @@ MSG_UNREGISTER_HANDLERS = "UnregisterHandlers"
 MSG_QUERY_HANDLERS = "QueryHandlers"
 MSG_QUERY_LOGS = "QueryLogs"
 MSG_QUERY_PROGRESS = "QueryProgress"
+MSG_SUBSCRIBE_LOGS = "SubscribeLogs"
+MSG_UNSUBSCRIBE_LOGS = "UnsubscribeLogs"
+MSG_SUBSCRIBE_TELEMETRY = "SubscribeTelemetry"
+MSG_UNSUBSCRIBE_TELEMETRY = "UnsubscribeTelemetry"
+MSG_SUBSCRIBE_NOTIFY = "SubscribeNotify"
+MSG_UNSUBSCRIBE_NOTIFY = "UnsubscribeNotify"
+MSG_SYSTEM_LOG_EVENT = "LogEvent"
+MSG_SYSTEM_TELEMETRY_EVENT = "TelemetryEvent"
+MSG_SYSTEM_NOTIFY_EVENT = "NotifyEvent"
 MSG_STORAGE_INSERT = "StorageInsert"
 MSG_STORAGE_QUERY = "StorageQuery"
 MSG_STORAGE_UPDATE = "StorageUpdate"
@@ -44,7 +53,10 @@ __all__ = [
     "DeliveryMessage",
     "DomainExecutionFailed",
     "DomainLogger",
+    "DomainRegistryClient",
     "DomainRequestError",
+    "DomainStorageClient",
+    "DomainTelemetry",
     "KERNEL_LOGGER_TARGET",
     "KERNEL_NOTIFY_TARGET",
     "KERNEL_REGISTRY_TARGET",
@@ -61,7 +73,16 @@ __all__ = [
     "MSG_STORAGE_INSERT",
     "MSG_STORAGE_QUERY",
     "MSG_STORAGE_UPDATE",
+    "MSG_SUBSCRIBE_LOGS",
+    "MSG_SUBSCRIBE_NOTIFY",
+    "MSG_SUBSCRIBE_TELEMETRY",
+    "MSG_SYSTEM_LOG_EVENT",
+    "MSG_SYSTEM_NOTIFY_EVENT",
+    "MSG_SYSTEM_TELEMETRY_EVENT",
     "MSG_UNREGISTER_HANDLERS",
+    "MSG_UNSUBSCRIBE_LOGS",
+    "MSG_UNSUBSCRIBE_NOTIFY",
+    "MSG_UNSUBSCRIBE_TELEMETRY",
     "__version__",
 ]
 
@@ -243,6 +264,68 @@ class _StdlibLoggingHandler(logging.Handler):
         )
 
 
+class DomainTelemetry:
+    """Native telemetry facility for reporting metrics to the Kernel."""
+
+    def __init__(self, domain: "AtelierDomain"):
+        self._domain = domain
+
+    def emit(self, metric_name: str, value: Any, tags: Optional[Dict[str, Any]] = None) -> int:
+        return self._domain._submit(
+            [KERNEL_TELEMETRY_TARGET],
+            metric_name,
+            params={"tags": tags or {}},
+            data={"name": metric_name, "value": value, "tags": tags or {}},
+        )
+
+    async def emit_async(
+        self,
+        metric_name: str,
+        value: Any,
+        tags: Optional[Dict[str, Any]] = None,
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        return (await self._domain.request(
+            KERNEL_TELEMETRY_TARGET,
+            metric_name,
+            {"tags": tags or {}},
+            {"name": metric_name, "value": value, "tags": tags or {}},
+            timeout,
+        ))["data"]
+
+
+class DomainStorageClient:
+    """Native storage facility providing safe per-domain CRUD operations."""
+
+    def __init__(self, domain: "AtelierDomain"):
+        self._domain = domain
+
+    async def insert(self, record_id: str, category: str, data: Dict[str, Any], upsert: bool = True, timeout: float = 30):
+        return await self._domain.storage_insert_async(record_id, category, data, upsert=upsert, timeout=timeout)
+
+    async def update(self, record_id: str, data: Dict[str, Any], patch: bool = True, timeout: float = 30):
+        return await self._domain.storage_update_async(record_id, data, patch=patch, timeout=timeout)
+
+    async def delete(self, record_id: Optional[str] = None, category: Optional[str] = None, timeout: float = 30):
+        return await self._domain.storage_delete_async(record_id=record_id, category=category, timeout=timeout)
+
+    async def query(self, domain: Optional[str] = None, record_id: Optional[str] = None, category: Optional[str] = None, filter: Optional[Dict[str, Any]] = None, filter_map: Optional[Dict[str, Any]] = None, limit: int = 500, timeout: float = 30):
+        return await self._domain.storage_query_async(domain=domain, record_id=record_id, category=category, filter=filter, filter_map=filter_map, limit=limit, timeout=timeout)
+
+
+class DomainRegistryClient:
+    """Native registry facility for business service discovery."""
+
+    def __init__(self, domain: "AtelierDomain"):
+        self._domain = domain
+
+    async def query_handlers(self, domain: Optional[str] = None, target: Optional[str] = None, handler: Optional[str] = None, include_inactive: bool = False, timeout: float = 30):
+        return await self._domain.query_handlers_async(domain=domain, target=target, handler=handler, include_inactive=include_inactive, timeout=timeout)
+
+    async def get_description(self, target: str, timeout: float = 30):
+        return await self._domain.get_handler_description_async(target, timeout=timeout)
+
+
 class AtelierDomain(AsyncRuntime):
     """High-level Python Domain SDK for Atelier Kernel."""
 
@@ -258,6 +341,9 @@ class AtelierDomain(AsyncRuntime):
         self._handlers: Dict[str, Callable[..., Any]] = {}
         self._handler_docs: Dict[str, str] = {}
         self._receipt_callbacks: List[Callable[[Dict[str, Any]], None]] = []
+        self._log_listeners: List[Any] = []
+        self._telemetry_listeners: List[Any] = []
+        self._notify_listeners: List[Any] = []
         self._pending = {}
         self._closed = False
         self._async_loop = None
@@ -269,6 +355,9 @@ class AtelierDomain(AsyncRuntime):
             default_layer="DOMAIN",
             default_component=domain,
         )
+        self.telemetry = DomainTelemetry(self)
+        self.storage = DomainStorageClient(self)
+        self.registry = DomainRegistryClient(self)
 
     def handler(self, name: str):
         """Registers a handler for `<domain>.<name>`. Automatically extracts docstring or leading `#` comments as handler description."""
@@ -285,6 +374,70 @@ class AtelierDomain(AsyncRuntime):
         self._receipt_callbacks.append(func)
         return func
 
+    def on_log(self, func: Optional[Callable] = None, *, level: Optional[str] = None, source_domain: Optional[str] = None):
+        """
+        Registers a callback or decorator to listen to the real-time system log stream.
+        Can filter by minimum `level` (e.g. 'WARNING') and/or `source_domain`.
+        """
+        def decorator(fn):
+            self._log_listeners.append((fn, level, source_domain))
+            if getattr(self, "_state", None) == "open":
+                params = {}
+                if level:
+                    params["level"] = level
+                if source_domain:
+                    params["source_domain"] = source_domain
+                self._submit([KERNEL_LOGGER_TARGET], MSG_SUBSCRIBE_LOGS, params=params, data={})
+            return fn
+        if func is not None:
+            return decorator(func)
+        return decorator
+
+    def on_telemetry(self, func: Optional[Callable] = None):
+        """Registers a callback or decorator to listen to the real-time telemetry stream."""
+        def decorator(fn):
+            self._telemetry_listeners.append(fn)
+            if getattr(self, "_state", None) == "open":
+                self._submit([KERNEL_TELEMETRY_TARGET], MSG_SUBSCRIBE_TELEMETRY, params={}, data={})
+            return fn
+        if func is not None:
+            return decorator(func)
+        return decorator
+
+    def on_notify(self, func: Optional[Callable] = None):
+        """Registers a callback or decorator to listen to system alerts and notifications."""
+        def decorator(fn):
+            self._notify_listeners.append(fn)
+            if getattr(self, "_state", None) == "open":
+                self._submit([KERNEL_NOTIFY_TARGET], MSG_SUBSCRIBE_NOTIFY, params={}, data={})
+            return fn
+        if func is not None:
+            return decorator(func)
+        return decorator
+
+    def notify(self, level: str, message: str, title: str = "", details: Optional[Dict[str, Any]] = None) -> int:
+        """Emits a system notification or alert to `kernel.notify`."""
+        return self._submit(
+            [KERNEL_NOTIFY_TARGET],
+            title or "Notification",
+            params={"severity": level.lower(), "level": level.lower()},
+            data={"title": title, "message": message, "details": details or {}},
+        )
+
+    async def notify_async(self, level: str, message: str, title: str = "", details: Optional[Dict[str, Any]] = None, timeout: float = 30) -> Dict[str, Any]:
+        """Emits a system notification or alert to `kernel.notify` asynchronously."""
+        return (await self.request(
+            KERNEL_NOTIFY_TARGET,
+            title or "Notification",
+            {"severity": level.lower(), "level": level.lower()},
+            {"title": title, "message": message, "details": details or {}},
+            timeout,
+        ))["data"]
+
+    async def discover_handlers(self, domain: Optional[str] = None, target: Optional[str] = None, handler: Optional[str] = None, include_inactive: bool = False, timeout: float = 30):
+        """Discovers active business domain handlers (excludes kernel internal processors)."""
+        return await self.query_handlers_async(domain=domain, target=target, handler=handler, include_inactive=include_inactive, timeout=timeout)
+
     async def query_handlers(
         self,
         domain: Optional[str] = None,
@@ -297,6 +450,14 @@ class AtelierDomain(AsyncRuntime):
             params["domain"] = domain
         if target is not None:
             params["target"] = target
+        if handler is not None:
+            params["handler"] = handler
+        return await self.send(
+            targets="kernel.registry",
+            message_type=MSG_QUERY_HANDLERS,
+            params=params,
+            data={},
+        )
         if handler is not None:
             params["handler"] = handler
         return await self.send(

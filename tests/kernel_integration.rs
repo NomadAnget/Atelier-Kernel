@@ -2208,3 +2208,357 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
         );
     }
 }
+
+/// 18. Tests kernel.runtime, kernel.observer, and kernel.supervisor (smooth rolling update & candidate validation rollback).
+#[test]
+fn test_kernel_runtime_observer_supervisor_smooth_update_and_rollback() {
+    use atelier_kernel::{
+        KERNEL_OBSERVER_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_SUPERVISOR_TARGET,
+        MSG_QUERY_OBSERVER, MSG_QUERY_RUNTIME, MSG_STOP_DOMAIN,
+        MSG_SUBSCRIBE_OBSERVER, MSG_SYSTEM_OBSERVER_EVENT, MSG_UNSUBSCRIBE_OBSERVER,
+        MSG_UPDATE_DOMAIN,
+    };
+
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    kernel.logger().set_console_enabled(false);
+
+    let client = kernel.attach_domain("control_client");
+
+    // Script for worker v1
+    let script_v1 = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["compute"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
+for line in ipc_in:
+    frame = json.loads(line)
+    if frame.get("frame_type") == "deliver":
+        msg_id = frame["message_id"]
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"worker_roll.compute","status":"received","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"worker_roll.compute","status":"started","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"worker_roll.compute","status":"completed","data":{{"version":1}}}}) + "\n")
+        ipc_out.flush()
+"#
+    );
+
+    let spec_v1 = DomainProcessSpec {
+        domain_id: "worker_roll".to_string(),
+        command: python_cmd().to_string(),
+        args: vec!["-c".to_string(), script_v1],
+        working_dir: None,
+        auto_restart: true,
+        max_restarts: Some(5),
+        restart_delay_ms: 100,
+    };
+
+    let pid1 = kernel.spawn_process_domain(spec_v1).expect("spawn v1");
+    assert!(pid1 > 0);
+
+    // Wait until worker_roll is Active
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if kernel.router().domain_status("worker_roll") == Some(DomainStatus::Active) {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ready, "worker_roll v1 should become Active");
+
+    // 1. Test kernel.runtime: query domain assembly
+    let q_ids = client.send(
+        vec![KERNEL_RUNTIME_TARGET.to_string()],
+        MSG_QUERY_RUNTIME,
+        json!({ "domain": "worker_roll" }),
+        json!({}),
+    );
+    let q_frames = client.drain_frames();
+    let q_completed = q_frames.iter().find_map(|f| match f {
+        KernelToDomainFrame::Receipt(r) if r.message_id == q_ids[0] && r.status == ContractStatus::Completed => {
+            r.data.clone()
+        }
+        _ => None,
+    }).expect("Query runtime should complete");
+
+    let dom_info = q_completed.get("domain").expect("domain info present");
+    assert_eq!(dom_info["domain_id"], "worker_roll");
+    assert_eq!(dom_info["status"], "Active");
+    let initial_inst_id = dom_info["instance_id"].as_u64().unwrap();
+    assert!(initial_inst_id > 0);
+    let routes = dom_info["routes"].as_array().expect("routes array");
+    assert!(routes.iter().any(|r| r == "worker_roll.compute"));
+
+    // 2. Test kernel.observer: subscribe, observe messages, query snapshots, unsubscribe
+    let sub_obs_ids = client.send(
+        vec![KERNEL_OBSERVER_TARGET.to_string()],
+        MSG_SUBSCRIBE_OBSERVER,
+        json!({}),
+        json!({}),
+    );
+    let sub_obs_frames = client.drain_frames();
+    assert!(sub_obs_frames.iter().any(|f| match f {
+        KernelToDomainFrame::Receipt(r) => r.message_id == sub_obs_ids[0] && r.status == ContractStatus::Completed,
+        _ => false,
+    }));
+    assert_eq!(kernel.router().observer_subscribers_count(), 1);
+
+    // Send a message from client to worker_roll.compute
+    let comp_ids = client.send(
+        vec!["worker_roll.compute".to_string()],
+        "ComputeTask",
+        json!({}),
+        json!({ "x": 10 }),
+    );
+
+    // Drain until completed receipt received
+    let dl_comp = std::time::Instant::now() + Duration::from_secs(5);
+    let mut comp_done = false;
+    let mut obs_events = Vec::new();
+    while std::time::Instant::now() < dl_comp {
+        let frames = client.drain_frames();
+        for f in frames {
+            match f {
+                KernelToDomainFrame::Receipt(r) if r.message_id == comp_ids[0] && r.status == ContractStatus::Completed => {
+                    assert_eq!(r.data.as_ref().and_then(|d| d.get("version")).and_then(|v| v.as_i64()), Some(1));
+                    comp_done = true;
+                }
+                KernelToDomainFrame::Deliver(m) if m.target == KERNEL_OBSERVER_TARGET && m.message_type == MSG_SYSTEM_OBSERVER_EVENT => {
+                    obs_events.push(m);
+                }
+                _ => {}
+            }
+        }
+        if comp_done && !obs_events.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(comp_done, "worker_roll v1 should have completed compute");
+    assert!(!obs_events.is_empty(), "Observer subscriber should receive observation events");
+
+    // Query observer snapshots
+    let q_obs_ids = client.send(
+        vec![KERNEL_OBSERVER_TARGET.to_string()],
+        MSG_QUERY_OBSERVER,
+        json!({ "limit": 10 }),
+        json!({}),
+    );
+    let q_obs_frames = client.drain_frames();
+    let q_obs_data = q_obs_frames.iter().find_map(|f| match f {
+        KernelToDomainFrame::Receipt(r) if r.message_id == q_obs_ids[0] && r.status == ContractStatus::Completed => {
+            r.data.clone()
+        }
+        _ => None,
+    }).expect("Query observer snapshots should succeed");
+    assert!(q_obs_data["count"].as_u64().unwrap_or(0) >= 1);
+
+    // Unsubscribe from observer
+    let unsub_obs_ids = client.send(
+        vec![KERNEL_OBSERVER_TARGET.to_string()],
+        MSG_UNSUBSCRIBE_OBSERVER,
+        json!({}),
+        json!({}),
+    );
+    let unsub_frames = client.drain_frames();
+    assert!(unsub_frames.iter().any(|f| match f {
+        KernelToDomainFrame::Receipt(r) => r.message_id == unsub_obs_ids[0] && r.status == ContractStatus::Completed,
+        _ => false,
+    }));
+    assert_eq!(kernel.router().observer_subscribers_count(), 0);
+
+    // 3. Test kernel.supervisor: Smooth rolling update to v2
+    let script_v2 = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["compute"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
+for line in ipc_in:
+    frame = json.loads(line)
+    if frame.get("frame_type") == "deliver":
+        msg_id = frame["message_id"]
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"worker_roll.compute","status":"received","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"worker_roll.compute","status":"started","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"worker_roll.compute","status":"completed","data":{{"version":2}}}}) + "\n")
+        ipc_out.flush()
+"#
+    );
+
+    let spec_v2 = json!({
+        "domain_id": "worker_roll",
+        "command": python_cmd(),
+        "args": ["-c", script_v2],
+        "working_dir": null,
+        "auto_restart": true,
+        "max_restarts": 5,
+        "restart_delay_ms": 100
+    });
+
+    let upd_ids = client.send(
+        vec![KERNEL_SUPERVISOR_TARGET.to_string()],
+        MSG_UPDATE_DOMAIN,
+        json!({
+            "domain": "worker_roll",
+            "spec": spec_v2,
+            "probe_handler": "compute",
+            "timeout_ms": 6000
+        }),
+        json!({}),
+    );
+
+    let mut upd_receipt_opt = None;
+    let dl_upd = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < dl_upd {
+        let frames = client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Receipt(r) = f {
+                if r.message_id == upd_ids[0] && r.status == ContractStatus::Completed {
+                    upd_receipt_opt = Some(r);
+                    break;
+                }
+            }
+        }
+        if upd_receipt_opt.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let upd_receipt = upd_receipt_opt.expect("UpdateDomain receipt should be received");
+    assert_eq!(upd_receipt.status, ContractStatus::Completed);
+    let upd_data = upd_receipt.data.as_ref().expect("upd_data present");
+    assert_eq!(upd_data.get("status").and_then(|v| v.as_str()), Some("updated"));
+    assert!(upd_data.get("instance_id").and_then(|v| v.as_u64()).unwrap() > initial_inst_id);
+    let new_pid = upd_data.get("new_pid").and_then(|v| v.as_u64()).unwrap();
+    assert_ne!(new_pid, pid1 as u64);
+
+    // Verify worker_roll now runs v2
+    let comp_v2_ids = client.send(
+        vec!["worker_roll.compute".to_string()],
+        "ComputeTask",
+        json!({}),
+        json!({ "x": 20 }),
+    );
+
+    let dl_comp_v2 = std::time::Instant::now() + Duration::from_secs(5);
+    let mut comp_v2_done = false;
+    while std::time::Instant::now() < dl_comp_v2 {
+        let frames = client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Receipt(r) = f {
+                if r.message_id == comp_v2_ids[0] && r.status == ContractStatus::Completed {
+                    assert_eq!(r.data.as_ref().and_then(|d| d.get("version")).and_then(|v| v.as_i64()), Some(2));
+                    comp_v2_done = true;
+                    break;
+                }
+            }
+        }
+        if comp_v2_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(comp_v2_done, "worker_roll must now be running version 2");
+
+    // 4. Test candidate failure and automatic rollback
+    // Script that intentionally fails validation (immediate exit / crash)
+    let bad_script = "import sys; sys.exit(42)";
+    let bad_spec = json!({
+        "domain_id": "worker_roll",
+        "command": python_cmd(),
+        "args": ["-c", bad_script],
+        "working_dir": null,
+        "auto_restart": false,
+        "max_restarts": 0,
+        "restart_delay_ms": 100
+    });
+
+    let bad_upd_ids = client.send(
+        vec![KERNEL_SUPERVISOR_TARGET.to_string()],
+        MSG_UPDATE_DOMAIN,
+        json!({
+            "domain": "worker_roll",
+            "spec": bad_spec,
+            "probe_handler": "compute",
+            "timeout_ms": 1500
+        }),
+        json!({}),
+    );
+
+    let dl_bad = std::time::Instant::now() + Duration::from_secs(5);
+    let mut bad_receipt_opt = None;
+    while std::time::Instant::now() < dl_bad {
+        let frames = client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Receipt(r) = f {
+                if r.message_id == bad_upd_ids[0] && (r.status == ContractStatus::ExecutionFailed || r.status == ContractStatus::Completed) {
+                    bad_receipt_opt = Some(r);
+                    break;
+                }
+            }
+        }
+        if bad_receipt_opt.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let bad_receipt = bad_receipt_opt.expect("Bad Update receipt received");
+    assert_eq!(bad_receipt.status, ContractStatus::ExecutionFailed);
+    assert_eq!(bad_receipt.data.as_ref().and_then(|d| d.get("error")).and_then(|v| v.as_str()), Some("update_failed"));
+
+    // Verify existing v2 worker is STILL healthy and serves traffic without interruption
+    let comp_still_v2 = client.send(
+        vec!["worker_roll.compute".to_string()],
+        "ComputeTask",
+        json!({}),
+        json!({ "x": 30 }),
+    );
+    let dl_still = std::time::Instant::now() + Duration::from_secs(5);
+    let mut still_ok = false;
+    while std::time::Instant::now() < dl_still {
+        let frames = client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Receipt(r) = f {
+                if r.message_id == comp_still_v2[0] && r.status == ContractStatus::Completed {
+                    assert_eq!(r.data.as_ref().and_then(|d| d.get("version")).and_then(|v| v.as_i64()), Some(2));
+                    still_ok = true;
+                    break;
+                }
+            }
+        }
+        if still_ok {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(still_ok, "Existing instance continues serving traffic after candidate rollback");
+
+    // 5. Test stop domain via supervisor
+    let stop_ids = client.send(
+        vec![KERNEL_SUPERVISOR_TARGET.to_string()],
+        MSG_STOP_DOMAIN,
+        json!({ "domain": "worker_roll" }),
+        json!({}),
+    );
+    let dl_stop = std::time::Instant::now() + Duration::from_secs(5);
+    let mut stop_done = false;
+    while std::time::Instant::now() < dl_stop {
+        let frames = client.drain_frames();
+        for f in frames {
+            if let KernelToDomainFrame::Receipt(r) = f {
+                if r.message_id == stop_ids[0] && r.status == ContractStatus::Completed {
+                    assert_eq!(r.data.as_ref().and_then(|d| d.get("status")).and_then(|v| v.as_str()), Some("stopped"));
+                    stop_done = true;
+                    break;
+                }
+            }
+        }
+        if stop_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(stop_done, "StopDomain must complete");
+}
+

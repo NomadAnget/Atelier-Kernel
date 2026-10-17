@@ -146,6 +146,14 @@ function enhance(Base,RequestError,ExecutionFailed) {
     async unsubscribeTelemetryAsync(options={}){return (await this.request('kernel.telemetry','UnsubscribeTelemetry',{},{},options)).data;}
     async subscribeNotifyAsync(options={}){return (await this.request('kernel.notify','SubscribeNotify',{},{},options)).data;}
     async unsubscribeNotifyAsync(options={}){return (await this.request('kernel.notify','UnsubscribeNotify',{},{},options)).data;}
+    async queryRuntimeAsync({domain,domainId,domain_id}={},options={}){const params={};const d=domain??domainId??domain_id;if(d!==undefined)params.domain=d;return (await this.request('kernel.runtime','QueryRuntime',params,{},options)).data;}
+    async queryObserverAsync({limit=100,messageId,message_id,target,sourceDomain,source_domain}={},options={}){const params={limit};const mid=messageId??message_id;if(mid!==undefined)params.message_id=mid;if(target!==undefined)params.target=target;const sd=sourceDomain??source_domain;if(sd!==undefined)params.source_domain=sd;return (await this.request('kernel.observer','QueryObserver',params,{},options)).data;}
+    async subscribeObserverAsync(options={}){return (await this.request('kernel.observer','SubscribeObserver',{},{},options)).data;}
+    async unsubscribeObserverAsync(options={}){return (await this.request('kernel.observer','UnsubscribeObserver',{},{},options)).data;}
+    async supervisorStartAsync({domain,spec}={},options={}){const params={domain};if(spec!==undefined)params.spec=spec;return (await this.request('kernel.supervisor','StartDomain',params,{},options)).data;}
+    async supervisorStopAsync({domain}={},options={}){const params={domain};return (await this.request('kernel.supervisor','StopDomain',params,{},options)).data;}
+    async supervisorRestartAsync({domain}={},options={}){const params={domain};return (await this.request('kernel.supervisor','RestartDomain',params,{},options)).data;}
+    async supervisorUpdateAsync({domain,spec,probeHandler,probe_handler,timeoutMs,timeout_ms=5000}={},options={}){const params={domain,timeout_ms:timeoutMs??timeout_ms};if(spec!==undefined&&spec!==null)params.spec=spec;const ph=probeHandler??probe_handler;if(ph!==undefined)params.probe_handler=ph;return (await this.request('kernel.supervisor','UpdateDomain',params,{},options)).data;}
     _writeFrame(frame) {
       if(this._state==='closed')throw new RequestError('connection_closed');
       let line;
@@ -191,6 +199,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
       if(this._logListeners&&this._logListeners.length){for(const {level,sourceDomain} of this._logListeners){const p={};if(level!==undefined)p.level=level;if(sourceDomain!==undefined)p.source_domain=sourceDomain;this._submit(['kernel.logger'],'SubscribeLogs',p,{});}}
       if(this._telemetryListeners&&this._telemetryListeners.length){this._submit(['kernel.telemetry'],'SubscribeTelemetry',{},{});}
       if(this._notifyListeners&&this._notifyListeners.length){this._submit(['kernel.notify'],'SubscribeNotify',{},{});}
+      if(this._observationListeners&&this._observationListeners.length){this._submit(['kernel.observer'],'SubscribeObserver',{},{});}
       this._startup=Promise.resolve().then(async()=>{if(onStart)await onStart();}).catch(error=>{this._startupError=error;this._diagnostic(`SDK startup failed: ${error}`);this.close();});
       return this._runPromise;
     }
@@ -222,6 +231,10 @@ function enhance(Base,RequestError,ExecutionFailed) {
         this._dispatchSystemNotify(frame);
         return;
       }
+      if(target==='kernel.observer'||msgType==='ObservationEvent'){
+        this._dispatchSystemObserver(frame);
+        return;
+      }
 
       this.reportReceipt(frame.message_id,frame.target,'received');this._dispatch(frame);
     }
@@ -243,6 +256,12 @@ function enhance(Base,RequestError,ExecutionFailed) {
       const alert=frame.data||{};
       for(const callback of (this._notifyListeners||[])){
         this._invokeEventListener(callback,alert);
+      }
+    }
+    _dispatchSystemObserver(frame){
+      const event=frame.data||{};
+      for(const callback of (this._observationListeners||[])){
+        this._invokeEventListener(callback,event);
       }
     }
     _invokeEventListener(callback,payload){

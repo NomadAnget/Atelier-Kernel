@@ -260,6 +260,81 @@ class DomainRegistryClient {
   }
 }
 
+class DomainRuntimeClient {
+  /**
+   * Native runtime infrastructure facility for querying domain assembly.
+   */
+  constructor(domain) {
+    this._domain = domain;
+  }
+
+  query(options = {}) {
+    return this._domain.queryRuntimeAsync(typeof options === 'string' ? { domain: options } : options);
+  }
+
+  async listDomains(options = {}) {
+    const res = await this.query(options);
+    return res?.domains || [];
+  }
+
+  async getDomain(domainId, options = {}) {
+    const res = await this._domain.queryRuntimeAsync({ domain: domainId }, options);
+    return res?.domain || null;
+  }
+}
+
+class DomainObserverClient {
+  /**
+   * Native observer infrastructure facility for querying snapshots and managing subscriptions.
+   */
+  constructor(domain) {
+    this._domain = domain;
+  }
+
+  async query(options = {}) {
+    const res = await this._domain.queryObserverAsync(options);
+    return res?.events || [];
+  }
+
+  subscribe(options = {}) {
+    return this._domain.subscribeObserverAsync(options);
+  }
+
+  unsubscribe(options = {}) {
+    return this._domain.unsubscribeObserverAsync(options);
+  }
+}
+
+class DomainSupervisorClient {
+  /**
+   * Native supervisor infrastructure facility for process lifecycle and smooth rolling updates.
+   */
+  constructor(domain) {
+    this._domain = domain;
+  }
+
+  start(domain, spec = null, options = {}) {
+    return this._domain.supervisorStartAsync({ domain, spec }, options);
+  }
+
+  stop(domain, options = {}) {
+    return this._domain.supervisorStopAsync({ domain }, options);
+  }
+
+  restart(domain, options = {}) {
+    return this._domain.supervisorRestartAsync({ domain }, options);
+  }
+
+  update(domain, spec = null, options = {}) {
+    if (spec && typeof spec === "object" && !spec.command && (spec.probeHandler || spec.probe_handler || spec.timeoutMs || spec.timeout_ms)) {
+      return this._domain.supervisorUpdateAsync({ domain, ...spec });
+    }
+    const payload = { domain, ...options };
+    if (spec !== undefined && spec !== null) payload.spec = spec;
+    return this._domain.supervisorUpdateAsync(payload);
+  }
+}
+
 class AtelierDomain {
   constructor({ domain = "", stageDelayMs = 0 } = {}) {
     this._domainName = domain;
@@ -270,12 +345,16 @@ class AtelierDomain {
     this._logListeners = [];
     this._telemetryListeners = [];
     this._notifyListeners = [];
+    this._observationListeners = [];
     this._stageDelayMs = stageDelayMs;
     this._pending = new Map(); this._closed = false; this._running = false;
     this.logger = new DomainLogger(this, "DOMAIN", domain);
     this.telemetry = new DomainTelemetry(this);
     this.storage = new DomainStorageClient(this);
     this.registry = new DomainRegistryClient(this);
+    this.runtime = new DomainRuntimeClient(this);
+    this.observer = new DomainObserverClient(this);
+    this.supervisor = new DomainSupervisorClient(this);
   }
 
   /**
@@ -340,6 +419,17 @@ class AtelierDomain {
     this._notifyListeners.push(callback);
     if (this._state === "open") {
       this._submit([KERNEL_NOTIFY_TARGET], "SubscribeNotify", {}, {});
+    }
+    return this;
+  }
+
+  /**
+   * Registers a callback to listen to the real-time global message observation stream.
+   */
+  onObservation(callback) {
+    this._observationListeners.push(callback);
+    if (this._state === "open") {
+      this._submit([KERNEL_OBSERVER_TARGET], "SubscribeObserver", {}, {});
     }
     return this;
   }
@@ -541,6 +631,9 @@ const KERNEL_STORAGE_TARGET = "kernel.storage";
 const KERNEL_LOGGER_TARGET = "kernel.logger";
 const KERNEL_TELEMETRY_TARGET = "kernel.telemetry";
 const KERNEL_NOTIFY_TARGET = "kernel.notify";
+const KERNEL_RUNTIME_TARGET = "kernel.runtime";
+const KERNEL_OBSERVER_TARGET = "kernel.observer";
+const KERNEL_SUPERVISOR_TARGET = "kernel.supervisor";
 
 const MSG_REGISTER_HANDLERS = "RegisterHandlers";
 const MSG_UNREGISTER_HANDLERS = "UnregisterHandlers";
@@ -553,9 +646,19 @@ const MSG_SUBSCRIBE_TELEMETRY = "SubscribeTelemetry";
 const MSG_UNSUBSCRIBE_TELEMETRY = "UnsubscribeTelemetry";
 const MSG_SUBSCRIBE_NOTIFY = "SubscribeNotify";
 const MSG_UNSUBSCRIBE_NOTIFY = "UnsubscribeNotify";
+const MSG_QUERY_RUNTIME = "QueryRuntime";
+const MSG_QUERY_DOMAIN_ASSEMBLY = "QueryDomainAssembly";
+const MSG_QUERY_OBSERVER = "QueryObserver";
+const MSG_SUBSCRIBE_OBSERVER = "SubscribeObserver";
+const MSG_UNSUBSCRIBE_OBSERVER = "UnsubscribeObserver";
+const MSG_START_DOMAIN = "StartDomain";
+const MSG_STOP_DOMAIN = "StopDomain";
+const MSG_RESTART_DOMAIN = "RestartDomain";
+const MSG_UPDATE_DOMAIN = "UpdateDomain";
 const MSG_SYSTEM_LOG_EVENT = "LogEvent";
 const MSG_SYSTEM_TELEMETRY_EVENT = "TelemetryEvent";
 const MSG_SYSTEM_NOTIFY_EVENT = "NotifyEvent";
+const MSG_SYSTEM_OBSERVER_EVENT = "ObservationEvent";
 const MSG_STORAGE_INSERT = "StorageInsert";
 const MSG_STORAGE_QUERY = "StorageQuery";
 const MSG_STORAGE_UPDATE = "StorageUpdate";
@@ -568,34 +671,50 @@ module.exports = {
   ...require("./runtime").enhance(AtelierDomain, DomainRequestError, DomainExecutionFailed),
   DomainExecutionFailed,
   DomainLogger,
+  DomainObserverClient,
   DomainRegistryClient,
   DomainRequestError,
+  DomainRuntimeClient,
   DomainStorageClient,
+  DomainSupervisorClient,
   DomainTelemetry,
   KERNEL_LOGGER_TARGET,
   KERNEL_NOTIFY_TARGET,
+  KERNEL_OBSERVER_TARGET,
   KERNEL_REGISTRY_TARGET,
+  KERNEL_RUNTIME_TARGET,
   KERNEL_STORAGE_TARGET,
+  KERNEL_SUPERVISOR_TARGET,
   KERNEL_TELEMETRY_TARGET,
   MSG_DELIVERY_DURABLE,
   MSG_DELIVERY_EPHEMERAL,
   MSG_DELIVERY_VOLATILE,
+  MSG_QUERY_DOMAIN_ASSEMBLY,
   MSG_QUERY_HANDLERS,
   MSG_QUERY_LOGS,
+  MSG_QUERY_OBSERVER,
   MSG_QUERY_PROGRESS,
+  MSG_QUERY_RUNTIME,
   MSG_REGISTER_HANDLERS,
+  MSG_RESTART_DOMAIN,
+  MSG_START_DOMAIN,
+  MSG_STOP_DOMAIN,
   MSG_STORAGE_DELETE,
   MSG_STORAGE_INSERT,
   MSG_STORAGE_QUERY,
   MSG_STORAGE_UPDATE,
   MSG_SUBSCRIBE_LOGS,
   MSG_SUBSCRIBE_NOTIFY,
+  MSG_SUBSCRIBE_OBSERVER,
   MSG_SUBSCRIBE_TELEMETRY,
   MSG_SYSTEM_LOG_EVENT,
   MSG_SYSTEM_NOTIFY_EVENT,
+  MSG_SYSTEM_OBSERVER_EVENT,
   MSG_SYSTEM_TELEMETRY_EVENT,
   MSG_UNREGISTER_HANDLERS,
   MSG_UNSUBSCRIBE_LOGS,
   MSG_UNSUBSCRIBE_NOTIFY,
+  MSG_UNSUBSCRIBE_OBSERVER,
   MSG_UNSUBSCRIBE_TELEMETRY,
+  MSG_UPDATE_DOMAIN,
 };

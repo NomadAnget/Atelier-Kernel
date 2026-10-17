@@ -13,11 +13,33 @@ pub const KERNEL_LOGGER_TARGET: &str = "kernel.logger";
 pub const KERNEL_TELEMETRY_TARGET: &str = "kernel.telemetry";
 /// Built-in kernel target for system notifications and alerts.
 pub const KERNEL_NOTIFY_TARGET: &str = "kernel.notify";
+/// Built-in kernel target for domain assembly and runtime state query.
+pub const KERNEL_RUNTIME_TARGET: &str = "kernel.runtime";
+/// Built-in kernel target for global message lifecycle observation.
+pub const KERNEL_OBSERVER_TARGET: &str = "kernel.observer";
+/// Built-in kernel target for domain supervisor lifecycle control.
+pub const KERNEL_SUPERVISOR_TARGET: &str = "kernel.supervisor";
 
 /// Built-in lifecycle / registry message types.
 pub const MSG_REGISTER_HANDLERS: &str = "RegisterHandlers";
 pub const MSG_UNREGISTER_HANDLERS: &str = "UnregisterHandlers";
 pub const MSG_QUERY_HANDLERS: &str = "QueryHandlers";
+
+/// Built-in runtime query message types.
+pub const MSG_QUERY_RUNTIME: &str = "QueryRuntime";
+pub const MSG_QUERY_DOMAIN_ASSEMBLY: &str = "QueryDomainAssembly";
+
+/// Built-in observer message types.
+pub const MSG_QUERY_OBSERVER: &str = "QueryObserver";
+pub const MSG_SUBSCRIBE_OBSERVER: &str = "SubscribeObserver";
+pub const MSG_UNSUBSCRIBE_OBSERVER: &str = "UnsubscribeObserver";
+pub const MSG_SYSTEM_OBSERVER_EVENT: &str = "ObservationEvent";
+
+/// Built-in supervisor control message types.
+pub const MSG_START_DOMAIN: &str = "StartDomain";
+pub const MSG_STOP_DOMAIN: &str = "StopDomain";
+pub const MSG_RESTART_DOMAIN: &str = "RestartDomain";
+pub const MSG_UPDATE_DOMAIN: &str = "UpdateDomain";
 
 /// Built-in logging message types.
 pub const MSG_QUERY_LOGS: &str = "QueryLogs";

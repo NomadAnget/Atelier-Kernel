@@ -3,8 +3,11 @@ Cross-language verification for Kernel Infrastructure methods:
 - on_log / onLog: auto-subscription, level filtering, ephemeral push without receipts
 - on_telemetry / onTelemetry: auto-subscription, metric ingestion, zero receipts
 - on_notify / onNotify: auto-subscription, alert fanout, zero receipts
+- on_observation / onObservation: auto-subscription, lifecycle events, zero receipts
 - domain.telemetry.emit / domain.notify: native emission helpers
-- domain.storage / domain.registry / discover_handlers
+- domain.runtime: native assembly query
+- domain.observer: native snapshot query and subscriptions
+- domain.supervisor: native process lifecycle control and rolling update
 """
 import json, os, queue, subprocess, sys, threading, time, uuid
 from pathlib import Path
@@ -21,6 +24,7 @@ d = AtelierDomain(domain="infra_test_py", shutdown_grace=0.1)
 received_logs = []
 received_telemetry = []
 received_alerts = []
+received_observations = []
 
 @d.on_log(level="WARNING")
 def handle_log(record):
@@ -34,12 +38,17 @@ def handle_telemetry(metric):
 def handle_alert(alert):
     received_alerts.append(alert.get("message"))
 
+@d.on_observation
+def handle_observation(event):
+    received_observations.append(event.get("topic") or event.get("event_type"))
+
 @d.handler("status")
 def status(msg):
     return {
         "logs": received_logs,
         "telemetry": received_telemetry,
         "alerts": received_alerts,
+        "observations": received_observations,
     }
 
 @d.handler("emit_test")
@@ -47,6 +56,17 @@ def emit_test(msg):
     d.telemetry.emit("cpu_load", 85.5, {"host": "node1"})
     d.notify("error", "Disk full", "StorageAlert")
     return {"emitted": True}
+
+@d.handler("infra_test")
+async def infra_test(msg):
+    res_runtime = await d.runtime.query(domain="domain_alpha")
+    res_observer = await d.observer.query(limit=50)
+    res_supervisor = await d.supervisor.update(domain="domain_alpha", probe_handler="ping", timeout_ms=3000)
+    return {
+        "runtime": res_runtime,
+        "observer": res_observer,
+        "supervisor": res_supervisor,
+    }
 
 d.run()
 '''
@@ -58,6 +78,7 @@ const d = new AtelierDomain({ domain: "infra_test_js", shutdownGrace: 0.1 });
 const receivedLogs = [];
 const receivedTelemetry = [];
 const receivedAlerts = [];
+const receivedObservations = [];
 
 d.onLog((record) => {
   receivedLogs.push(record.message);
@@ -71,11 +92,16 @@ d.onNotify((alert) => {
   receivedAlerts.push(alert.message);
 });
 
+d.onObservation((event) => {
+  receivedObservations.push(event.topic || event.event_type);
+});
+
 d.handler("status", () => {
   return {
     logs: receivedLogs,
     telemetry: receivedTelemetry,
     alerts: receivedAlerts,
+    observations: receivedObservations,
   };
 });
 
@@ -83,6 +109,17 @@ d.handler("emit_test", () => {
   d.telemetry.emit("cpu_load", 85.5, { host: "node1" });
   d.notify("error", "Disk full", "StorageAlert");
   return { emitted: true };
+});
+
+d.handler("infra_test", async () => {
+  const resRuntime = await d.runtime.query({ domain: "domain_alpha" });
+  const resObserver = await d.observer.query({ limit: 50 });
+  const resSupervisor = await d.supervisor.update("domain_alpha", { probeHandler: "ping", timeoutMs: 3000 });
+  return {
+    runtime: resRuntime,
+    observer: resObserver,
+    supervisor: resSupervisor,
+  };
 });
 
 d.run();
@@ -93,11 +130,11 @@ def run_scenario(lang, code):
     w_pipe_read, w_pipe_write = os.pipe()
 
     if lang == "py":
-        script_path = WORK / "test_py.py"
+        script_path = WORK / f"test_{lang}.py"
         script_path.write_text(code, encoding="utf-8")
         cmd = [sys.executable, "-u", str(script_path)]
     else:
-        script_path = WORK / "test_js.js"
+        script_path = WORK / f"test_{lang}.js"
         script_path.write_text(code, encoding="utf-8")
         sdk_js_path = str(ROOT / "sdk/nodejs")
         cmd = ["node", str(script_path), sdk_js_path]
@@ -139,7 +176,7 @@ def run_scenario(lang, code):
     t = threading.Thread(target=reader, daemon=True)
     t.start()
 
-    # 1. Collect startup frames: should contain RegisterHandlers and auto-subscriptions
+    # 1. Collect startup frames: should contain RegisterHandlers and 4 auto-subscriptions
     startup_sub_targets = set()
     start_time = time.time()
     while time.time() - start_time < 3.0:
@@ -157,12 +194,14 @@ def run_scenario(lang, code):
                     startup_sub_targets.add("telemetry")
                 elif target == "kernel.notify" and m_type == "SubscribeNotify":
                     startup_sub_targets.add("notify")
-            if len(startup_sub_targets) == 4:
+                elif target == "kernel.observer" and m_type == "SubscribeObserver":
+                    startup_sub_targets.add("observer")
+            if len(startup_sub_targets) == 5:
                 break
         except queue.Empty:
             continue
 
-    if len(startup_sub_targets) != 4:
+    if len(startup_sub_targets) != 5:
         stdout_text = proc.stdout.read().decode("utf-8", errors="replace") if proc.stdout else ""
         stderr_text = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
         raise AssertionError(f"[{lang}] Missing auto-subscriptions: {startup_sub_targets}\nSTDOUT: {stdout_text}\nSTDERR: {stderr_text}\nFRAMES: {frames_received}")
@@ -213,12 +252,23 @@ def run_scenario(lang, code):
     }) + "\n")
     in_file.flush()
 
-    # Wait 200ms and verify NO receipts were generated for the above 4 system deliveries
+    # 2e. Push Observer event
+    in_file.write(json.dumps({
+        "frame_type": "deliver",
+        "message_id": "obs_1",
+        "target": "kernel.observer",
+        "message_type": "ObservationEvent",
+        "source_domain": "kernel",
+        "data": {"topic": "worker_lifecycle", "state": "active"},
+    }) + "\n")
+    in_file.flush()
+
+    # Wait 250ms and verify NO receipts were generated for the above 5 system deliveries
     time.sleep(0.25)
     sent_receipt_ids = [
         f["message_id"] for f in frames_received if f.get("frame_type") == "receipt"
     ]
-    for sys_id in ["log_1", "log_2", "telem_1", "alert_1"]:
+    for sys_id in ["log_1", "log_2", "telem_1", "alert_1", "obs_1"]:
         assert sys_id not in sent_receipt_ids, f"[{lang}] System event {sys_id} must NEVER trigger receipt frames!"
     print(f"  [{lang}] Verified zero receipt frames sent for system event deliveries")
 
@@ -251,6 +301,7 @@ def run_scenario(lang, code):
     assert status_result["logs"] == ["Captured warning log"], f"[{lang}] Unexpected logs: {status_result['logs']}"
     assert status_result["telemetry"] == ["temp_gauge"], f"[{lang}] Unexpected telemetry: {status_result['telemetry']}"
     assert status_result["alerts"] == ["Cluster alert text"], f"[{lang}] Unexpected alerts: {status_result['alerts']}"
+    assert status_result["observations"] == ["worker_lifecycle"], f"[{lang}] Unexpected observations: {status_result.get('observations')}"
     print(f"  [{lang}] Verified callbacks executed with filtered event data")
 
     # 4. Call 'emit_test' handler to verify domain.telemetry.emit and domain.notify outbound emission
@@ -290,6 +341,85 @@ def run_scenario(lang, code):
     assert emitted_telem, f"[{lang}] Missing telemetry emission"
     assert emitted_notify, f"[{lang}] Missing notify emission"
     print(f"  [{lang}] Verified domain.telemetry.emit and domain.notify outbound frame generation")
+
+    # 5. Call 'infra_test' handler to verify runtime, observer, supervisor native client methods
+    in_file.write(json.dumps({
+        "frame_type": "deliver",
+        "message_id": "rpc_infra_1",
+        "target": f"infra_test_{lang}.infra_test",
+        "message_type": "InfraTest",
+        "source_domain": "test_runner",
+        "data": {},
+    }) + "\n")
+    in_file.flush()
+
+    infra_completed_data = None
+    start_time = time.time()
+    while time.time() - start_time < 4.0:
+        try:
+            f = frames_q.get(timeout=0.2)
+            if f.get("frame_type") == "send":
+                target = f.get("targets", [""])[0]
+                seq = f.get("seq")
+                mid = f.get("message_id") or f"mock_msg_{seq}"
+                if target == "kernel.runtime":
+                    assert f.get("params", {}).get("domain") == "domain_alpha"
+                    # Mock Kernel response completed receipt
+                    in_file.write(json.dumps({
+                        "frame_type": "receipt",
+                        "seq": seq,
+                        "message_id": mid,
+                        "target": "kernel.runtime",
+                        "status": "completed",
+                        "data": {"domain": {"domain_id": "domain_alpha", "status": "Running"}},
+                    }) + "\n")
+                    in_file.flush()
+                elif target == "kernel.observer":
+                    assert f.get("params", {}).get("limit") == 50
+                    # Mock Kernel response completed receipt
+                    in_file.write(json.dumps({
+                        "frame_type": "receipt",
+                        "seq": seq,
+                        "message_id": mid,
+                        "target": "kernel.observer",
+                        "status": "completed",
+                        "data": {"events": [{"topic": "msg_delivered", "target": "domain_alpha.ping"}]},
+                    }) + "\n")
+                    in_file.flush()
+                elif target == "kernel.supervisor":
+                    assert f.get("params", {}).get("domain") == "domain_alpha"
+                    assert f.get("params", {}).get("probe_handler") == "ping"
+                    assert f.get("params", {}).get("timeout_ms") == 3000
+                    # Mock Kernel response completed receipt
+                    in_file.write(json.dumps({
+                        "frame_type": "receipt",
+                        "seq": seq,
+                        "message_id": mid,
+                        "target": "kernel.supervisor",
+                        "status": "completed",
+                        "data": {"success": True, "domain": "domain_alpha", "action": "update"},
+                    }) + "\n")
+                    in_file.flush()
+            elif f.get("frame_type") == "receipt" and f.get("message_id") == "rpc_infra_1" and f.get("status") == "completed":
+                infra_completed_data = f.get("data")
+                break
+        except queue.Empty:
+            continue
+
+    if infra_completed_data is None:
+        proc.terminate()
+        try:
+            stdout_bytes, stderr_bytes = proc.communicate(timeout=1.0)
+        except Exception:
+            proc.kill()
+            stdout_bytes, stderr_bytes = proc.communicate()
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace")
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace")
+        raise AssertionError(f"[{lang}] rpc_infra_1 failed to complete\nSTDOUT: {stdout_text}\nSTDERR: {stderr_text}\nFRAMES: {frames_received}")
+    assert infra_completed_data["runtime"]["domain"]["domain_id"] == "domain_alpha"
+    assert infra_completed_data["observer"] == [{"topic": "msg_delivered", "target": "domain_alpha.ping"}]
+    assert infra_completed_data["supervisor"]["success"] is True
+    print(f"  [{lang}] Verified runtime, observer, and supervisor native client RPC roundtrips")
 
     proc.terminate()
     try:

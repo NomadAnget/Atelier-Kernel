@@ -43,6 +43,8 @@ pub enum SupervisorError {
     StdioCaptureFailed(String),
     #[error("unknown domain spec for '{0}'")]
     UnknownDomainSpec(String),
+    #[error("domain update validation failed for '{domain}': {reason}")]
+    UpdateValidationFailed { domain: String, reason: String },
 }
 
 /// External Kernel Boot Configuration (`kernel_boot.json`).
@@ -209,10 +211,21 @@ impl DomainProcessSpec {
     }
 }
 
+#[derive(Clone)]
 struct ManagedProcess {
     instance_id: u64,
     child: Arc<Mutex<Child>>,
     stopping: Arc<AtomicBool>,
+}
+
+/// Result of a smooth domain rolling update or rollback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainUpdateResult {
+    pub domain_id: String,
+    pub new_pid: u32,
+    pub old_pid: Option<u32>,
+    pub instance_id: u64,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +323,145 @@ impl DomainSupervisorInner {
         }
     }
 
+    fn spawn_child_pipes(
+        &self,
+        domain_id: &str,
+        spec: &DomainProcessSpec,
+    ) -> Result<(Child, std::io::PipeWriter, std::io::PipeReader), SupervisorError> {
+        let _spawn_guard = self.spawn_lock.lock();
+
+        #[cfg(unix)]
+        let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) =
+            allocate_non_stdio_pipes().map_err(|source| SupervisorError::SpawnFailed {
+                domain: domain_id.to_string(),
+                source,
+            })?;
+
+        #[cfg(windows)]
+        let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) = {
+            let (k2d_rx, k2d_tx) =
+                std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
+                    domain: domain_id.to_string(),
+                    source,
+                })?;
+            let (d2k_rx, d2k_tx) =
+                std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
+                    domain: domain_id.to_string(),
+                    source,
+                })?;
+            (k2d_rx, k2d_tx, d2k_rx, d2k_tx)
+        };
+
+        #[cfg(unix)]
+        let (r_fd, w_fd) = {
+            use std::os::fd::AsRawFd;
+            let r = k2d_rx.as_raw_fd();
+            let w = d2k_tx.as_raw_fd();
+            clear_cloexec(r).map_err(|source| SupervisorError::SpawnFailed {
+                domain: domain_id.to_string(),
+                source,
+            })?;
+            clear_cloexec(w).map_err(|source| SupervisorError::SpawnFailed {
+                domain: domain_id.to_string(),
+                source,
+            })?;
+            (r, w)
+        };
+
+        #[cfg(windows)]
+        let (r_handle, w_handle) = {
+            use std::os::windows::io::AsRawHandle;
+            let r_h = k2d_rx.as_raw_handle();
+            let w_h = d2k_tx.as_raw_handle();
+            unsafe {
+                if SetHandleInformation(r_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                    == 0
+                    || SetHandleInformation(
+                        w_h as *mut _,
+                        HANDLE_FLAG_INHERIT,
+                        HANDLE_FLAG_INHERIT,
+                    ) == 0
+                {
+                    return Err(SupervisorError::SpawnFailed {
+                        domain: domain_id.to_string(),
+                        source: std::io::Error::last_os_error(),
+                    });
+                }
+            }
+            (r_h as usize, w_h as usize)
+        };
+
+        let configure_cmd = |cmd: &mut Command| {
+            cmd.args(&spec.args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(dir) = &spec.working_dir {
+                cmd.current_dir(dir);
+            }
+            #[cfg(unix)]
+            {
+                cmd.env("ATELIER_IPC_READ_FD", r_fd.to_string())
+                    .env("ATELIER_IPC_WRITE_FD", w_fd.to_string());
+            }
+            #[cfg(windows)]
+            {
+                cmd.env("ATELIER_IPC_READ_FD", r_handle.to_string())
+                    .env("ATELIER_IPC_WRITE_FD", w_handle.to_string())
+                    .env("ATELIER_IPC_HANDLE_MODE", "win32");
+            }
+        };
+
+        let command_str = if cfg!(windows) && spec.command == "python3" {
+            "python"
+        } else {
+            &spec.command
+        };
+        let mut cmd = Command::new(command_str);
+        configure_cmd(&mut cmd);
+
+        let child_res = match cmd.spawn() {
+            Ok(c) => Ok(c),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let alt_cmd = if command_str == "python3" {
+                    Some("python")
+                } else if command_str == "python" {
+                    Some("python3")
+                } else {
+                    None
+                };
+
+                if let Some(alt) = alt_cmd {
+                    let mut fallback = Command::new(alt);
+                    configure_cmd(&mut fallback);
+                    fallback
+                        .spawn()
+                        .map_err(|source| SupervisorError::SpawnFailed {
+                            domain: domain_id.to_string(),
+                            source,
+                        })
+                } else {
+                    Err(SupervisorError::SpawnFailed {
+                        domain: domain_id.to_string(),
+                        source: e,
+                    })
+                }
+            }
+            Err(e) => Err(SupervisorError::SpawnFailed {
+                domain: domain_id.to_string(),
+                source: e,
+            }),
+        };
+
+        // Explicitly drop the child-side pipe endpoints in the parent process immediately
+        // so the Kernel only holds (k2d_tx, d2k_rx) and receives immediate EOF when the domain exits.
+        drop(k2d_rx);
+        drop(d2k_tx);
+
+        let child = child_res?;
+        Ok((child, k2d_tx, d2k_rx))
+    }
+
     fn spawn_process_internal(
         &self,
         spec: DomainProcessSpec,
@@ -321,142 +473,7 @@ impl DomainSupervisorInner {
         // Stop any existing process for this domain first.
         let _ = self.stop_process_internal(&domain_id);
 
-        // Critical section for allocating dedicated dual anonymous pipes and spawning the child
-        // so concurrent domain spawns never leak inheritable pipe endpoints across domains.
-        let (mut child, k2d_tx, d2k_rx) = {
-            let _spawn_guard = self.spawn_lock.lock();
-
-            #[cfg(unix)]
-            let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) =
-                allocate_non_stdio_pipes().map_err(|source| SupervisorError::SpawnFailed {
-                    domain: domain_id.clone(),
-                    source,
-                })?;
-
-            #[cfg(windows)]
-            let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) = {
-                let (k2d_rx, k2d_tx) =
-                    std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
-                        domain: domain_id.clone(),
-                        source,
-                    })?;
-                let (d2k_rx, d2k_tx) =
-                    std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
-                        domain: domain_id.clone(),
-                        source,
-                    })?;
-                (k2d_rx, k2d_tx, d2k_rx, d2k_tx)
-            };
-
-            #[cfg(unix)]
-            let (r_fd, w_fd) = {
-                use std::os::fd::AsRawFd;
-                let r = k2d_rx.as_raw_fd();
-                let w = d2k_tx.as_raw_fd();
-                clear_cloexec(r).map_err(|source| SupervisorError::SpawnFailed {
-                    domain: domain_id.clone(),
-                    source,
-                })?;
-                clear_cloexec(w).map_err(|source| SupervisorError::SpawnFailed {
-                    domain: domain_id.clone(),
-                    source,
-                })?;
-                (r, w)
-            };
-
-            #[cfg(windows)]
-            let (r_handle, w_handle) = {
-                use std::os::windows::io::AsRawHandle;
-                let r_h = k2d_rx.as_raw_handle();
-                let w_h = d2k_tx.as_raw_handle();
-                unsafe {
-                    if SetHandleInformation(r_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-                        == 0
-                        || SetHandleInformation(
-                            w_h as *mut _,
-                            HANDLE_FLAG_INHERIT,
-                            HANDLE_FLAG_INHERIT,
-                        ) == 0
-                    {
-                        return Err(SupervisorError::SpawnFailed {
-                            domain: domain_id.clone(),
-                            source: std::io::Error::last_os_error(),
-                        });
-                    }
-                }
-                (r_h as usize, w_h as usize)
-            };
-
-            let configure_cmd = |cmd: &mut Command| {
-                cmd.args(&spec.args)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                if let Some(dir) = &spec.working_dir {
-                    cmd.current_dir(dir);
-                }
-                #[cfg(unix)]
-                {
-                    cmd.env("ATELIER_IPC_READ_FD", r_fd.to_string())
-                        .env("ATELIER_IPC_WRITE_FD", w_fd.to_string());
-                }
-                #[cfg(windows)]
-                {
-                    cmd.env("ATELIER_IPC_READ_FD", r_handle.to_string())
-                        .env("ATELIER_IPC_WRITE_FD", w_handle.to_string())
-                        .env("ATELIER_IPC_HANDLE_MODE", "win32");
-                }
-            };
-
-            let command_str = if cfg!(windows) && spec.command == "python3" {
-                "python"
-            } else {
-                &spec.command
-            };
-            let mut cmd = Command::new(command_str);
-            configure_cmd(&mut cmd);
-
-            let child_res = match cmd.spawn() {
-                Ok(c) => Ok(c),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let alt_cmd = if command_str == "python3" {
-                        Some("python")
-                    } else if command_str == "python" {
-                        Some("python3")
-                    } else {
-                        None
-                    };
-
-                    if let Some(alt) = alt_cmd {
-                        let mut fallback = Command::new(alt);
-                        configure_cmd(&mut fallback);
-                        fallback
-                            .spawn()
-                            .map_err(|source| SupervisorError::SpawnFailed {
-                                domain: domain_id.clone(),
-                                source,
-                            })
-                    } else {
-                        Err(SupervisorError::SpawnFailed {
-                            domain: domain_id.clone(),
-                            source: e,
-                        })
-                    }
-                }
-                Err(e) => Err(SupervisorError::SpawnFailed {
-                    domain: domain_id.clone(),
-                    source: e,
-                }),
-            };
-
-            // Explicitly drop the child-side pipe endpoints in the parent process immediately
-            // so the Kernel only holds (k2d_tx, d2k_rx) and receives immediate EOF when the domain exits.
-            drop(k2d_rx);
-            drop(d2k_tx);
-
-            let child = child_res?;
-            (child, k2d_tx, d2k_rx)
-        };
+        let (mut child, k2d_tx, d2k_rx) = self.spawn_child_pipes(&domain_id, &spec)?;
 
         let pid = child.id();
         let child_stdout = child.stdout.take();
@@ -959,6 +976,187 @@ impl DomainSupervisor {
             inbox: Mutex::new(rx),
             next_seq: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// Returns the OS process ID for a managed domain, if currently running.
+    pub fn get_pid(&self, domain_id: &str) -> Option<u32> {
+        self.inner
+            .processes
+            .lock()
+            .get(domain_id)
+            .map(|p| p.child.lock().id())
+    }
+
+    /// Performs a zero-downtime rolling update with validation and automatic rollback.
+    pub fn update_process_domain(
+        &self,
+        domain_id: &str,
+        new_spec: Option<DomainProcessSpec>,
+        _probe_handler: Option<&str>,
+        timeout: Duration,
+    ) -> Result<DomainUpdateResult, SupervisorError> {
+        let spec = match new_spec {
+            Some(s) => {
+                self.inner.specs.write().insert(domain_id.to_string(), s.clone());
+                s
+            }
+            None => self
+                .get_spec(domain_id)
+                .ok_or_else(|| SupervisorError::UnknownDomainSpec(domain_id.to_string()))?,
+        };
+
+        let old_managed = self.inner.processes.lock().get(domain_id).cloned();
+        let old_pid = old_managed.as_ref().map(|m| m.child.lock().id());
+        let old_instance_id = old_managed.as_ref().map(|m| m.instance_id);
+
+        if old_managed.is_none() {
+            let pid = self.spawn_process_domain(spec)?;
+            let inst_id = self.inner.router.domain_instance_id(domain_id).unwrap_or(0);
+            return Ok(DomainUpdateResult {
+                domain_id: domain_id.to_string(),
+                new_pid: pid,
+                old_pid: None,
+                instance_id: inst_id,
+                status: "started".to_string(),
+            });
+        }
+
+        // Spawn candidate child process
+        let (child, k2d_tx, d2k_rx) = self.inner.spawn_child_pipes(domain_id, &spec)?;
+        let candidate_pid = child.id();
+
+        let (cand_tx, cand_rx) = mpsc::channel::<KernelToDomainFrame>();
+        let candidate_instance_id = self.inner.router.attach_candidate_pipe(domain_id, cand_tx);
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let child_arc = Arc::new(Mutex::new(child));
+
+        // Candidate writer thread
+        let writer_domain = domain_id.to_string();
+        thread::Builder::new()
+            .name(format!("kernel-cand-tx-{writer_domain}-{candidate_instance_id}"))
+            .spawn(move || {
+                let mut pipe_tx = k2d_tx;
+                while let Ok(frame) = cand_rx.recv() {
+                    if let Ok(line) = serde_json::to_string(&frame) {
+                        if writeln!(pipe_tx, "{line}").is_err() || pipe_tx.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        // Candidate reader thread
+        let reader_domain = domain_id.to_string();
+        let router_ref = Arc::clone(&self.inner.router);
+        let stopping_ref = Arc::clone(&stopping);
+        let child_for_reader = Arc::clone(&child_arc);
+        thread::Builder::new()
+            .name(format!("kernel-cand-rx-{reader_domain}-{candidate_instance_id}"))
+            .spawn(move || {
+                let reader = BufReader::new(d2k_rx);
+                for line in reader.lines() {
+                    match line {
+                        Ok(raw_line) => {
+                            router_ref.handle_raw_pipe_line_for_instance(
+                                &reader_domain,
+                                candidate_instance_id,
+                                &raw_line,
+                            );
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !stopping_ref.load(Ordering::SeqCst) {
+                    let mut lock = child_for_reader.lock();
+                    let _ = lock.wait();
+                }
+            })
+            .ok();
+
+        // Validation loop: probe readiness and health
+        let start_time = Instant::now();
+        let mut validated = false;
+        while start_time.elapsed() < timeout {
+            // Check if candidate process terminated prematurely
+            {
+                let mut lock = child_arc.lock();
+                if let Ok(Some(_)) = lock.try_wait() {
+                    break;
+                }
+            }
+            if self.inner.router.is_candidate_ready(domain_id, candidate_instance_id) {
+                validated = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        if !validated {
+            // Rollback! Terminate candidate, keep old instance serving
+            stopping.store(true, Ordering::SeqCst);
+            {
+                let mut lock = child_arc.lock();
+                let _ = lock.kill();
+                let _ = lock.wait();
+            }
+            self.inner.router.abort_candidate(domain_id, candidate_instance_id);
+            return Err(SupervisorError::UpdateValidationFailed {
+                domain: domain_id.to_string(),
+                reason: "Candidate instance failed readiness/probe check within timeout".to_string(),
+            });
+        }
+
+        // Validation succeeded! Atomically switch routes in router
+        self.inner.router.commit_candidate(domain_id, candidate_instance_id);
+
+        let new_managed = ManagedProcess {
+            instance_id: candidate_instance_id,
+            child: Arc::clone(&child_arc),
+            stopping: Arc::clone(&stopping),
+        };
+        self.inner.processes.lock().insert(domain_id.to_string(), new_managed);
+
+        // Reset restart trackers
+        {
+            let mut trackers = self.inner.restart_trackers.lock();
+            let tracker = trackers
+                .entry(domain_id.to_string())
+                .or_insert_with(|| RestartTracker {
+                    consecutive_restarts: 0,
+                    last_spawn_instant: None,
+                });
+            tracker.last_spawn_instant = Some(Instant::now());
+        }
+
+        // Gracefully drain and terminate old process in background thread
+        if let Some(old_p) = old_managed {
+            let domain_drain = domain_id.to_string();
+            let old_inst = old_instance_id.unwrap_or(0);
+            let router_drain = Arc::clone(&self.inner.router);
+            thread::Builder::new()
+                .name(format!("kernel-drain-{domain_drain}-{old_inst}"))
+                .spawn(move || {
+                    thread::sleep(Duration::from_millis(600));
+                    old_p.stopping.store(true, Ordering::SeqCst);
+                    {
+                        let mut lock = old_p.child.lock();
+                        let _ = lock.kill();
+                        let _ = lock.wait();
+                    }
+                    router_drain.cleanup_draining_instance(&domain_drain, old_inst);
+                })
+                .ok();
+        }
+
+        Ok(DomainUpdateResult {
+            domain_id: domain_id.to_string(),
+            new_pid: candidate_pid,
+            old_pid,
+            instance_id: candidate_instance_id,
+            status: "updated".to_string(),
+        })
     }
 }
 

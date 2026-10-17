@@ -151,12 +151,70 @@ export class DomainRegistryClient {
   getDescription(target: string, requestOptions?: RequestOptions): Promise<string | null>;
 }
 
+export interface QueryRuntimeOptions {
+  domain?: string;
+  domainId?: string;
+  domain_id?: string;
+}
+
+export interface DomainAssembly {
+  domain_id: string;
+  status: string;
+  instance_id: number;
+  routes: string[];
+  handlers: Record<string, string>;
+  process?: Record<string, any>;
+}
+
+export class DomainRuntimeClient {
+  constructor(domain: AtelierDomain);
+  query(options?: QueryRuntimeOptions | string, requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  listDomains(requestOptions?: RequestOptions): Promise<DomainAssembly[]>;
+  getDomain(domainId: string, requestOptions?: RequestOptions): Promise<DomainAssembly | null>;
+}
+
+export interface QueryObserverOptions {
+  limit?: number;
+  messageId?: string;
+  message_id?: string;
+  target?: string;
+  sourceDomain?: string;
+  source_domain?: string;
+}
+
+export class DomainObserverClient {
+  constructor(domain: AtelierDomain);
+  query(options?: QueryObserverOptions, requestOptions?: RequestOptions): Promise<Array<Record<string, any>>>;
+  subscribe(requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  unsubscribe(requestOptions?: RequestOptions): Promise<Record<string, any>>;
+}
+
+export interface SupervisorUpdateOptions {
+  domain: string;
+  spec?: Record<string, any>;
+  probeHandler?: string;
+  probe_handler?: string;
+  timeoutMs?: number;
+  timeout_ms?: number;
+}
+
+export class DomainSupervisorClient {
+  constructor(domain: AtelierDomain);
+  start(domain: string, spec?: Record<string, any>, options?: RequestOptions): Promise<Record<string, any>>;
+  stop(domain: string, options?: RequestOptions): Promise<Record<string, any>>;
+  restart(domain: string, options?: RequestOptions): Promise<Record<string, any>>;
+  update(domain: string, spec?: Record<string, any>, options?: Partial<SupervisorUpdateOptions> & RequestOptions): Promise<Record<string, any>>;
+}
+
 export class AtelierDomain {
   readonly context:DomainContext;
   readonly logger: DomainLogger;
   readonly telemetry: DomainTelemetry;
   readonly storage: DomainStorageClient;
   readonly registry: DomainRegistryClient;
+  readonly runtime: DomainRuntimeClient;
+  readonly observer: DomainObserverClient;
+  readonly supervisor: DomainSupervisorClient;
   shutdown(options?:{grace?:number}):Promise<void>;
   requestMany(messageIds:string[],options?:RequestOptions):Promise<TargetResult[]>;
   waitResult(messageId:string,options?:RequestOptions):Promise<Record<string,any>>;
@@ -166,6 +224,14 @@ export class AtelierDomain {
   getHandlerDescriptionAsync(target:string,requestOptions?:RequestOptions):Promise<string|null>;
   queryLogsAsync(options?:QueryLogsOptions,requestOptions?:RequestOptions):Promise<QueryLogsResponse>;
   queryProgressAsync(requestOptions?:RequestOptions):Promise<QueryProgressResponse>;
+  queryRuntimeAsync(options?: QueryRuntimeOptions, requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  queryObserverAsync(options?: QueryObserverOptions, requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  subscribeObserverAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  unsubscribeObserverAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  supervisorStartAsync(options: { domain: string; spec?: Record<string, any> }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  supervisorStopAsync(options: { domain: string }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  supervisorRestartAsync(options: { domain: string }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
+  supervisorUpdateAsync(options: SupervisorUpdateOptions, requestOptions?: RequestOptions): Promise<Record<string, any>>;
   subscribeLogsAsync(options?: { level?: string; sourceDomain?: string; source_domain?: string }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
   unsubscribeLogsAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
   subscribeTelemetryAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
@@ -192,6 +258,7 @@ export class AtelierDomain {
   onLog(callback: (record: Record<string, any>) => any | Promise<any>, options?: { level?: string; sourceDomain?: string; source_domain?: string }): this;
   onTelemetry(callback: (metric: Record<string, any>) => any | Promise<any>): this;
   onNotify(callback: (alert: Record<string, any>) => any | Promise<any>): this;
+  onObservation(callback: (event: Record<string, any>) => any | Promise<any>): this;
   notify(level: string, message: string, title?: string, details?: Record<string, any>): number;
   notifyAsync(level: string, message: string, title?: string, details?: Record<string, any>, options?: RequestOptions): Promise<Record<string, any>>;
   discoverHandlers(options?: QueryHandlersOptions): Promise<QueryHandlersResponse>;
@@ -228,6 +295,9 @@ export const KERNEL_STORAGE_TARGET: "kernel.storage";
 export const KERNEL_LOGGER_TARGET: "kernel.logger";
 export const KERNEL_TELEMETRY_TARGET: "kernel.telemetry";
 export const KERNEL_NOTIFY_TARGET: "kernel.notify";
+export const KERNEL_RUNTIME_TARGET: "kernel.runtime";
+export const KERNEL_OBSERVER_TARGET: "kernel.observer";
+export const KERNEL_SUPERVISOR_TARGET: "kernel.supervisor";
 
 export const MSG_REGISTER_HANDLERS: "RegisterHandlers";
 export const MSG_UNREGISTER_HANDLERS: "UnregisterHandlers";
@@ -240,9 +310,19 @@ export const MSG_SUBSCRIBE_TELEMETRY: "SubscribeTelemetry";
 export const MSG_UNSUBSCRIBE_TELEMETRY: "UnsubscribeTelemetry";
 export const MSG_SUBSCRIBE_NOTIFY: "SubscribeNotify";
 export const MSG_UNSUBSCRIBE_NOTIFY: "UnsubscribeNotify";
+export const MSG_QUERY_RUNTIME: "QueryRuntime";
+export const MSG_QUERY_DOMAIN_ASSEMBLY: "QueryDomainAssembly";
+export const MSG_QUERY_OBSERVER: "QueryObserver";
+export const MSG_SUBSCRIBE_OBSERVER: "SubscribeObserver";
+export const MSG_UNSUBSCRIBE_OBSERVER: "UnsubscribeObserver";
+export const MSG_START_DOMAIN: "StartDomain";
+export const MSG_STOP_DOMAIN: "StopDomain";
+export const MSG_RESTART_DOMAIN: "RestartDomain";
+export const MSG_UPDATE_DOMAIN: "UpdateDomain";
 export const MSG_SYSTEM_LOG_EVENT: "LogEvent";
 export const MSG_SYSTEM_TELEMETRY_EVENT: "TelemetryEvent";
 export const MSG_SYSTEM_NOTIFY_EVENT: "NotifyEvent";
+export const MSG_SYSTEM_OBSERVER_EVENT: "ObservationEvent";
 export const MSG_STORAGE_INSERT: "StorageInsert";
 export const MSG_STORAGE_QUERY: "StorageQuery";
 export const MSG_STORAGE_UPDATE: "StorageUpdate";

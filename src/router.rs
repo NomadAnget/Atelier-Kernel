@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
@@ -13,12 +13,16 @@ use crate::logging::{KernelLogHub, LogRecord};
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DomainStatus, DomainToKernelFrame, HandlerDescriptor, InboundReceipt,
-    KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET,
-    KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_HANDLERS,
-    MSG_QUERY_LOGS, MSG_QUERY_PROGRESS, MSG_REGISTER_HANDLERS, MSG_SUBSCRIBE_LOGS,
-    MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_TELEMETRY, MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT,
+    KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET, KERNEL_REGISTRY_TARGET,
+    KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET, KERNEL_SUPERVISOR_TARGET,
+    KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_DOMAIN_ASSEMBLY,
+    MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
+    MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
+    MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
+    MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
-    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_TELEMETRY, MessageReceipt, OutboundMessage,
+    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_OBSERVER, MSG_UNSUBSCRIBE_TELEMETRY,
+    MSG_UPDATE_DOMAIN, MessageReceipt, ObservationEvent, OutboundMessage,
     now_millis, parse_target_address,
 };
 use crate::storage::DomainStorageEngine;
@@ -84,6 +88,21 @@ impl LogSubscriptionFilter {
     }
 }
 
+#[derive(Clone)]
+pub struct CandidateEntry {
+    pub instance_id: u64,
+    pub pipe_tx: Sender<KernelToDomainFrame>,
+    pub handlers: HashMap<String, String>,
+    pub ready: bool,
+}
+
+#[derive(Clone)]
+pub struct DrainingEntry {
+    pub instance_id: u64,
+    pub pipe_tx: Sender<KernelToDomainFrame>,
+    pub started_at: Instant,
+}
+
 /// Internal registration state of a single managed Domain.
 struct DomainEntry {
     /// Monotonically increasing process/pipe instance generation ID.
@@ -92,6 +111,8 @@ struct DomainEntry {
     pipe_tx: Option<Sender<KernelToDomainFrame>>,
     /// Maps `handler_name -> description`.
     handlers: HashMap<String, String>,
+    candidate: Option<CandidateEntry>,
+    draining: Vec<DrainingEntry>,
 }
 
 /// Core Atelier Kernel Router: manages domain routes, generates message IDs,
@@ -120,10 +141,16 @@ pub struct KernelRouter {
     telemetry_subscribers: Arc<RwLock<HashSet<String>>>,
     /// Active domain subscriptions for kernel notification events.
     notify_subscribers: Arc<RwLock<HashSet<String>>>,
+    /// Active domain subscriptions for kernel observation events.
+    observer_subscribers: Arc<RwLock<HashSet<String>>>,
     /// Shutdown signal for the background log fanout thread.
     stop_log_pump: Arc<AtomicBool>,
     /// Handle to the background log fanout worker thread.
     log_pump_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Handle to the background observer fanout worker thread.
+    observer_pump_handle: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Optional back-reference to domain supervisor for runtime queries and domain control.
+    supervisor: RwLock<Option<Weak<crate::supervisor::DomainSupervisor>>>,
 }
 
 impl KernelRouter {
@@ -137,6 +164,7 @@ impl KernelRouter {
         let log_subscribers = Arc::new(RwLock::new(HashMap::<String, LogSubscriptionFilter>::new()));
         let telemetry_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let notify_subscribers = Arc::new(RwLock::new(HashSet::new()));
+        let observer_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let stop_log_pump = Arc::new(AtomicBool::new(false));
 
         let rx = logger.subscribe();
@@ -196,6 +224,54 @@ impl KernelRouter {
             })
             .ok();
 
+        let obs_rx = observer.subscribe();
+        let obs_subs_worker = Arc::clone(&observer_subscribers);
+        let obs_domains_worker = Arc::clone(&domains);
+        let obs_stop_flag = Arc::clone(&stop_log_pump);
+
+        let observer_pump_handle = thread::Builder::new()
+            .name("kernel-observer-fanout".to_string())
+            .spawn(move || {
+                while !obs_stop_flag.load(Ordering::Relaxed) {
+                    match obs_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(event) => {
+                            let subs = obs_subs_worker.read().clone();
+                            if subs.is_empty() {
+                                continue;
+                            }
+                            let data = match serde_json::to_value(&event) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            for domain_id in subs {
+                                let domains_guard = obs_domains_worker.read();
+                                if let Some(entry) = domains_guard.get(&domain_id) {
+                                    if entry.status != DomainStatus::Faulted && entry.status != DomainStatus::Stopped {
+                                        if let Some(tx) = &entry.pipe_tx {
+                                            let msg = KernelMessage {
+                                                logical_id: event.logical_id.clone(),
+                                                message_id: format!("obs_{}", event.event_id),
+                                                source_domain: "kernel".to_string(),
+                                                target: KERNEL_OBSERVER_TARGET.to_string(),
+                                                targets: vec![KERNEL_OBSERVER_TARGET.to_string()],
+                                                message_type: MSG_SYSTEM_OBSERVER_EVENT.to_string(),
+                                                params: json!({}),
+                                                timestamp: event.timestamp,
+                                                data: data.clone(),
+                                            };
+                                            let _ = tx.send(KernelToDomainFrame::Deliver(msg));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .ok();
+
         Self {
             receipt_publication: Mutex::new(()),
             next_instance_id: AtomicU64::new(1),
@@ -210,9 +286,24 @@ impl KernelRouter {
             log_subscribers,
             telemetry_subscribers,
             notify_subscribers,
+            observer_subscribers,
             stop_log_pump,
             log_pump_handle: Mutex::new(pump_handle),
+            observer_pump_handle: Mutex::new(observer_pump_handle),
+            supervisor: RwLock::new(None),
         }
+    }
+
+    pub fn set_supervisor(&self, supervisor: Weak<crate::supervisor::DomainSupervisor>) {
+        *self.supervisor.write() = Some(supervisor);
+    }
+
+    pub fn supervisor(&self) -> Option<Arc<crate::supervisor::DomainSupervisor>> {
+        self.supervisor.read().as_ref().and_then(|w| w.upgrade())
+    }
+
+    pub fn observer_subscribers_count(&self) -> usize {
+        self.observer_subscribers.read().len()
     }
 
     pub fn log_subscribers_count(&self) -> usize {
@@ -293,12 +384,16 @@ impl KernelRouter {
                 status: DomainStatus::Spawning,
                 pipe_tx: None,
                 handlers: HashMap::new(),
+                candidate: None,
+                draining: Vec::new(),
             });
         // Clean up any leftover routes from a prior generation before binding the new instance.
         for h in entry.handlers.keys() {
             routes.remove(&format!("{domain_id}.{h}"));
         }
         entry.handlers.clear();
+        entry.candidate = None;
+        entry.draining.clear();
         entry.instance_id = instance_id;
         entry.status = DomainStatus::Spawning;
         entry.pipe_tx = Some(pipe_tx);
@@ -306,8 +401,126 @@ impl KernelRouter {
         self.log_subscribers.write().remove(domain_id);
         self.telemetry_subscribers.write().remove(domain_id);
         self.notify_subscribers.write().remove(domain_id);
+        self.observer_subscribers.write().remove(domain_id);
 
         instance_id
+    }
+
+    /// Attaches a candidate pipe for a zero-downtime rolling update.
+    pub fn attach_candidate_pipe(&self, domain_id: &str, pipe_tx: Sender<KernelToDomainFrame>) -> u64 {
+        let gate = self.domain_gate(domain_id);
+        let _domain_guard = gate.lock();
+
+        let candidate_instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
+        self.ledger.clear_session_dedup_for_domain(domain_id);
+        let mut domains = self.domains.write();
+        let entry = domains
+            .entry(domain_id.to_string())
+            .or_insert_with(|| DomainEntry {
+                instance_id: 0,
+                status: DomainStatus::Spawning,
+                pipe_tx: None,
+                handlers: HashMap::new(),
+                candidate: None,
+                draining: Vec::new(),
+            });
+        entry.candidate = Some(CandidateEntry {
+            instance_id: candidate_instance_id,
+            pipe_tx,
+            handlers: HashMap::new(),
+            ready: false,
+        });
+        candidate_instance_id
+    }
+
+    /// Checks if a candidate instance has registered its handlers and is ready.
+    pub fn is_candidate_ready(&self, domain_id: &str, candidate_instance_id: u64) -> bool {
+        let domains = self.domains.read();
+        domains
+            .get(domain_id)
+            .and_then(|e| e.candidate.as_ref())
+            .map(|c| c.instance_id == candidate_instance_id && c.ready)
+            .unwrap_or(false)
+    }
+
+    /// Atomically commits candidate instance, moving old instance into draining, and updating routes.
+    pub fn commit_candidate(&self, domain_id: &str, candidate_instance_id: u64) -> bool {
+        let gate = self.domain_gate(domain_id);
+        let _domain_guard = gate.lock();
+
+        let mut domains = self.domains.write();
+        let mut routes = self.routes.write();
+        if let Some(entry) = domains.get_mut(domain_id) {
+            if let Some(candidate) = entry.candidate.take() {
+                if candidate.instance_id == candidate_instance_id {
+                    if let Some(old_pipe) = entry.pipe_tx.take() {
+                        if entry.instance_id > 0 {
+                            entry.draining.push(DrainingEntry {
+                                instance_id: entry.instance_id,
+                                pipe_tx: old_pipe,
+                                started_at: Instant::now(),
+                            });
+                        }
+                    }
+                    for h in entry.handlers.keys() {
+                        routes.remove(&format!("{domain_id}.{h}"));
+                    }
+                    entry.instance_id = candidate.instance_id;
+                    entry.pipe_tx = Some(candidate.pipe_tx);
+                    entry.handlers = candidate.handlers;
+                    entry.status = DomainStatus::Active;
+                    for h in entry.handlers.keys() {
+                        routes.insert(format!("{domain_id}.{h}"), domain_id.to_string());
+                    }
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Aborts a candidate instance without altering the active routes.
+    pub fn abort_candidate(&self, domain_id: &str, candidate_instance_id: u64) -> bool {
+        let gate = self.domain_gate(domain_id);
+        let _domain_guard = gate.lock();
+
+        let mut domains = self.domains.write();
+        if let Some(entry) = domains.get_mut(domain_id) {
+            if let Some(candidate) = &entry.candidate {
+                if candidate.instance_id == candidate_instance_id {
+                    entry.candidate = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Removes an old instance from draining once all in-flight messages have been reaped.
+    pub fn cleanup_draining_instance(&self, domain_id: &str, instance_id: u64) {
+        let mut domains = self.domains.write();
+        if let Some(entry) = domains.get_mut(domain_id) {
+            entry.draining.retain(|d| d.instance_id != instance_id);
+        }
+    }
+
+    /// Validates whether an instance_id belongs to the active, candidate, or draining generation.
+    pub fn is_valid_instance_for_domain(&self, domain_id: &str, instance_id: u64) -> bool {
+        let domains = self.domains.read();
+        if let Some(entry) = domains.get(domain_id) {
+            if entry.instance_id == instance_id {
+                return true;
+            }
+            if let Some(c) = &entry.candidate {
+                if c.instance_id == instance_id {
+                    return true;
+                }
+            }
+            if entry.draining.iter().any(|d| d.instance_id == instance_id) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Returns the current active generation `instance_id` for `domain_id`, if attached.
@@ -414,7 +627,7 @@ impl KernelRouter {
     ) {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
-        if self.domain_instance_id(authenticated_domain) != Some(instance_id) {
+        if !self.is_valid_instance_for_domain(authenticated_domain, instance_id) {
             return;
         }
         self.handle_raw_pipe_line_inner(authenticated_domain, raw_line);
@@ -481,7 +694,7 @@ impl KernelRouter {
     ) -> Option<Vec<String>> {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
-        if self.domain_instance_id(authenticated_domain) != Some(instance_id) {
+        if !self.is_valid_instance_for_domain(authenticated_domain, instance_id) {
             return None;
         }
         self.handle_frame_inner(authenticated_domain, frame)
@@ -609,6 +822,12 @@ impl KernelRouter {
                 self.dispatch_kernel_storage(authenticated_domain, outbound.seq, &kernel_msg);
             } else if target == KERNEL_LOGGER_TARGET {
                 self.dispatch_kernel_logger(authenticated_domain, outbound.seq, &kernel_msg);
+            } else if target == KERNEL_RUNTIME_TARGET {
+                self.dispatch_kernel_runtime(authenticated_domain, outbound.seq, &kernel_msg);
+            } else if target == KERNEL_OBSERVER_TARGET {
+                self.dispatch_kernel_observer(authenticated_domain, outbound.seq, &kernel_msg);
+            } else if target == KERNEL_SUPERVISOR_TARGET {
+                self.dispatch_kernel_supervisor(authenticated_domain, outbound.seq, &kernel_msg);
             } else if target == KERNEL_TELEMETRY_TARGET
                 || target == "web_ui.metric_tick"
                 || (target.starts_with("web_ui")
@@ -703,6 +922,57 @@ impl KernelRouter {
 
                 let mut registered_routes = Vec::new();
                 let mut registered_handlers = Vec::new();
+                let mut candidate_pipe_opt = None;
+                {
+                    let mut domains = self.domains.write();
+                    if let Some(entry) = domains.get_mut(source_domain) {
+                        if let Some(cand) = &mut entry.candidate {
+                            cand.handlers.clear();
+                            for (h, desc) in &handlers {
+                                let full_route = format!("{source_domain}.{h}");
+                                cand.handlers.insert(h.clone(), desc.clone());
+                                registered_routes.push(full_route.clone());
+                                registered_handlers.push(json!({
+                                    "target": full_route,
+                                    "domain": source_domain,
+                                    "handler": h,
+                                    "description": desc,
+                                }));
+                            }
+                            cand.ready = true;
+                            candidate_pipe_opt = Some(cand.pipe_tx.clone());
+                        }
+                    }
+                }
+
+                if let Some(cand_pipe) = candidate_pipe_opt {
+                    if let ReceiptTransition::Advanced { receipt, .. } = self.ledger.advance_status(
+                        "kernel",
+                        &msg.message_id,
+                        &msg.target,
+                        ContractStatus::Completed,
+                        Some(json!({
+                            "domain": source_domain,
+                            "status": "candidate_ready",
+                            "registered_routes": registered_routes,
+                            "handlers": registered_handlers,
+                        })),
+                    ) {
+                        self.observer.emit(
+                            source_domain,
+                            &msg.target,
+                            &msg.message_id,
+                            &self.ledger.logical_id_for_message(&msg.message_id),
+                            receipt.seq,
+                            &msg.message_type,
+                            ContractStatus::Completed,
+                            receipt.data.clone(),
+                        );
+                        let _ = cand_pipe.send(KernelToDomainFrame::Receipt(receipt));
+                    }
+                    return;
+                }
+
                 {
                     let mut domains = self.domains.write();
                     let mut routes = self.routes.write();
@@ -714,6 +984,8 @@ impl KernelRouter {
                                 status: DomainStatus::Active,
                                 pipe_tx: None,
                                 handlers: HashMap::new(),
+                                candidate: None,
+                                draining: Vec::new(),
                             });
                     entry.status = DomainStatus::Active;
 
@@ -1131,6 +1403,389 @@ impl KernelRouter {
         }
     }
 
+    /// Dispatches a domain assembly query message targeting `kernel.runtime`.
+    fn dispatch_kernel_runtime(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+        self.emit_kernel_internal_stages(source_domain, seq, msg);
+
+        match msg.message_type.as_str() {
+            MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY | _ => {}
+        }
+
+        let target_domain = msg
+            .params
+            .get("domain")
+            .or_else(|| msg.params.get("domain_id"))
+            .or_else(|| msg.data.get("domain"))
+            .or_else(|| msg.data.get("domain_id"))
+            .and_then(Value::as_str);
+
+        let domains_guard = self.domains.read();
+        let supervisor_opt = self.supervisor();
+
+        let mut domain_list = Vec::new();
+        for (d_id, entry) in domains_guard.iter() {
+            if let Some(filter) = target_domain {
+                if d_id != filter {
+                    continue;
+                }
+            }
+            let mut routes: Vec<String> = entry.handlers.keys().map(|h| format!("{d_id}.{h}")).collect();
+            routes.sort();
+
+            let process_info = if let Some(sup) = &supervisor_opt {
+                if let Some(spec) = sup.get_spec(d_id) {
+                    json!({
+                        "pid": sup.get_pid(d_id),
+                        "command": spec.command,
+                        "args": spec.args,
+                        "working_dir": spec.working_dir,
+                        "auto_restart": spec.auto_restart,
+                        "max_restarts": spec.max_restarts,
+                        "restart_delay_ms": spec.restart_delay_ms,
+                        "restart_count": sup.restart_count(d_id),
+                        "is_stopped": sup.is_stopped(d_id),
+                    })
+                } else {
+                    json!({
+                        "pid": sup.get_pid(d_id),
+                        "in_process": true,
+                    })
+                }
+            } else {
+                Value::Null
+            };
+
+            domain_list.push(json!({
+                "domain_id": d_id,
+                "status": format!("{:?}", entry.status),
+                "instance_id": entry.instance_id,
+                "routes": routes,
+                "handlers": entry.handlers,
+                "process": process_info,
+            }));
+        }
+        domain_list.sort_by(|a, b| a["domain_id"].as_str().cmp(&b["domain_id"].as_str()));
+
+        let single_domain = if domain_list.len() == 1 && target_domain.is_some() {
+            Some(domain_list[0].clone())
+        } else {
+            None
+        };
+
+        let response_data = json!({
+            "count": domain_list.len(),
+            "domains": domain_list,
+            "domain": single_domain,
+        });
+
+        self.complete_kernel_internal_target(
+            source_domain,
+            msg,
+            ContractStatus::Completed,
+            Some(response_data),
+        );
+    }
+
+    /// Dispatches a message lifecycle observation message targeting `kernel.observer`.
+    fn dispatch_kernel_observer(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+        self.emit_kernel_internal_stages(source_domain, seq, msg);
+
+        match msg.message_type.as_str() {
+            MSG_SUBSCRIBE_OBSERVER => {
+                self.observer_subscribers.write().insert(source_domain.to_string());
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "subscribed",
+                        "target": KERNEL_OBSERVER_TARGET,
+                    })),
+                );
+            }
+            MSG_UNSUBSCRIBE_OBSERVER => {
+                self.observer_subscribers.write().remove(source_domain);
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "status": "unsubscribed",
+                        "target": KERNEL_OBSERVER_TARGET,
+                    })),
+                );
+            }
+            MSG_QUERY_OBSERVER | _ => {
+                let msg_id_filter = msg.params.get("message_id").and_then(Value::as_str);
+                let target_filter = msg.params.get("target").and_then(Value::as_str);
+                let source_filter = msg.params.get("source_domain").and_then(Value::as_str);
+                let limit = msg.params.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+
+                let all_events = self.observer.snapshot();
+                let mut filtered: Vec<ObservationEvent> = all_events.into_iter().filter(|e| {
+                    if let Some(mid) = msg_id_filter {
+                        if e.message_id != mid {
+                            return false;
+                        }
+                    }
+                    if let Some(tf) = target_filter {
+                        if e.target != tf {
+                            return false;
+                        }
+                    }
+                    if let Some(sf) = source_filter {
+                        if e.source_domain != sf {
+                            return false;
+                        }
+                    }
+                    true
+                }).collect();
+
+                if filtered.len() > limit {
+                    filtered = filtered.split_off(filtered.len() - limit);
+                }
+
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "count": filtered.len(),
+                        "events": filtered,
+                    })),
+                );
+            }
+        }
+    }
+
+    /// Dispatches a process lifecycle management message targeting `kernel.supervisor`.
+    fn dispatch_kernel_supervisor(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+        self.emit_kernel_internal_stages(source_domain, seq, msg);
+
+        let sup = match self.supervisor() {
+            Some(s) => s,
+            None => {
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::ExecutionFailed,
+                    Some(json!({
+                        "error": "supervisor_unavailable",
+                        "reason": "Kernel supervisor component is not attached",
+                    })),
+                );
+                return;
+            }
+        };
+
+        let target_domain = msg
+            .params
+            .get("domain")
+            .or_else(|| msg.params.get("domain_id"))
+            .or_else(|| msg.data.get("domain"))
+            .or_else(|| msg.data.get("domain_id"))
+            .and_then(Value::as_str);
+
+        match msg.message_type.as_str() {
+            MSG_START_DOMAIN => {
+                let domain_id = match target_domain {
+                    Some(d) => d,
+                    None => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({ "error": "missing_domain", "reason": "domain parameter required" })),
+                        );
+                        return;
+                    }
+                };
+
+                let spec_val = msg.params.get("spec").or_else(|| msg.data.get("spec"));
+                let res = if let Some(sv) = spec_val {
+                    match serde_json::from_value::<crate::supervisor::DomainProcessSpec>(sv.clone()) {
+                        Ok(mut spec) => {
+                            spec.domain_id = domain_id.to_string();
+                            sup.spawn_process_domain(spec)
+                        }
+                        Err(e) => {
+                            self.complete_kernel_internal_target(
+                                source_domain,
+                                msg,
+                                ContractStatus::ExecutionFailed,
+                                Some(json!({ "error": "invalid_spec", "reason": e.to_string() })),
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    sup.respawn_domain(domain_id)
+                };
+
+                match res {
+                    Ok(pid) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::Completed,
+                            Some(json!({ "domain_id": domain_id, "pid": pid, "status": "started" })),
+                        );
+                    }
+                    Err(e) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({ "error": "spawn_failed", "reason": e.to_string() })),
+                        );
+                    }
+                }
+            }
+            MSG_STOP_DOMAIN => {
+                let domain_id = match target_domain {
+                    Some(d) => d,
+                    None => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({ "error": "missing_domain", "reason": "domain parameter required" })),
+                        );
+                        return;
+                    }
+                };
+                let stopped = sup.stop_process_domain(domain_id);
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({ "domain_id": domain_id, "status": "stopped", "was_running": stopped })),
+                );
+            }
+            MSG_RESTART_DOMAIN => {
+                let domain_id = match target_domain {
+                    Some(d) => d,
+                    None => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({ "error": "missing_domain", "reason": "domain parameter required" })),
+                        );
+                        return;
+                    }
+                };
+                match sup.respawn_domain(domain_id) {
+                    Ok(pid) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::Completed,
+                            Some(json!({ "domain_id": domain_id, "pid": pid, "status": "restarted" })),
+                        );
+                    }
+                    Err(e) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({ "error": "restart_failed", "reason": e.to_string() })),
+                        );
+                    }
+                }
+            }
+            MSG_UPDATE_DOMAIN => {
+                let domain_id = match target_domain {
+                    Some(d) => d,
+                    None => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({ "error": "missing_domain", "reason": "domain parameter required" })),
+                        );
+                        return;
+                    }
+                };
+
+                let spec_val = msg.params.get("spec").or_else(|| msg.data.get("spec"));
+                let new_spec = if let Some(sv) = spec_val {
+                    match serde_json::from_value::<crate::supervisor::DomainProcessSpec>(sv.clone()) {
+                        Ok(mut spec) => {
+                            spec.domain_id = domain_id.to_string();
+                            Some(spec)
+                        }
+                        Err(e) => {
+                            self.complete_kernel_internal_target(
+                                source_domain,
+                                msg,
+                                ContractStatus::ExecutionFailed,
+                                Some(json!({ "error": "invalid_spec", "reason": e.to_string() })),
+                            );
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let timeout_ms = msg.params.get("timeout_ms")
+                    .or_else(|| msg.data.get("timeout_ms"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(5000);
+                let probe_handler = msg.params.get("probe_handler")
+                    .or_else(|| msg.data.get("probe_handler"))
+                    .and_then(Value::as_str);
+
+                match sup.update_process_domain(
+                    domain_id,
+                    new_spec,
+                    probe_handler,
+                    Duration::from_millis(timeout_ms),
+                ) {
+                    Ok(update_res) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::Completed,
+                            Some(json!({
+                                "domain_id": update_res.domain_id,
+                                "new_pid": update_res.new_pid,
+                                "old_pid": update_res.old_pid,
+                                "instance_id": update_res.instance_id,
+                                "status": update_res.status,
+                            })),
+                        );
+                    }
+                    Err(e) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({
+                                "domain_id": domain_id,
+                                "status": "rolled_back",
+                                "error": "update_failed",
+                                "reason": e.to_string(),
+                            })),
+                        );
+                    }
+                }
+            }
+            _ => {
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::ContractInvalid,
+                    Some(json!({
+                        "error": "unknown_message_type",
+                        "reason": format!("kernel.supervisor does not support {}", msg.message_type),
+                    })),
+                );
+            }
+        }
+    }
+
     /// Emits `Sent -> Received -> Started` receipts for kernel built-in targets (`kernel.registry`, `kernel.storage`, `kernel.logger`, etc.).
     fn emit_kernel_internal_stages(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         let (sent_rec, created) = self.ledger.record_initial_target_state(
@@ -1390,6 +2045,7 @@ impl KernelRouter {
         self.log_subscribers.write().remove(domain_id);
         self.telemetry_subscribers.write().remove(domain_id);
         self.notify_subscribers.write().remove(domain_id);
+        self.observer_subscribers.write().remove(domain_id);
 
         let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
         for (source_domain, receipt) in failed_deliveries {
@@ -1424,6 +2080,9 @@ impl Drop for KernelRouter {
     fn drop(&mut self) {
         self.stop_log_pump.store(true, Ordering::SeqCst);
         if let Some(handle) = self.log_pump_handle.lock().take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.observer_pump_handle.lock().take() {
             let _ = handle.join();
         }
     }

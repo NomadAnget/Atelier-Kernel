@@ -25,6 +25,9 @@ KERNEL_STORAGE_TARGET = "kernel.storage"
 KERNEL_LOGGER_TARGET = "kernel.logger"
 KERNEL_TELEMETRY_TARGET = "kernel.telemetry"
 KERNEL_NOTIFY_TARGET = "kernel.notify"
+KERNEL_RUNTIME_TARGET = "kernel.runtime"
+KERNEL_OBSERVER_TARGET = "kernel.observer"
+KERNEL_SUPERVISOR_TARGET = "kernel.supervisor"
 
 MSG_REGISTER_HANDLERS = "RegisterHandlers"
 MSG_UNREGISTER_HANDLERS = "UnregisterHandlers"
@@ -37,9 +40,19 @@ MSG_SUBSCRIBE_TELEMETRY = "SubscribeTelemetry"
 MSG_UNSUBSCRIBE_TELEMETRY = "UnsubscribeTelemetry"
 MSG_SUBSCRIBE_NOTIFY = "SubscribeNotify"
 MSG_UNSUBSCRIBE_NOTIFY = "UnsubscribeNotify"
+MSG_QUERY_RUNTIME = "QueryRuntime"
+MSG_QUERY_DOMAIN_ASSEMBLY = "QueryDomainAssembly"
+MSG_QUERY_OBSERVER = "QueryObserver"
+MSG_SUBSCRIBE_OBSERVER = "SubscribeObserver"
+MSG_UNSUBSCRIBE_OBSERVER = "UnsubscribeObserver"
+MSG_START_DOMAIN = "StartDomain"
+MSG_STOP_DOMAIN = "StopDomain"
+MSG_RESTART_DOMAIN = "RestartDomain"
+MSG_UPDATE_DOMAIN = "UpdateDomain"
 MSG_SYSTEM_LOG_EVENT = "LogEvent"
 MSG_SYSTEM_TELEMETRY_EVENT = "TelemetryEvent"
 MSG_SYSTEM_NOTIFY_EVENT = "NotifyEvent"
+MSG_SYSTEM_OBSERVER_EVENT = "ObservationEvent"
 MSG_STORAGE_INSERT = "StorageInsert"
 MSG_STORAGE_QUERY = "StorageQuery"
 MSG_STORAGE_UPDATE = "StorageUpdate"
@@ -53,36 +66,52 @@ __all__ = [
     "DeliveryMessage",
     "DomainExecutionFailed",
     "DomainLogger",
+    "DomainObserverClient",
     "DomainRegistryClient",
     "DomainRequestError",
+    "DomainRuntimeClient",
     "DomainStorageClient",
+    "DomainSupervisorClient",
     "DomainTelemetry",
     "KERNEL_LOGGER_TARGET",
     "KERNEL_NOTIFY_TARGET",
+    "KERNEL_OBSERVER_TARGET",
     "KERNEL_REGISTRY_TARGET",
+    "KERNEL_RUNTIME_TARGET",
     "KERNEL_STORAGE_TARGET",
+    "KERNEL_SUPERVISOR_TARGET",
     "KERNEL_TELEMETRY_TARGET",
     "MSG_DELIVERY_DURABLE",
     "MSG_DELIVERY_EPHEMERAL",
     "MSG_DELIVERY_VOLATILE",
+    "MSG_QUERY_DOMAIN_ASSEMBLY",
     "MSG_QUERY_HANDLERS",
     "MSG_QUERY_LOGS",
+    "MSG_QUERY_OBSERVER",
     "MSG_QUERY_PROGRESS",
+    "MSG_QUERY_RUNTIME",
     "MSG_REGISTER_HANDLERS",
+    "MSG_RESTART_DOMAIN",
+    "MSG_START_DOMAIN",
+    "MSG_STOP_DOMAIN",
     "MSG_STORAGE_DELETE",
     "MSG_STORAGE_INSERT",
     "MSG_STORAGE_QUERY",
     "MSG_STORAGE_UPDATE",
     "MSG_SUBSCRIBE_LOGS",
     "MSG_SUBSCRIBE_NOTIFY",
+    "MSG_SUBSCRIBE_OBSERVER",
     "MSG_SUBSCRIBE_TELEMETRY",
     "MSG_SYSTEM_LOG_EVENT",
     "MSG_SYSTEM_NOTIFY_EVENT",
+    "MSG_SYSTEM_OBSERVER_EVENT",
     "MSG_SYSTEM_TELEMETRY_EVENT",
     "MSG_UNREGISTER_HANDLERS",
     "MSG_UNSUBSCRIBE_LOGS",
     "MSG_UNSUBSCRIBE_NOTIFY",
+    "MSG_UNSUBSCRIBE_OBSERVER",
     "MSG_UNSUBSCRIBE_TELEMETRY",
+    "MSG_UPDATE_DOMAIN",
     "__version__",
 ]
 
@@ -326,6 +355,86 @@ class DomainRegistryClient:
         return await self._domain.get_handler_description_async(target, timeout=timeout)
 
 
+class DomainRuntimeClient:
+    """Native runtime infrastructure facility for querying domain assembly."""
+
+    def __init__(self, domain: "AtelierDomain"):
+        self._domain = domain
+
+    async def query(self, domain: Optional[str] = None, timeout: float = 30) -> Dict[str, Any]:
+        return await self._domain.query_runtime_async(domain=domain, timeout=timeout)
+
+    async def list_domains(self, timeout: float = 30) -> List[Dict[str, Any]]:
+        res = await self.query(timeout=timeout)
+        return res.get("domains") or []
+
+    async def get_domain(self, domain_id: str, timeout: float = 30) -> Optional[Dict[str, Any]]:
+        res = await self.query(domain=domain_id, timeout=timeout)
+        return res.get("domain")
+
+
+class DomainObserverClient:
+    """Native observer infrastructure facility for querying snapshots and managing subscriptions."""
+
+    def __init__(self, domain: "AtelierDomain"):
+        self._domain = domain
+
+    async def query(
+        self,
+        limit: int = 100,
+        message_id: Optional[str] = None,
+        target: Optional[str] = None,
+        source_domain: Optional[str] = None,
+        timeout: float = 30,
+    ) -> List[Dict[str, Any]]:
+        res = await self._domain.query_observer_async(
+            limit=limit,
+            message_id=message_id,
+            target=target,
+            source_domain=source_domain,
+            timeout=timeout,
+        )
+        return res.get("events") or []
+
+    async def subscribe(self, timeout: float = 30) -> Dict[str, Any]:
+        return await self._domain.subscribe_observer_async(timeout=timeout)
+
+    async def unsubscribe(self, timeout: float = 30) -> Dict[str, Any]:
+        return await self._domain.unsubscribe_observer_async(timeout=timeout)
+
+
+class DomainSupervisorClient:
+    """Native supervisor infrastructure facility for process lifecycle and smooth rolling updates."""
+
+    def __init__(self, domain: "AtelierDomain"):
+        self._domain = domain
+
+    async def start(self, domain: str, spec: Optional[Dict[str, Any]] = None, timeout: float = 30) -> Dict[str, Any]:
+        return await self._domain.supervisor_start_async(domain=domain, spec=spec, timeout=timeout)
+
+    async def stop(self, domain: str, timeout: float = 30) -> Dict[str, Any]:
+        return await self._domain.supervisor_stop_async(domain=domain, timeout=timeout)
+
+    async def restart(self, domain: str, timeout: float = 30) -> Dict[str, Any]:
+        return await self._domain.supervisor_restart_async(domain=domain, timeout=timeout)
+
+    async def update(
+        self,
+        domain: str,
+        spec: Optional[Dict[str, Any]] = None,
+        probe_handler: Optional[str] = None,
+        timeout_ms: int = 5000,
+        timeout: float = 30,
+    ) -> Dict[str, Any]:
+        return await self._domain.supervisor_update_async(
+            domain=domain,
+            spec=spec,
+            probe_handler=probe_handler,
+            timeout_ms=timeout_ms,
+            timeout=timeout,
+        )
+
+
 class AtelierDomain(AsyncRuntime):
     """High-level Python Domain SDK for Atelier Kernel."""
 
@@ -344,6 +453,7 @@ class AtelierDomain(AsyncRuntime):
         self._log_listeners: List[Any] = []
         self._telemetry_listeners: List[Any] = []
         self._notify_listeners: List[Any] = []
+        self._observation_listeners: List[Any] = []
         self._pending = {}
         self._closed = False
         self._async_loop = None
@@ -358,6 +468,9 @@ class AtelierDomain(AsyncRuntime):
         self.telemetry = DomainTelemetry(self)
         self.storage = DomainStorageClient(self)
         self.registry = DomainRegistryClient(self)
+        self.runtime = DomainRuntimeClient(self)
+        self.observer = DomainObserverClient(self)
+        self.supervisor = DomainSupervisorClient(self)
 
     def handler(self, name: str):
         """Registers a handler for `<domain>.<name>`. Automatically extracts docstring or leading `#` comments as handler description."""
@@ -410,6 +523,17 @@ class AtelierDomain(AsyncRuntime):
             self._notify_listeners.append(fn)
             if getattr(self, "_state", None) == "open":
                 self._submit([KERNEL_NOTIFY_TARGET], MSG_SUBSCRIBE_NOTIFY, params={}, data={})
+            return fn
+        if func is not None:
+            return decorator(func)
+        return decorator
+
+    def on_observation(self, func: Optional[Callable] = None):
+        """Registers a callback or decorator to listen to the real-time global message observation stream."""
+        def decorator(fn):
+            self._observation_listeners.append(fn)
+            if getattr(self, "_state", None) == "open":
+                self._submit([KERNEL_OBSERVER_TARGET], MSG_SUBSCRIBE_OBSERVER, params={}, data={})
             return fn
         if func is not None:
             return decorator(func)

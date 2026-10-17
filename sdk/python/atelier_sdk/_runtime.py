@@ -166,6 +166,44 @@ class AsyncRuntime(MessageClient):
     async def unsubscribe_notify_async(self, timeout=30):
         return (await self.request('kernel.notify', 'UnsubscribeNotify', {}, {}, timeout))['data']
 
+    async def query_runtime_async(self, domain=None, timeout=30):
+        params = {}
+        if domain is not None:
+            params['domain'] = domain
+        return (await self.request('kernel.runtime', 'QueryRuntime', params, {}, timeout))['data']
+
+    async def query_observer_async(self, limit=100, message_id=None, target=None, source_domain=None, timeout=30):
+        params = {'limit': limit}
+        if message_id is not None: params['message_id'] = message_id
+        if target is not None: params['target'] = target
+        if source_domain is not None: params['source_domain'] = source_domain
+        return (await self.request('kernel.observer', 'QueryObserver', params, {}, timeout))['data']
+
+    async def subscribe_observer_async(self, timeout=30):
+        return (await self.request('kernel.observer', 'SubscribeObserver', {}, {}, timeout))['data']
+
+    async def unsubscribe_observer_async(self, timeout=30):
+        return (await self.request('kernel.observer', 'UnsubscribeObserver', {}, {}, timeout))['data']
+
+    async def supervisor_start_async(self, domain, spec=None, timeout=30):
+        params = {'domain': domain}
+        if spec is not None: params['spec'] = spec
+        return (await self.request('kernel.supervisor', 'StartDomain', params, {}, timeout))['data']
+
+    async def supervisor_stop_async(self, domain, timeout=30):
+        params = {'domain': domain}
+        return (await self.request('kernel.supervisor', 'StopDomain', params, {}, timeout))['data']
+
+    async def supervisor_restart_async(self, domain, timeout=30):
+        params = {'domain': domain}
+        return (await self.request('kernel.supervisor', 'RestartDomain', params, {}, timeout))['data']
+
+    async def supervisor_update_async(self, domain, spec=None, probe_handler=None, timeout_ms=5000, timeout=30):
+        params = {'domain': domain, 'timeout_ms': timeout_ms}
+        if spec is not None: params['spec'] = spec
+        if probe_handler is not None: params['probe_handler'] = probe_handler
+        return (await self.request('kernel.supervisor', 'UpdateDomain', params, {}, timeout))['data']
+
     def _write_line(self,line):
         if self._state=='closed':raise DomainRequestError('connection_closed')
         encoded=line.encode('utf-8')
@@ -272,6 +310,9 @@ class AsyncRuntime(MessageClient):
         if target == 'kernel.notify' or msg_type in ('NotifyEvent',):
             self._dispatch_system_notify(frame)
             return
+        if target == 'kernel.observer' or msg_type in ('ObservationEvent',):
+            self._dispatch_system_observer(frame)
+            return
 
         self.report_receipt(frame['message_id'],frame['target'],'received')
         self._dispatch(frame)
@@ -294,6 +335,11 @@ class AsyncRuntime(MessageClient):
         alert = frame.get('data') or {}
         for listener in getattr(self, '_notify_listeners', []):
             self._invoke_event_listener(listener, alert)
+
+    def _dispatch_system_observer(self, frame):
+        event = frame.get('data') or {}
+        for listener in getattr(self, '_observation_listeners', []):
+            self._invoke_event_listener(listener, event)
 
     def _invoke_event_listener(self, listener, payload):
         try:
@@ -357,6 +403,8 @@ class AsyncRuntime(MessageClient):
             self._submit(['kernel.telemetry'], 'SubscribeTelemetry', params={}, data={})
         if getattr(self, '_notify_listeners', None):
             self._submit(['kernel.notify'], 'SubscribeNotify', params={}, data={})
+        if getattr(self, '_observation_listeners', None):
+            self._submit(['kernel.observer'], 'SubscribeObserver', params={}, data={})
         self._startup=asyncio.create_task(start())
         threading.Thread(target=reader,name='atelier-sdk-ipc-rx',daemon=True).start()
         try:

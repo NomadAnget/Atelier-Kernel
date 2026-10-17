@@ -19,11 +19,12 @@ pub use logging::{KernelLogHub, LogFramePayload, LogRecord, LogStore};
 pub use observer::KernelObserver;
 pub use web_frontend::WebFrontendDomain;
 pub use protocol::{
-    ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, InboundReceipt,
-    KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame,
-    MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_REGISTER_HANDLERS,
-    MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
-    MSG_UNREGISTER_HANDLERS, MessageReceipt, ObservationEvent, OutboundMessage,
+    ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
+    InboundReceipt, KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET, KernelMessage,
+    KernelToDomainFrame, MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE,
+    MSG_QUERY_HANDLERS, MSG_REGISTER_HANDLERS, MSG_STORAGE_DELETE, MSG_STORAGE_INSERT,
+    MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE, MSG_UNREGISTER_HANDLERS, MessageReceipt,
+    ObservationEvent, OutboundMessage,
 };
 pub use router::KernelRouter;
 pub use storage::{DomainStorageEngine, StorageError, StoredRecord};

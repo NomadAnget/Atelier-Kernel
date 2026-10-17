@@ -22,6 +22,7 @@ __version__ = "0.1.4"
 
 MSG_REGISTER_HANDLERS = "RegisterHandlers"
 MSG_UNREGISTER_HANDLERS = "UnregisterHandlers"
+MSG_QUERY_HANDLERS = "QueryHandlers"
 MSG_STORAGE_INSERT = "StorageInsert"
 MSG_STORAGE_QUERY = "StorageQuery"
 MSG_STORAGE_UPDATE = "StorageUpdate"
@@ -39,6 +40,7 @@ __all__ = [
     "MSG_DELIVERY_DURABLE",
     "MSG_DELIVERY_EPHEMERAL",
     "MSG_DELIVERY_VOLATILE",
+    "MSG_QUERY_HANDLERS",
     "MSG_REGISTER_HANDLERS",
     "MSG_STORAGE_DELETE",
     "MSG_STORAGE_INSERT",
@@ -239,6 +241,7 @@ class AtelierDomain(AsyncRuntime):
         self._seq_counter = 1
         self._write_lock = threading.Lock()
         self._handlers: Dict[str, Callable[..., Any]] = {}
+        self._handler_docs: Dict[str, str] = {}
         self._receipt_callbacks: List[Callable[[Dict[str, Any]], None]] = []
         self._pending = {}
         self._closed = False
@@ -253,14 +256,40 @@ class AtelierDomain(AsyncRuntime):
         )
 
     def handler(self, name: str):
+        """Registers a handler for `<domain>.<name>`. Automatically extracts docstring or leading `#` comments as handler description."""
         def decorator(func):
-            return self._register_handler(name,func)
+            return self._register_handler(name, func)
         return decorator
+
+    def on(self, name: str):
+        """Alias for `@domain.handler(name)`."""
+        return self.handler(name)
 
     def on_receipt(self, func: Callable[[Dict[str, Any]], None]):
         """Optional decorator to observe receipts returned by the Kernel for outbound messages."""
         self._receipt_callbacks.append(func)
         return func
+
+    async def query_handlers(
+        self,
+        domain: Optional[str] = None,
+        target: Optional[str] = None,
+        handler: Optional[str] = None,
+    ):
+        """Queries available handlers and their descriptions from `kernel.registry` (`QueryHandlers`)."""
+        params: Dict[str, Any] = {}
+        if domain is not None:
+            params["domain"] = domain
+        if target is not None:
+            params["target"] = target
+        if handler is not None:
+            params["handler"] = handler
+        return await self.send(
+            targets="kernel.registry",
+            message_type=MSG_QUERY_HANDLERS,
+            params=params,
+            data={},
+        )
 
     def _submit(
         self,

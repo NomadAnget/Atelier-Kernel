@@ -36,7 +36,24 @@ class AsyncRuntime(MessageClient):
     def _register_handler(self,name,fn):
         if not isinstance(name,str) or not name or '.' in name:raise ValueError('invalid handler name')
         self._handlers[name]=fn
+        doc=inspect.getdoc(fn) or ''
+        if not doc:
+            try:comments=inspect.getcomments(fn) or ''
+            except Exception:comments=''
+            if comments:
+                lines=[line.lstrip().lstrip('#').strip() for line in comments.splitlines() if line.lstrip().startswith('#')]
+                doc='\n'.join(line for line in lines if line).strip()
+        if not hasattr(self,'_handler_docs'):self._handler_docs={}
+        self._handler_docs[name]=doc
         return fn
+
+    async def query_handlers_async(self,domain=None,target=None,handler=None,include_inactive=False,timeout=30):
+        params={k:v for k,v in dict(domain=domain,target=target,handler=handler).items() if v is not None}
+        if include_inactive:params['include_inactive']=True
+        return (await self.request('kernel.registry','QueryHandlers',params,{},timeout))['data']
+    async def get_handler_description_async(self,target,timeout=30):
+        res=await self.query_handlers_async(target=target,timeout=timeout)
+        return res.get('description')
 
     async def storage_insert_async(self,record_id,category,data,upsert=True,timeout=30):
         return (await self.request('kernel.storage','StorageInsert',dict(record_id=record_id,category=category,upsert=upsert),data,timeout))['data']
@@ -190,7 +207,7 @@ class AsyncRuntime(MessageClient):
             except Exception as error:
                 self._startup_error=error;self._diagnostic('SDK startup failed: %s',error);self.close()
         threading.Thread(target=writer,name='atelier-sdk-stdout',daemon=True).start()
-        if self._handlers:self._submit(['kernel.registry'],'RegisterHandlers',{'handlers':list(self._handlers)},{})
+        if self._handlers:self._submit(['kernel.registry'],'RegisterHandlers',{'handlers':list(self._handlers),'descriptions':dict(getattr(self,'_handler_docs',{}))},{})
         self._startup=asyncio.create_task(start())
         threading.Thread(target=reader,name='atelier-sdk-stdin',daemon=True).start()
         try:

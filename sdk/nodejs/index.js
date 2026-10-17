@@ -6,7 +6,123 @@
  * `Started` -> `Completed` / `ExecutionFailed`), and `kernel.storage` CRUD helpers
  * so business domains only need to `require("atelier-sdk")` and declare handlers.
  */
+const fs = require("fs");
 const readline = require("readline");
+
+const _sourceFileCache = new Map();
+
+function _cleanBlockComment(raw) {
+  return raw
+    .replace(/^\/\*+/, "")
+    .replace(/\*+\/$/, "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^\s*\*?\s?/, "").trim())
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function _extractBodyComment(fn) {
+  if (typeof fn !== "function") return "";
+  if (typeof fn.description === "string" && fn.description.trim()) {
+    return fn.description.trim();
+  }
+  const src = Function.prototype.toString.call(fn);
+  const isFuncKeyword = /^(\s*async\s+)?function\b/.test(src);
+  const arrowIdx = src.indexOf("=>");
+  let bodyStart = -1;
+  if (!isFuncKeyword && arrowIdx !== -1) {
+    const afterArrow = src.slice(arrowIdx + 2).trimStart();
+    if (afterArrow.startsWith("{")) {
+      bodyStart = src.indexOf("{", arrowIdx + 2) + 1;
+    } else {
+      bodyStart = arrowIdx + 2;
+    }
+  } else {
+    const braceIdx = src.indexOf("{");
+    if (braceIdx !== -1) {
+      bodyStart = braceIdx + 1;
+    }
+  }
+  if (bodyStart === -1) return "";
+  const rest = src.slice(bodyStart).trimStart();
+  if (rest.startsWith("/*")) {
+    const endIdx = rest.indexOf("*/");
+    if (endIdx !== -1) {
+      return _cleanBlockComment(rest.slice(0, endIdx + 2));
+    }
+  }
+  if (rest.startsWith("//")) {
+    const lines = [];
+    for (const line of rest.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith("//")) {
+        lines.push(trimmed.replace(/^\/\/+\s?/, "").trim());
+      } else {
+        break;
+      }
+    }
+    return lines.filter(Boolean).join("\n").trim();
+  }
+  return "";
+}
+
+function _extractCallSiteComment() {
+  const stack = new Error().stack || "";
+  const stackLines = stack.split(/\r?\n/).slice(1);
+  for (const frame of stackLines) {
+    if (frame.includes("sdk/nodejs/") || frame.includes("sdk\\nodejs\\") || frame.includes("node:internal")) {
+      continue;
+    }
+    const match = frame.match(/\((.+):(\d+):(\d+)\)$/) || frame.match(/at\s+(.+):(\d+):(\d+)$/);
+    if (!match) continue;
+    let filePath = match[1].trim();
+    if (filePath.startsWith("file://")) {
+      try { filePath = new URL(filePath).pathname; } catch (_) {}
+    }
+    const lineNo = parseInt(match[2], 10);
+    if (!filePath || !Number.isFinite(lineNo) || lineNo <= 1) continue;
+    let fileLines = _sourceFileCache.get(filePath);
+    if (!fileLines) {
+      try {
+        fileLines = fs.readFileSync(filePath, "utf8").split(/\r?\n/);
+        _sourceFileCache.set(filePath, fileLines);
+      } catch (_) {
+        continue;
+      }
+    }
+    let idx = lineNo - 2;
+    while (idx >= 0 && fileLines[idx].trim() === "") {
+      return "";
+    }
+    if (idx < 0) return "";
+    const prevTrimmed = fileLines[idx].trim();
+    if (prevTrimmed.startsWith("//")) {
+      const collected = [];
+      while (idx >= 0 && fileLines[idx].trim().startsWith("//")) {
+        collected.unshift(fileLines[idx].trim().replace(/^\/\/+\s?/, "").trim());
+        idx--;
+      }
+      return collected.filter(Boolean).join("\n").trim();
+    }
+    if (prevTrimmed.endsWith("*/")) {
+      const blockLines = [];
+      while (idx >= 0) {
+        blockLines.unshift(fileLines[idx]);
+        if (fileLines[idx].includes("/*")) {
+          return _cleanBlockComment(blockLines.join("\n"));
+        }
+        idx--;
+      }
+    }
+    break;
+  }
+  return "";
+}
+
+function extractHandlerDescription(fn) {
+  return _extractBodyComment(fn) || _extractCallSiteComment() || "";
+}
 
 class DomainRequestError extends Error {
   constructor(status, data = null, messageId = null) {
@@ -79,6 +195,7 @@ class AtelierDomain {
     this._domainName = domain;
     this._seqCounter = 1;
     this._handlers = new Map();
+    this._handlerDocs = new Map();
     this._receiptCallbacks = [];
     this._stageDelayMs = stageDelayMs;
     this._pending = new Map(); this._closed = false; this._running = false;
@@ -87,13 +204,22 @@ class AtelierDomain {
 
   /**
    * Registers a handler function for `<domain>.<name>`.
+   * Automatically extracts leading comments or function body comments as the handler description.
    */
   handler(name, fn) {
     if (!name || name.includes(".")) {
       throw new Error(`Invalid handler name '${name}'`);
     }
     this._handlers.set(name, fn);
+    this._handlerDocs.set(name, extractHandlerDescription(fn));
     return this;
+  }
+
+  /**
+   * Alias for `domain.handler(name, fn)`.
+   */
+  on(name, fn) {
+    return this.handler(name, fn);
   }
 
   /**
@@ -102,6 +228,25 @@ class AtelierDomain {
   onReceipt(fn) {
     this._receiptCallbacks.push(fn);
     return this;
+  }
+
+  /**
+   * Queries available handlers and their descriptions from `kernel.registry` (`QueryHandlers`).
+   */
+  queryHandlers(arg1 = {}, target, handler) {
+    const params = {};
+    if (typeof arg1 === "object" && arg1 !== null) {
+      if (arg1.domain !== undefined) params.domain = arg1.domain;
+      if (arg1.target !== undefined) params.target = arg1.target;
+      if (arg1.handler !== undefined) params.handler = arg1.handler;
+      if (arg1.includeInactive !== undefined) params.include_inactive = Boolean(arg1.includeInactive);
+      if (arg1.include_inactive !== undefined) params.include_inactive = Boolean(arg1.include_inactive);
+    } else {
+      if (arg1 !== undefined) params.domain = arg1;
+      if (target !== undefined) params.target = target;
+      if (handler !== undefined) params.handler = handler;
+    }
+    return this.send("kernel.registry", "QueryHandlers", params, {});
   }
 
   /**
@@ -216,6 +361,7 @@ class AtelierDomain {
 
 const MSG_REGISTER_HANDLERS = "RegisterHandlers";
 const MSG_UNREGISTER_HANDLERS = "UnregisterHandlers";
+const MSG_QUERY_HANDLERS = "QueryHandlers";
 const MSG_STORAGE_INSERT = "StorageInsert";
 const MSG_STORAGE_QUERY = "StorageQuery";
 const MSG_STORAGE_UPDATE = "StorageUpdate";
@@ -232,6 +378,7 @@ module.exports = {
   MSG_DELIVERY_DURABLE,
   MSG_DELIVERY_EPHEMERAL,
   MSG_DELIVERY_VOLATILE,
+  MSG_QUERY_HANDLERS,
   MSG_REGISTER_HANDLERS,
   MSG_STORAGE_DELETE,
   MSG_STORAGE_INSERT,

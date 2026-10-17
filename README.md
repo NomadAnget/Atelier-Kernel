@@ -36,11 +36,11 @@
 | 契约 | 开发者只需记住的规则 |
 | :--- | :--- |
 | **`C1` 身份与命名空间** | 域 ID（`domain_id`）在 `kernel_boot.json` 中声明，仅限 `[A-Za-z0-9_]+`。它同时决定了你的路由前缀 `<domain_id>.<handler>`、专属表 `store_<domain_id>` 与日志来源 `source_domain`。你无需在消息中填写 `source_domain`，内核按物理管道强制覆写。 |
-| **`C2` 两层消息与 9 种标准 `message_type`** | 外层信封归内核，内层 `data` 归业务域（内核绝不解析 `data` 内部业务字段，**业务校验、脱敏加密、引擎内部执行队列均由各业务域自治**）。调用 `domain.send(targets, message_type, data)` 时，跨域消息统一使用以下 3 种投递类型：<br>• `Durable`（默认）：写入 SQLite `kernel_ledger` + 内存账本，跨重启可审计恢复<br>• `Volatile`：仅驻留内存账本，适合高频传感器/UI 状态同步<br>• `Ephemeral`：在途内存追踪，到达终态（`Completed` 等）后立即从内存抹除，适合流式 Token/心跳 |
+| **`C2` 两层消息与 10 种标准 `message_type`** | 外层信封归内核，内层 `data` 归业务域（内核绝不解析 `data` 内部业务字段，**业务校验、脱敏加密、引擎内部执行队列均由各业务域自治**）。调用 `domain.send(targets, message_type, params, data)` 时，跨域消息统一使用以下 3 种投递类型：<br>• `Durable`（默认）：写入 SQLite `kernel_ledger` + 内存账本，跨重启可审计恢复<br>• `Volatile`：仅驻留内存账本，适合高频传感器/UI 状态同步<br>• `Ephemeral`：在途内存追踪，到达终态（`Completed` 等）后立即从内存抹除，适合流式 Token/心跳 |
 | **`C3` 四阶段回执与零盲发** | 每条消息经历 `Sent -> Received -> Started -> Completed`（SDK 自动代发 `Received`/`Started`/`Completed`）。若目标 `<domain>.<handler>` 未注册或进程离线，内核**拒绝盲发**并立即向发送端返回 `TargetInvalid`；若处理器抛出异常，SDK 自动捕获并上报 `ExecutionFailed`。 |
 
-> **内置内核服务消息类型（共 6 种，由 SDK 封装方法自动调用）**：
-> - `kernel.registry`：`RegisterHandlers`、`UnregisterHandlers`
+> **内置内核服务消息类型（共 7 种，由 SDK 封装方法自动调用）**：
+> - `kernel.registry`：`RegisterHandlers`、`UnregisterHandlers`、`QueryHandlers`（查询可用处理器列表及处理器说明；**Python / Node.js SDK 自动提取处理器方法注释作为说明，零额外注册参数**）
 > - `kernel.storage`：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`
 
 ---
@@ -51,62 +51,72 @@
 
 | 维度 | ❌ 严禁做法（会被内核拦截或 `--check` 报错） | ✅ 正确做法（符合宪法） |
 | :--- | :--- | :--- |
-| **进程与代码隔离 (`M4`)** | 跨目录直接 import 其他域的代码（如 `from ..billing import xxx` 或 `require('../billing')`） | 域间 100% 物理隔离，仅通过 `domain.send(["billing.charge"], "Durable", data)` 通信 |
-| **数据库访问 (`M3`, `M4`, `M7`)** | 域代码中自行 `import sqlite3` 直连内核数据库，或尝试修改他域表、执行 `ALTER TABLE` | 仅通过 `domain.storage.insert / query / update / delete` 操作本域表；跨表只读查询传 `domain="other_domain"`；业务字段扩展直接放进 `data` JSON |
-| **日志与标准输出 (`M5`)** | 在域代码中使用裸 `print(...)` 或 `console.log(...)`（会直接污染 `stdout` JSON-Lines 协议管道！） | 统一使用 SDK 提供的日志器：`domain.logger.info("msg", {"k": "v"})`（或向 `stderr` 输出调试信息） |
-| **处理器命名 (`M1`)** | 处理器名包含点号 `.`（如 `@domain.on("a.b")`） | 处理器名不含 `.`（如 `@domain.on("calc_order")`），完整路由由内核拼接为 `<domain>.calc_order` |
+| **进程与代码隔离 (`M4`)** | 跨目录直接 import 其他域的代码（如 `from ..billing import xxx` 或 `require('../billing')`） | 域间 100% 物理隔离，仅通过 `domain.send(["billing.charge"], "Durable", params, data)` 通信 |
+| **数据库访问 (`M3`, `M4`, `M7`)** | 域代码中自行 `import sqlite3` 直连内核数据库，或尝试修改他域表、执行 `ALTER TABLE` | 仅通过 `domain.storage_insert_async / storage_query_async / ...` 操作本域表；跨表只读查询传 `domain="other_domain"`；业务字段扩展直接放进 `data` JSON |
+| **日志与标准输出 (`M5`)** | 在域代码中使用裸 `print(...)` 或 `console.log(...)`（会直接污染 `stdout` JSON-Lines 协议管道！） | 统一使用 SDK 提供的日志器：`domain.logger.info("msg")`（或向 `stderr` 输出调试信息） |
+| **处理器命名与说明 (`M1`)** | 处理器名包含点号 `.`（如 `@domain.handler("a.b")`） | 处理器名不含 `.`（如 `@domain.handler("calc_order")`），直接在方法上写注释或 Docstring，SDK 自动提取上报给内核 |
 | **异常处理 (`B3`, `B6`)** | 裸 `except: pass` 静默吞掉异常或返回假成功；在处理器里写死循环阻塞管道 | 校验失败或依赖异常时直接抛出异常（让 SDK 自动触发 `ExecutionFailed` 回执）；耗时任务放入引擎域自管队列异步执行 |
 
 #### 代码示例对比
 
-**Python 域示例：**
+**Python 域示例（零额外参数自动提取 Docstring 或 `#` 注释）：**
 ```python
 from atelier_sdk import AtelierDomain, MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL
 
 domain = AtelierDomain("order_service")
 
-@domain.on("create_order")  # ✅ M1: 处理器名不含 '.'
-def handle_create_order(ctx):
+@domain.handler("create_order")  # ✅ M1: 处理器名不含 '.'，零额外参数！
+async def handle_create_order(msg):
+    """创建销售订单并持久化到本域存储表（SDK 自动将此注释注册为处理器说明）"""
     # ❌ M5 违宪: print("creating order...")  -> 会破坏 stdout 协议管道！
     # ✅ M5 合规: 使用 domain.logger
-    domain.logger.info("Creating order", {"order_id": ctx.data.get("order_id")})
+    domain.logger.info("Creating order %s", msg.data.get("order_id"))
 
-    if "amount" not in ctx.data:
+    if "amount" not in msg.data:
         # ✅ B3 合规: 显式抛出异常，SDK 自动回传 ExecutionFailed 回执
         raise ValueError("Missing required field: amount")
 
     # ✅ M3/M4 合规: 通过存储消息写入本域表 store_order_service
-    domain.storage.insert(
-        record_key=ctx.data["order_id"],
-        schema_version="order.v1",
-        data=ctx.data,  # ✅ C2/B4: 如需敏感字段脱敏，由业务域在写入前自行处理
+    await domain.storage_insert_async(
+        record_id=msg.data["order_id"],
+        category="order.v1",
+        data=msg.data,  # ✅ C2/B4: 如需敏感字段脱敏，由业务域在写入前自行处理
     )
 
+    # ✅ 查询内核当前可用处理器列表或指定处理器的说明
+    all_handlers = await domain.query_handlers_async()
+    pay_doc = await domain.get_handler_description_async("payment_service.pay")
+
     # ✅ C2 合规: 按业务性质选择 Durable / Volatile / Ephemeral 投递策略
-    domain.send(["payment_service.pay"], MSG_DELIVERY_DURABLE, ctx.data)
-    domain.send(["ui_stream.push_progress"], MSG_DELIVERY_EPHEMERAL, {"step": "created"})
-    return {"ok": True}
+    await domain.send(["payment_service.pay"], MSG_DELIVERY_DURABLE, {}, msg.data)
+    await domain.send(["ui_stream.push_progress"], MSG_DELIVERY_EPHEMERAL, {}, {"step": "created"})
+    return {"ok": True, "pay_handler_doc": pay_doc, "active_count": all_handlers["count"]}
 
 domain.run()
 ```
 
-**Node.js 域示例：**
+**Node.js 域示例（自动提取函数上方 `//`、`/** ... */` 或函数首行注释）：**
 ```javascript
 const { AtelierDomain, MSG_DELIVERY_VOLATILE } = require("atelier-sdk");
 
-const domain = new AtelierDomain("telemetry_hub");
+const domain = new AtelierDomain({ domain: "telemetry_hub" });
 
-domain.on("report_metrics", (ctx) => {
-  // ❌ M5 违宪: console.log("metrics:", ctx.data);
+// 接收主机遥测指标并转发至实时仪表盘（SDK 自动提取上方或函数内首行注释作为处理器说明）
+domain.handler("report_metrics", async (msg) => {
+  // ❌ M5 违宪: console.log("metrics:", msg.data);
   // ✅ M5 合规:
-  domain.logger.info("Received metrics", { host: ctx.data.host });
+  domain.logger.info(`Received metrics from ${msg.data.host}`);
+
+  // ✅ 查询指定域的可用处理器列表及说明
+  const orderHandlers = await domain.queryHandlersAsync({ domain: "order_service" });
+  const createDoc = await domain.getHandlerDescriptionAsync("order_service.create_order");
 
   // ✅ M3 合规: 跨表只读查询其他域的数据（写操作仅限本域）
-  domain.storage.query({ domain: "order_service", limit: 10 });
+  await domain.storageQueryAsync({ domain: "order_service", limit: 10 });
 
   // ✅ C2 合规: 高频状态同步使用 Volatile（纯内存账本，零磁盘 I/O）
-  domain.send(["dashboard.refresh"], MSG_DELIVERY_VOLATILE, ctx.data);
-  return { status: "forwarded" };
+  await domain.send(["dashboard.refresh"], MSG_DELIVERY_VOLATILE, {}, msg.data);
+  return { status: "forwarded", createDoc, count: orderHandlers.count };
 });
 
 domain.run();

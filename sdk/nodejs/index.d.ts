@@ -82,6 +82,29 @@ export class DomainExecutionFailed extends Error {
   constructor(payload: Record<string, any>);
 }
 
+export interface QueryHandlersOptions {
+  domain?: string;
+  target?: string;
+  handler?: string;
+  includeInactive?: boolean;
+  include_inactive?: boolean;
+}
+
+export interface HandlerDescriptor {
+  target: string;
+  domain: string;
+  handler: string;
+  description: string;
+  status: string;
+}
+
+export interface QueryHandlersResponse {
+  count: number;
+  routes: string[];
+  handlers: HandlerDescriptor[];
+  description?: string | null;
+}
+
 export class AtelierDomain {
   readonly context:DomainContext;
   shutdown(options?:{grace?:number}):Promise<void>;
@@ -89,6 +112,8 @@ export class AtelierDomain {
   waitResult(messageId:string,options?:RequestOptions):Promise<Record<string,any>>;
   waitResults(messageIds:string[],options?:RequestOptions):Promise<TargetResult[]>;
   forgetResult(messageId:string):boolean;
+  queryHandlersAsync(options?:QueryHandlersOptions,requestOptions?:RequestOptions):Promise<QueryHandlersResponse>;
+  getHandlerDescriptionAsync(target:string,requestOptions?:RequestOptions):Promise<string|null>;
   storageInsertAsync(recordId:string,category:string,data:Record<string,any>,upsert?:boolean,options?:RequestOptions):Promise<any>;
   storageUpdateAsync(recordId:string,data:Record<string,any>,patch?:boolean,options?:RequestOptions):Promise<any>;
   storageDeleteAsync(options?:StorageDeleteOptions,requestOptions?:RequestOptions):Promise<any>;
@@ -102,7 +127,13 @@ export class AtelierDomain {
     name: string,
     fn: (msg: DeliveryMessage<TData, TParams>, domain: AtelierDomain) => any | Promise<any>
   ): this;
+  on<TData = Record<string, any>, TParams = Record<string, any>>(
+    name: string,
+    fn: (msg: DeliveryMessage<TData, TParams>, domain: AtelierDomain) => any | Promise<any>
+  ): this;
   onReceipt(fn: (receiptFrame: Record<string, any>) => void): this;
+  queryHandlers(options?:QueryHandlersOptions):Promise<string>;
+  queryHandlers(domain?:string,target?:string,handler?:string):Promise<string>;
   send(target:string,messageType:string,params?:Record<string,any>,data?:any,options?:RequestOptions):Promise<string>;
   send(targets:string[],messageType:string,params?:Record<string,any>,data?:any,options?:RequestOptions):Promise<string[]>;
   storageInsert(recordId:string,category:string,data:any,upsert?:boolean):Promise<string>;
@@ -129,6 +160,7 @@ export class DomainRequestError extends Error {
 
 export const MSG_REGISTER_HANDLERS: "RegisterHandlers";
 export const MSG_UNREGISTER_HANDLERS: "UnregisterHandlers";
+export const MSG_QUERY_HANDLERS: "QueryHandlers";
 export const MSG_STORAGE_INSERT: "StorageInsert";
 export const MSG_STORAGE_QUERY: "StorageQuery";
 export const MSG_STORAGE_UPDATE: "StorageUpdate";

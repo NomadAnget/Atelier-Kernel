@@ -468,9 +468,14 @@ impl WebFrontendDomain {
         let webui_receipts = self.receipt_history.lock().clone();
         let recent_logs = self.kernel.logger().recent_logs();
         let active_progress = self.kernel.logger().active_progress();
+        let available_handlers = self
+            .kernel
+            .router()
+            .available_handlers(None, None, None, false);
 
         json!({
             "active_routes": active_routes,
+            "available_handlers": available_handlers,
             "total_events": total_events,
             "invalid_count": invalid_count,
             "domains": domains_json,

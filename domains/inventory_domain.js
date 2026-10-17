@@ -14,6 +14,7 @@ const stockLedger = {
   "CHRONO-MOD-7": 45,
 };
 
+// 扣减指定 SKU 的库存并持久化最新库存快照
 domain.handler("deduct", async (msg) => {
   const sku = msg.data.sku || "ATELIER-GEAR-01";
   const qty = Number(msg.data.qty || 1);
@@ -45,6 +46,9 @@ domain.handler("deduct", async (msg) => {
   };
 });
 
+/**
+ * 补充指定 SKU 的库存数量
+ */
 domain.handler("restock", async (msg) => {
   const sku = msg.data.sku || "ATELIER-GEAR-01";
   const qty = Number(msg.data.qty || 10);
@@ -57,11 +61,15 @@ domain.handler("restock", async (msg) => {
   };
 });
 
-domain.handler("stock_info", () => ({
-  runtime: "Node.js (atelier_sdk)",
-  stock: stockLedger,
-}));
+domain.handler("stock_info", () => {
+  // 查询当前所有 SKU 的实时库存账本
+  return {
+    runtime: "Node.js (atelier_sdk)",
+    stock: stockLedger,
+  };
+});
 
+// 动态开启或关闭库存域自动遥测上报
 domain.handler("set_auto_traffic", async (msg) => {
   if (typeof msg.data.enabled === "boolean") {
     autoTrafficEnabled = msg.data.enabled;

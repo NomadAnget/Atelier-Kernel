@@ -11,6 +11,7 @@ pub const KERNEL_STORAGE_TARGET: &str = "kernel.storage";
 /// Built-in lifecycle / registry message types.
 pub const MSG_REGISTER_HANDLERS: &str = "RegisterHandlers";
 pub const MSG_UNREGISTER_HANDLERS: &str = "UnregisterHandlers";
+pub const MSG_QUERY_HANDLERS: &str = "QueryHandlers";
 
 /// Built-in storage CRUD message types ("Storage as Messaging").
 pub const MSG_STORAGE_INSERT: &str = "StorageInsert";
@@ -22,6 +23,21 @@ pub const MSG_STORAGE_DELETE: &str = "StorageDelete";
 pub const MSG_DELIVERY_DURABLE: &str = "Durable";
 pub const MSG_DELIVERY_VOLATILE: &str = "Volatile";
 pub const MSG_DELIVERY_EPHEMERAL: &str = "Ephemeral";
+
+/// Metadata descriptor for a registered domain handler (`<domain>.<handler>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandlerDescriptor {
+    /// Full route address `"<domain>.<handler>"`.
+    pub target: String,
+    /// Owning domain identifier.
+    pub domain: String,
+    /// Handler name within the domain.
+    pub handler: String,
+    /// Human/developer-readable description extracted from function docstring or comments.
+    pub description: String,
+    /// Current lifecycle status of the owning domain.
+    pub status: DomainStatus,
+}
 
 /// Delivery persistence policy resolved from `message_type` for domain messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -18,6 +18,8 @@ function enhance(Base,RequestError,ExecutionFailed) {
     }
     get context(){const value=context.getStore();if(!value)return {};const {signal,...portable}=value;return {...portable};}
     _currentSignal(){return context.getStore()?.signal;}
+    async queryHandlersAsync({domain,target,handler,includeInactive,include_inactive}={},options={}){const params={};for(const [k,v] of Object.entries({domain,target,handler}))if(v!==undefined)params[k]=v;if(includeInactive||include_inactive)params.include_inactive=true;return (await this.request('kernel.registry','QueryHandlers',params,{},options)).data;}
+    async getHandlerDescriptionAsync(target,options={}){const res=await this.queryHandlersAsync({target},options);return res?.description??null;}
     async storageInsertAsync(recordId,category,data,upsert=true,options={}){return (await this.request('kernel.storage','StorageInsert',{record_id:recordId,category,upsert},data,options)).data;}
     async storageUpdateAsync(recordId,data,patch=true,options={}){return (await this.request('kernel.storage','StorageUpdate',{record_id:recordId,patch},data,options)).data;}
     async storageDeleteAsync({recordId,record_id,category}={},options={}){const params={};if(recordId!==undefined||record_id!==undefined)params.record_id=recordId??record_id;if(category!==undefined)params.category=category;return (await this.request('kernel.storage','StorageDelete',params,{},options)).data;}
@@ -60,7 +62,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
         let frame;try{frame=JSON.parse(line);if(!frame||typeof frame!=='object'||Array.isArray(frame))throw new Error();}catch(_){this._diagnostic('SDK received malformed JSON frame');return;}
         try{this._receive(frame);}catch(error){this._diagnostic(`SDK dispatch failed: ${error}`);this.close();}
       });
-      if(this._handlers.size)this._submit(['kernel.registry'],'RegisterHandlers',{handlers:[...this._handlers.keys()]},{});
+      if(this._handlers.size)this._submit(['kernel.registry'],'RegisterHandlers',{handlers:[...this._handlers.keys()],descriptions:Object.fromEntries(this._handlerDocs||[])},{});
       this._startup=Promise.resolve().then(async()=>{if(onStart)await onStart();}).catch(error=>{this._startupError=error;this._diagnostic(`SDK startup failed: ${error}`);this.close();});
       return this._runPromise;
     }

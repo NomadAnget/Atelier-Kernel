@@ -10,9 +10,10 @@ use crate::ledger::{KernelLedger, ReceiptTransition};
 use crate::logging::KernelLogHub;
 use crate::observer::KernelObserver;
 use crate::protocol::{
-    ContractStatus, DomainStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
-    KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame, MSG_REGISTER_HANDLERS,
-    MSG_UNREGISTER_HANDLERS, MessageReceipt, OutboundMessage, now_millis, parse_target_address,
+    ContractStatus, DomainStatus, DomainToKernelFrame, HandlerDescriptor, InboundReceipt,
+    KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame,
+    MSG_QUERY_HANDLERS, MSG_REGISTER_HANDLERS, MSG_UNREGISTER_HANDLERS, MessageReceipt,
+    OutboundMessage, now_millis, parse_target_address,
 };
 use crate::storage::DomainStorageEngine;
 
@@ -22,7 +23,8 @@ struct DomainEntry {
     instance_id: u64,
     status: DomainStatus,
     pipe_tx: Option<Sender<KernelToDomainFrame>>,
-    handlers: HashSet<String>,
+    /// Maps `handler_name -> description`.
+    handlers: HashMap<String, String>,
 }
 
 /// Core Atelier Kernel Router: manages domain routes, generates message IDs,
@@ -112,10 +114,10 @@ impl KernelRouter {
                 instance_id,
                 status: DomainStatus::Spawning,
                 pipe_tx: None,
-                handlers: HashSet::new(),
+                handlers: HashMap::new(),
             });
         // Clean up any leftover routes from a prior generation before binding the new instance.
-        for h in &entry.handlers {
+        for h in entry.handlers.keys() {
             routes.remove(&format!("{domain_id}.{h}"));
         }
         entry.handlers.clear();
@@ -150,7 +152,7 @@ impl KernelRouter {
             .map(|(domain_id, entry)| {
                 let mut routes: Vec<String> = entry
                     .handlers
-                    .iter()
+                    .keys()
                     .map(|h| format!("{domain_id}.{h}"))
                     .collect();
                 routes.sort();
@@ -159,6 +161,63 @@ impl KernelRouter {
             .collect();
         list.sort_by(|a, b| a.0.cmp(&b.0));
         list
+    }
+
+    /// Queries registered handlers across active domains (with optional domain / target / handler filters),
+    /// returning their route address, owning domain, handler name, description, and status.
+    pub fn available_handlers(
+        &self,
+        domain_filter: Option<&str>,
+        target_filter: Option<&str>,
+        handler_filter: Option<&str>,
+        include_inactive: bool,
+    ) -> Vec<HandlerDescriptor> {
+        let domains = self.domains.read();
+        let mut descriptors = Vec::new();
+        for (domain_id, entry) in domains.iter() {
+            if !include_inactive && entry.status != DomainStatus::Active {
+                continue;
+            }
+            if let Some(df) = domain_filter
+                && !df.is_empty()
+                && df != domain_id
+            {
+                continue;
+            }
+            for (handler, desc) in &entry.handlers {
+                let target = format!("{domain_id}.{handler}");
+                if let Some(tf) = target_filter
+                    && !tf.is_empty()
+                    && tf != target
+                {
+                    continue;
+                }
+                if let Some(hf) = handler_filter
+                    && !hf.is_empty()
+                    && hf != handler
+                {
+                    continue;
+                }
+                descriptors.push(HandlerDescriptor {
+                    target,
+                    domain: domain_id.clone(),
+                    handler: handler.clone(),
+                    description: desc.clone(),
+                    status: entry.status,
+                });
+            }
+        }
+        descriptors.sort_by(|a, b| a.target.cmp(&b.target));
+        descriptors
+    }
+
+    /// Looks up the human-readable description for a specific `<domain>.<handler>` target.
+    pub fn handler_description(&self, target: &str) -> Option<String> {
+        let (domain_id, handler) = parse_target_address(target)?;
+        let domains = self.domains.read();
+        domains
+            .get(domain_id)
+            .and_then(|entry| entry.handlers.get(handler).cloned())
     }
 
     /// Processes a raw JSON line from a specific process generation `instance_id` of `authenticated_domain`.
@@ -369,23 +428,60 @@ impl KernelRouter {
         ids
     }
 
-    /// Dispatches a message targeting `kernel.registry` (`RegisterHandlers` / `UnregisterHandlers`).
+    /// Dispatches a message targeting `kernel.registry` (`RegisterHandlers` / `UnregisterHandlers` / `QueryHandlers`).
     fn dispatch_kernel_registry(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         // Emit Stage 1 (Sent), Stage 2 (Received), Stage 3 (Started)
         self.emit_kernel_internal_stages(source_domain, seq, msg);
 
         match msg.message_type.as_str() {
             MSG_REGISTER_HANDLERS => {
+                let desc_map = msg.params.get("descriptions").and_then(Value::as_object);
                 let handlers_opt =
                     msg.params
                         .get("handlers")
                         .and_then(Value::as_array)
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(Value::as_str)
-                                .map(|s| s.trim().to_string())
-                                .filter(|s| !s.is_empty() && !s.contains('.'))
-                                .collect::<Vec<String>>()
+                                .filter_map(|item| {
+                                    if let Some(name) = item.as_str() {
+                                        let trimmed = name.trim();
+                                        if trimmed.is_empty() || trimmed.contains('.') {
+                                            return None;
+                                        }
+                                        let desc = desc_map
+                                            .and_then(|m| m.get(trimmed))
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        Some((trimmed.to_string(), desc))
+                                    } else if let Some(obj) = item.as_object() {
+                                        let name = obj
+                                            .get("name")
+                                            .or_else(|| obj.get("handler"))
+                                            .and_then(Value::as_str)?
+                                            .trim();
+                                        if name.is_empty() || name.contains('.') {
+                                            return None;
+                                        }
+                                        let desc = obj
+                                            .get("description")
+                                            .or_else(|| obj.get("doc"))
+                                            .and_then(Value::as_str)
+                                            .or_else(|| {
+                                                desc_map
+                                                    .and_then(|m| m.get(name))
+                                                    .and_then(Value::as_str)
+                                            })
+                                            .unwrap_or("")
+                                            .trim()
+                                            .to_string();
+                                        Some((name.to_string(), desc))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<(String, String)>>()
                         });
 
                 let Some(handlers) = handlers_opt.filter(|h| !h.is_empty()) else {
@@ -404,6 +500,7 @@ impl KernelRouter {
                 let _ = self.storage.ensure_domain_table(source_domain);
 
                 let mut registered_routes = Vec::new();
+                let mut registered_handlers = Vec::new();
                 {
                     let mut domains = self.domains.write();
                     let mut routes = self.routes.write();
@@ -414,15 +511,21 @@ impl KernelRouter {
                                 instance_id: self.next_instance_id.fetch_add(1, Ordering::Relaxed),
                                 status: DomainStatus::Active,
                                 pipe_tx: None,
-                                handlers: HashSet::new(),
+                                handlers: HashMap::new(),
                             });
                     entry.status = DomainStatus::Active;
 
-                    for h in handlers {
+                    for (h, desc) in handlers {
                         let full_route = format!("{source_domain}.{h}");
-                        entry.handlers.insert(h);
+                        entry.handlers.insert(h.clone(), desc.clone());
                         routes.insert(full_route.clone(), source_domain.to_string());
-                        registered_routes.push(full_route);
+                        registered_routes.push(full_route.clone());
+                        registered_handlers.push(json!({
+                            "target": full_route,
+                            "domain": source_domain,
+                            "handler": h,
+                            "description": desc,
+                        }));
                     }
                 }
 
@@ -434,6 +537,7 @@ impl KernelRouter {
                         "domain": source_domain,
                         "status": "active",
                         "registered_routes": registered_routes,
+                        "handlers": registered_handlers,
                     })),
                 );
             }
@@ -443,7 +547,7 @@ impl KernelRouter {
                     let mut domains = self.domains.write();
                     let mut routes = self.routes.write();
                     if let Some(entry) = domains.get_mut(source_domain) {
-                        for h in entry.handlers.drain() {
+                        for (h, _) in entry.handlers.drain() {
                             let full_route = format!("{source_domain}.{h}");
                             routes.remove(&full_route);
                             removed_routes.push(full_route);
@@ -457,6 +561,41 @@ impl KernelRouter {
                     Some(json!({
                         "domain": source_domain,
                         "unregistered_routes": removed_routes,
+                    })),
+                );
+            }
+            MSG_QUERY_HANDLERS => {
+                let domain_filter = msg.params.get("domain").and_then(Value::as_str);
+                let target_filter = msg.params.get("target").and_then(Value::as_str);
+                let handler_filter = msg.params.get("handler").and_then(Value::as_str);
+                let include_inactive = msg
+                    .params
+                    .get("include_inactive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+
+                let descriptors = self.available_handlers(
+                    domain_filter,
+                    target_filter,
+                    handler_filter,
+                    include_inactive,
+                );
+                let routes: Vec<String> = descriptors.iter().map(|d| d.target.clone()).collect();
+                let single_description = if descriptors.len() == 1 {
+                    Some(descriptors[0].description.clone())
+                } else {
+                    target_filter.and_then(|tf| self.handler_description(tf))
+                };
+
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "count": descriptors.len(),
+                        "routes": routes,
+                        "handlers": descriptors,
+                        "description": single_description,
                     })),
                 );
             }
@@ -746,7 +885,7 @@ impl KernelRouter {
             }
             entry.status = DomainStatus::Faulted;
             entry.pipe_tx = None;
-            for h in &entry.handlers {
+            for h in entry.handlers.keys() {
                 routes.remove(&format!("{domain_id}.{h}"));
             }
             entry.handlers.clear();

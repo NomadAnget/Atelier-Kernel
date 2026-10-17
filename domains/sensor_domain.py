@@ -10,14 +10,17 @@ auto_traffic_enabled = True
 
 @domain.handler('read')
 def on_read(_msg):
+    """读取当前传感器实时温度与运行状态"""
     return {'sensor': 'sensor_hub (Python3)', 'temperature_c': round(random.uniform(40.0, 65.0), 1), 'status': 'nominal'}
 
+# 校准传感器零点偏移量
 @domain.handler('calibrate')
 def on_calibrate(msg):
     return {'calibrated': True, 'offset_applied': msg.data.get('offset', 0.0)}
 
 @domain.handler('set_auto_traffic')
 def on_set_auto_traffic(msg):
+    """动态开启或关闭传感器域自动遥测上报"""
     global auto_traffic_enabled
     if 'enabled' in msg.data:
         auto_traffic_enabled = bool(msg.data['enabled'])

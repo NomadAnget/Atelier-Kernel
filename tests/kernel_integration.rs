@@ -1616,5 +1616,139 @@ console.error("stderr is allowed");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// 15. Query Available Handlers & Automatic Comment Description Extraction Test:
+/// Verifies that:
+/// - Python SDK automatically extracts function docstrings (`"""..."""`) and `#` comments above `@domain.handler`
+/// - Node.js SDK automatically extracts leading `//` / `/** ... */` comments and function-body `//` comments
+/// - Any domain can query available handlers and their descriptions via `kernel.registry` (`QueryHandlers`)
+#[test]
+fn test_query_available_handlers_and_auto_comment_descriptions() {
+    use atelier_kernel::{KERNEL_REGISTRY_TARGET, MSG_QUERY_HANDLERS};
+
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+
+    kernel
+        .spawn_process_domain(DomainProcessSpec::new(
+            "order",
+            "python3",
+            vec!["./domains/order_domain.py".to_string()],
+        ))
+        .expect("Failed to spawn Python order domain");
+
+    kernel
+        .spawn_process_domain(DomainProcessSpec::new(
+            "inventory",
+            "node",
+            vec!["./domains/inventory_domain.js".to_string()],
+        ))
+        .expect("Failed to spawn Node.js inventory domain");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
+        if kernel.router().domain_status("order") == Some(DomainStatus::Active)
+            && kernel.router().domain_status("inventory") == Some(DomainStatus::Active)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        kernel.router().domain_status("order"),
+        Some(DomainStatus::Active)
+    );
+    assert_eq!(
+        kernel.router().domain_status("inventory"),
+        Some(DomainStatus::Active)
+    );
+
+    // 1. Check direct KernelRouter API for Python & Node.js handler descriptions
+    assert_eq!(
+        kernel.router().handler_description("order.create").as_deref(),
+        Some("创建销售订单并持久化到本域存储表 store_order")
+    );
+    assert_eq!(
+        kernel.router().handler_description("order.echo").as_deref(),
+        Some("原样回显请求参数与载荷数据（连通性测试）")
+    );
+    assert_eq!(
+        kernel
+            .router()
+            .handler_description("inventory.deduct")
+            .as_deref(),
+        Some("扣减指定 SKU 的库存并持久化最新库存快照")
+    );
+    assert_eq!(
+        kernel
+            .router()
+            .handler_description("inventory.restock")
+            .as_deref(),
+        Some("补充指定 SKU 的库存数量")
+    );
+    assert_eq!(
+        kernel
+            .router()
+            .handler_description("inventory.stock_info")
+            .as_deref(),
+        Some("查询当前所有 SKU 的实时库存账本")
+    );
+
+    // 2. Query available handlers and descriptions from another domain via `kernel.registry` (`QueryHandlers`)
+    let caller = kernel.attach_domain("orchestrator");
+    let query_all_ids = caller.send(
+        vec![KERNEL_REGISTRY_TARGET.to_string()],
+        MSG_QUERY_HANDLERS,
+        json!({}),
+        json!({}),
+    );
+    let frames = caller.drain_frames();
+    let completed = frames
+        .into_iter()
+        .filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r)
+                if r.message_id == query_all_ids[0] && r.status == ContractStatus::Completed =>
+            {
+                r.data
+            }
+            _ => None,
+        })
+        .next()
+        .expect("Expected Completed receipt for QueryHandlers");
+
+    let routes = completed["routes"].as_array().unwrap();
+    assert!(routes.contains(&json!("order.create")));
+    assert!(routes.contains(&json!("inventory.deduct")));
+
+    // 3. Query single target description via `params.target`
+    let query_one_ids = caller.send(
+        vec![KERNEL_REGISTRY_TARGET.to_string()],
+        MSG_QUERY_HANDLERS,
+        json!({ "target": "inventory.deduct" }),
+        json!({}),
+    );
+    let one_frames = caller.drain_frames();
+    let one_completed = one_frames
+        .into_iter()
+        .filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r)
+                if r.message_id == query_one_ids[0] && r.status == ContractStatus::Completed =>
+            {
+                r.data
+            }
+            _ => None,
+        })
+        .next()
+        .expect("Expected Completed receipt for single-target QueryHandlers");
+
+    assert_eq!(one_completed["count"], json!(1));
+    assert_eq!(
+        one_completed["description"],
+        json!("扣减指定 SKU 的库存并持久化最新库存快照")
+    );
+
+    kernel.supervisor().stop_process_domain("order");
+    kernel.supervisor().stop_process_domain("inventory");
+}
+
+
 
 

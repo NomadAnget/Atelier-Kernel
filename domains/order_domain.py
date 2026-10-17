@@ -12,6 +12,7 @@ auto_interval_sec = 2.2
 
 @domain.handler('create')
 async def on_create(msg):
+    """创建销售订单并持久化到本域存储表 store_order"""
     data = msg.data
     order_id = data.get('order_id', f'ORD-{msg.message_id[-6:]}')
     sku = data.get('sku', 'ATELIER-GEAR-01')
@@ -23,6 +24,7 @@ async def on_create(msg):
     domain.logger.phase('INFO', 'finish', f'Order {order_id} created successfully', layer='DOMAIN')
     return {'ok': True, 'runtime': 'Python3 (atelier_sdk)', 'saved_to_table': 'store_order', 'order': order_record}
 
+# 原样回显请求参数与载荷数据（连通性测试）
 @domain.handler('echo')
 def on_echo(msg):
     domain.logger.info('Handling echo request for %s', msg.source_domain, layer='DOMAIN')
@@ -30,6 +32,7 @@ def on_echo(msg):
 
 @domain.handler('slow_op')
 async def on_slow_op(msg):
+    """模拟多阶段耗时批处理任务并实时推送进度"""
     delay_ms = int(msg.params.get('delay_ms', 600))
     key = f'order_task_{msg.message_id[-6:]}'
     domain.logger.progress(f'Waiting to acquire resource for {key}', key=key, waiting=True, layer='DOMAIN')
@@ -43,11 +46,13 @@ async def on_slow_op(msg):
 
 @domain.handler('callback_ui')
 async def on_callback_ui(msg):
+    """向前端观察台发送反向通知消息"""
     await domain.wait_results(await domain.send(targets=['web_ui.push_alert', 'frontend.notify'], message_type='OrderDomainNotification', params={'severity': 'info'}, data={'greeting': f'来自 Python order 域的反向通知（响应 {msg.source_domain} 的消息 {msg.message_id}）'}))
     return {'pushed_notification_to': ['web_ui.push_alert', 'frontend.notify']}
 
 @domain.handler('set_auto_traffic')
 def on_set_auto_traffic(msg):
+    """动态开启或关闭订单域自动流量生成器"""
     global auto_traffic_enabled, auto_interval_sec
     if 'enabled' in msg.data:
         auto_traffic_enabled = bool(msg.data['enabled'])

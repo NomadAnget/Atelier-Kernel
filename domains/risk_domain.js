@@ -8,6 +8,7 @@ const domain = new AtelierDomain();
 let autoTrafficEnabled = true;
 let evaluatedCount = 0;
 
+// 评估订单或传感器遥测数据的安全风险等级与得分
 domain.handler("evaluate", () => {
   const score = Math.floor(Math.random() * 35) + 65;
   return {
@@ -18,12 +19,16 @@ domain.handler("evaluate", () => {
   };
 });
 
+/**
+ * 查询风控域累计审计次数与合规状态
+ */
 domain.handler("audit", () => ({
   audited: true,
   total_evaluated: evaluatedCount,
 }));
 
 domain.handler("set_auto_traffic", async (msg) => {
+  // 动态开启或关闭风控域自动心跳与审计任务
   if (typeof msg.data.enabled === "boolean") {
     autoTrafficEnabled = msg.data.enabled;
   }

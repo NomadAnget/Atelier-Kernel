@@ -15,11 +15,14 @@
   - 专属存储表固定为 `store_<domain_id>`；
   - 入站日志与 `stderr` 来源固定由内核覆写为 `source_domain = domain_id`，彻底杜绝身份伪造。
 
-### C2 · 两层消息结构与 9 类标准 `message_type` 契约
+### C2 · 两层消息结构与 10 类标准 `message_type` 契约
 - **上层为内核契约元数据**：包含 `logical_id`、`message_id`、`source_domain`、`targets`、`message_type`、`params`、`timestamp`。
 - **内层为业务数据包（`data`）**：标准 JSON 格式。业务数据结构演进、字段校验、前端数据脱敏等均由对应业务域自治，**内核行为与数据库表结构完全零感知**。
-- **`message_type` 三大类共 9 个标准值**：
-  1. **路由注册与注销（`target = "kernel.registry"`）**：`RegisterHandlers`、`UnregisterHandlers`
+- **`message_type` 三大类共 10 个标准值**：
+  1. **路由注册、注销与发现（`target = "kernel.registry"`）**：
+     - `RegisterHandlers`：注册本域处理器列表及说明（Python / Node.js SDK 自动提取处理器函数注释或 Docstring 作为说明，无需增加注册参数）；
+     - `UnregisterHandlers`：注销本域处理器；
+     - `QueryHandlers`：查询当前可用处理器列表及处理器说明（支持按 `domain`、`target`、`handler` 过滤）。
   2. **存储即消息 CRUD（`target = "kernel.storage"`）**：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`
   3. **域消息投递持久化策略（`target = "<domain>.<handler>"`）**：
      - `Durable`：写入 SQLite 持久投递账本（`kernel_ledger`）+ 内存账本，支持跨重启状态恢复与审计（未显式指定时默认按 `Durable` 处理）；

@@ -15,9 +15,26 @@ task queues, and dependency orchestration belong to domains or product assembly.
 Handlers accept opaque JSON data. DomainExecutionFailed passes the domain's own
 payload through; there is no required application error schema.
 
-Removed from both SDKs: schema/validator handler options, allowed-source policy,
-DomainError, health/readiness handlers and polling, business admission queue and
-concurrency quotas. Domain dependency ping logic stays in product assembly.
+## Native Infrastructure Facilities
+
+The SDK exposes 8 native infrastructure clients and listeners directly on the domain instance:
+1. `domain.registry`: Handler discovery (`query_handlers` / `get_description`). The kernel strictly excludes all `kernel.*` internal targets from discovery results to prevent domain-to-domain pub-sub anti-patterns.
+2. `domain.storage`: Scoped persistence (`insert`, `query`, `update`, `delete`). Write operations are strictly scoped to the domain's own table; queries can read other tables via `domain`.
+3. `domain.logger`: Isolated structured logging via dedicated pipe (`debug`, `info`, `warn`, `error`, `phase`, `progress`). Listen via `@domain.on_log` / `domain.onLog`.
+4. `domain.telemetry`: High-frequency metric emission (`domain.telemetry.emit`). Listen via `@domain.on_telemetry` / `domain.onTelemetry`.
+5. `domain.notify`: Alert dispatching (`domain.notify`). Listen via `@domain.on_notify` / `domain.onNotify`.
+6. `domain.runtime`: Runtime topology and process inspection (`list_domains`, `get_domain`, `query`).
+7. `domain.observer`: Lifecycle snapshot queries (`query`) and global event stream listening via `@domain.on_observation` / `domain.onObservation`.
+8. `domain.supervisor`: Process lifecycle control (`start`, `stop`, `restart`) and smooth rolling update with isolated candidate probing and automatic zero-gap rollback (`update`).
+
+## Event Stream Delivery Contract
+
+System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationEvent`) delivered from kernel pipes to registered listeners use `DeliveryPolicy::Ephemeral`:
+- Zero receipt frames: Domains never report receipt acknowledgements (`received`, `started`, `completed`) for system push events.
+- Automatic subscription negotiation: Listeners registered before `run` / `run_async` automatically send subscription messages during startup.
+- Automatic teardown: When a subscriber domain terminates or faults, the kernel automatically unregisters its subscriptions to prevent stale pipes or memory leaks.
+
+## Local Transport Safeguards
 
 Only local transport safeguards remain: max_pending=1024, max_outbox=256,
 max_frame_bytes=16777216, shutdown_grace=5 seconds (Node camelCase). These limit

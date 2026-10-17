@@ -24,99 +24,143 @@
 6. **两层消息结构，隔离业务演进**：上层为固定内核契约元数据（用于路由、回执追踪与自动建表），内层 `data` 为标准 JSON 数据包；业务数据结构演进对内核与表结构零影响。
 7. **四阶段标准回执 & 三档持久化策略**：严格遵循 `Sent -> Received -> Started -> Completed` 四阶段回执闭环，内置 `Durable`（SQLite 落盘）、`Volatile`（纯内存账本）、`Ephemeral`（用后即焚）三种投递消息类型，并由 `KernelObserver` 实时旁路广播全量消息状态。
 8. **存储即消息（写隔离、读可跨表）**：按域自动建表（`store_<domain>`），向 `kernel.storage` 发送 `StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete` 消息即完成增删改查；写入类操作严格限制在本域表，`StorageQuery` 支持通过 `params.domain` 跨表只读查询。
+9. **8 大内置基础设施方法（非业务处理器，零域间发布订阅）**：
+   - 内核将注册、存储、日志、遥测、告警、运行时拓扑、观察者快照与生命周期更新收敛为统一的**内核基础设施方法**，直接挂载在多语言 SDK 的 `domain.*` 实例上；
+   - 业务路由列表（`available_handlers`）严格**排除**所有 `kernel.*` 处理器，彻底杜绝域间强耦合与发布订阅反模式；
+   - 观察者流、日志流、遥测流、告警流严格采用 `DeliveryPolicy::Ephemeral` 瞬态直推，零回执报账，域崩溃断开时内核自动解绑注销；
+   - 支持平滑滚动更新（`update`）：隔离拉起候选实例进行主动探活（`probe_handler`），探活成功原子切换路由并平滑排干旧实例在途请求；探活失败零感自动回滚。
 
 ---
 
 ## ⚖️ 面向开发者的契约与宪法速查（Developer Guide）
 
-编写业务域或引擎域代码前，只需掌握 **3 项核心契约** 与 **开发红线（Do's & Don'ts）**。完整规范见 **[CONSTITUTION.md](./CONSTITUTION.md)**。
+编写业务域或引擎域代码前，只需掌握 **3 项核心契约**、**8 大基础设施方法** 与 **开发红线（Do's & Don'ts）**。完整规范见 **[CONSTITUTION.md](./CONSTITUTION.md)**。
 
 ### 1. 三大核心契约（Contracts `C1–C3`）
 
 | 契约 | 开发者只需记住的规则 |
 | :--- | :--- |
 | **`C1` 身份与命名空间** | 域 ID（`domain_id`）在 `kernel_boot.json` 中声明，仅限 `[A-Za-z0-9_]+`。它同时决定了你的路由前缀 `<domain_id>.<handler>`、专属表 `store_<domain_id>` 与日志来源 `source_domain`。你无需在消息中填写 `source_domain`，内核按物理管道强制覆写。 |
-| **`C2` 两层消息与 10 种标准 `message_type`** | 外层信封归内核，内层 `data` 归业务域（内核绝不解析 `data` 内部业务字段，**业务校验、脱敏加密、引擎内部执行队列均由各业务域自治**）。调用 `domain.send(targets, message_type, params, data)` 时，跨域消息统一使用以下 3 种投递类型：<br>• `Durable`（默认）：写入 SQLite `kernel_ledger` + 内存账本，跨重启可审计恢复<br>• `Volatile`：仅驻留内存账本，适合高频传感器/UI 状态同步<br>• `Ephemeral`：在途内存追踪，到达终态（`Completed` 等）后立即从内存抹除，适合流式 Token/心跳 |
-| **`C3` 四阶段回执与零盲发** | 每条消息经历 `Sent -> Received -> Started -> Completed`（SDK 自动代发 `Received`/`Started`/`Completed`）。若目标 `<domain>.<handler>` 未注册或进程离线，内核**拒绝盲发**并立即向发送端返回 `TargetInvalid`；若处理器抛出异常，SDK 自动捕获并上报 `ExecutionFailed`。 |
+| **`C2` 两层消息与 3 种跨域投递策略** | 外层信封归内核，内层 `data` 归业务域（内核绝不解析 `data` 内部业务字段，**业务校验、脱敏加密、引擎内部执行队列均由各业务域自治**）。调用 `domain.send(targets, message_type, params, data)` 时，跨域消息统一使用以下 3 种投递类型：<br>• `Durable`（默认）：写入 SQLite `kernel_ledger` + 内存账本，跨重启可审计恢复<br>• `Volatile`：仅驻留内存账本，适合高频传感器/UI 状态同步<br>• `Ephemeral`：在途内存追踪，到达终态（`Completed` 等）后立即从内存抹除，适合流式 Token/心跳 |
+| **`C3` 四阶段回执与零盲发** | 每条跨域业务消息经历 `Sent -> Received -> Started -> Completed`（SDK 自动代发 `Received`/`Started`/`Completed`）。若目标 `<domain>.<handler>` 未注册或进程离线，内核**拒绝盲发**并立即向发送端返回 `TargetInvalid`；若处理器抛出异常，SDK 自动捕获并上报 `ExecutionFailed`。 |
 
-> **内置内核服务消息类型（共 7 种，由 SDK 封装方法自动调用）**：
-> - `kernel.registry`：`RegisterHandlers`、`UnregisterHandlers`、`QueryHandlers`（查询可用处理器列表及处理器说明；**Python / Node.js SDK 自动提取处理器方法注释作为说明，零额外注册参数**）
-> - `kernel.storage`：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`
+> **内核内置服务目标清单（共 8 个，仅供 SDK 基础设施方法调用，不在业务路由中暴露）**：
+> - `kernel.registry`：处理器注册握手与元数据文档发现（`RegisterHandlers`, `UnregisterHandlers`, `QueryHandlers`）
+> - `kernel.storage`：按域建表隔离存储（`StorageInsert`, `StorageQuery`, `StorageUpdate`, `StorageDelete`）
+> - `kernel.logger`：统一结构化日志、进度查询与日志流监听（`QueryLogs`, `QueryProgress`, `SubscribeLogs`, `UnsubscribeLogs`）
+> - `kernel.telemetry`：高频指标发射与遥测流监听（`SubscribeTelemetry`, `UnsubscribeTelemetry`）
+> - `kernel.notify`：系统级告警通知与事件广播（`SubscribeNotify`, `UnsubscribeNotify`）
+> - `kernel.runtime`：域运行拓扑与装配状态查询（`QueryRuntime`, `QueryDomainAssembly`）
+> - `kernel.observer`：全局消息生命周期观察与快照检索（`QueryObserver`, `SubscribeObserver`, `UnsubscribeObserver`）
+> - `kernel.supervisor`：域进程生命周期控制与平滑滚动更新（`StartDomain`, `StopDomain`, `RestartDomain`, `UpdateDomain`）
 
 ---
 
-### 2. 域开发者红线清单（Machine Constitution `M1–M7` & Guidelines `B1–B6`）
+### 2. 内核 8 大基础设施方法（Kernel Infrastructure Facilities）
+
+所有内核处理器均已沉淀为 SDK 语言原生的基础设施对象与方法，域无需将其作为普通消息调用：
+
+| 基础设施模块 | 内核内部目标 | Python SDK 原生方法 | Node.js SDK 原生方法 | 特性说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| **元数据注册与发现** | `kernel.registry` | `d.registry.query_handlers(...)`<br>`d.registry.get_description(...)` | `d.registry.queryHandlers(...)`<br>`d.registry.getDescription(...)` | 自动提取函数 Docstring/注释；严格排除 `kernel.*` |
+| **按域隔离存储** | `kernel.storage` | `d.storage.insert(...)`<br>`d.storage.query(...)`<br>`d.storage.update(...)`<br>`d.storage.delete(...)` | `d.storage.insert(...)`<br>`d.storage.query(...)`<br>`d.storage.update(...)`<br>`d.storage.delete(...)` | 严格按所属域隔离建表；支持 `domain` 跨表只读查询 |
+| **统一结构化日志** | `kernel.logger` | `d.logger.info(...)`<br>`d.logger.phase(...)`<br>`d.logger.progress(...)`<br>`@d.on_log(level="...")` | `d.logger.info(...)`<br>`d.logger.phase(...)`<br>`d.logger.progress(...)`<br>`d.onLog(fn, {level})` | 物理隔离 stdout 防管道污染；瞬态日志推流零 Receipt 负担 |
+| **高频遥测指标** | `kernel.telemetry` | `d.telemetry.emit(name, val, tags)`<br>`@d.on_telemetry` | `d.telemetry.emit(name, val, tags)`<br>`d.onTelemetry(fn)` | 原生指标发射；管道事件直推零收据 |
+| **系统告警广播** | `kernel.notify` | `d.notify(severity, msg, title)`<br>`@d.on_notify` | `d.notify(severity, msg, title)`<br>`d.onNotify(fn)` | 系统级通知与跨域告警流 |
+| **运行态装配拓扑** | `kernel.runtime` | `d.runtime.list_domains()`<br>`d.runtime.get_domain(id)`<br>`d.runtime.query(...)` | `d.runtime.listDomains()`<br>`d.runtime.getDomain(id)`<br>`d.runtime.query(...)` | 获取全系统所有受托管域的状态、代际 `instance_id` 与路由 |
+| **消息生命周期观察** | `kernel.observer` | `d.observer.query(limit=...)`<br>`@d.on_observation` | `d.observer.query({limit})`<br>`d.onObservation(fn)` | 检索四阶段生命周期快照；原生监听全局事件流 |
+| **进程更新与回滚** | `kernel.supervisor` | `d.supervisor.start(domain)`<br>`d.supervisor.stop(domain)`<br>`d.supervisor.restart(domain)`<br>`d.supervisor.update(domain, ...)` | `d.supervisor.start(domain)`<br>`d.supervisor.stop(domain)`<br>`d.supervisor.restart(domain)`<br>`d.supervisor.update(domain, ...)` | 候选版本隔离探活；探活成功原子切换并排干旧实例；探活失败零感自动回滚 |
+
+---
+
+### 3. 域开发者红线清单（Machine Constitution `M1–M7` & Guidelines `B1–B6`）
 
 #### ✅ 正确做法（Do's） vs ❌ 严禁做法（Don'ts）
 
 | 维度 | ❌ 严禁做法（会被内核拦截或 `--check` 报错） | ✅ 正确做法（符合宪法） |
 | :--- | :--- | :--- |
 | **进程与代码隔离 (`M4`)** | 跨目录直接 import 其他域的代码（如 `from ..billing import xxx` 或 `require('../billing')`） | 域间 100% 物理隔离，仅通过 `domain.send(["billing.charge"], "Durable", params, data)` 通信 |
-| **数据库访问 (`M3`, `M4`, `M7`)** | 域代码中自行 `import sqlite3` 直连内核数据库，或尝试修改他域表、执行 `ALTER TABLE` | 仅通过 `domain.storage_insert_async / storage_query_async / ...` 操作本域表；跨表只读查询传 `domain="other_domain"`；业务字段扩展直接放进 `data` JSON |
+| **数据库访问 (`M3`, `M4`, `M7`)** | 域代码中自行 `import sqlite3` 直连内核数据库，或尝试修改他域表、执行 `ALTER TABLE` | 统一调用 `domain.storage.insert / query / ...` 操作本域表；跨表只读查询传 `domain="other_domain"`；业务字段放进 `data` JSON |
 | **日志与标准输出 (`M5`)** | 在域代码中使用裸 `print(...)` 或 `console.log(...)`（会直接污染 `stdout` JSON-Lines 协议管道！） | 统一使用 SDK 提供的日志器：`domain.logger.info("msg")`（或向 `stderr` 输出调试信息） |
 | **处理器命名与说明 (`M1`)** | 处理器名包含点号 `.`（如 `@domain.handler("a.b")`） | 处理器名不含 `.`（如 `@domain.handler("calc_order")`），直接在方法上写注释或 Docstring，SDK 自动提取上报给内核 |
 | **异常处理 (`B3`, `B6`)** | 裸 `except: pass` 静默吞掉异常或返回假成功；在处理器里写死循环阻塞管道 | 校验失败或依赖异常时直接抛出异常（让 SDK 自动触发 `ExecutionFailed` 回执）；耗时任务放入引擎域自管队列异步执行 |
 
 #### 代码示例对比
 
-**Python 域示例（零额外参数自动提取 Docstring 或 `#` 注释）：**
+**Python 域示例（展示 8 大基础设施方法与优雅处理）：**
 ```python
 from atelier_sdk import AtelierDomain, MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL
 
 domain = AtelierDomain("order_service")
 
-@domain.handler("create_order")  # ✅ M1: 处理器名不含 '.'，零额外参数！
+# ✅ 原生监听全局观察流（零 Receipt 负担，内核管道推流）
+@domain.on_observation
+def on_lifecycle(event):
+    if event.get("state") == "ExecutionFailed":
+        domain.logger.warning("Detected failure on %s", event.get("target"))
+
+# ✅ 注册业务处理器（零额外参数，自动提取 Docstring）
+@domain.handler("create_order")
 async def handle_create_order(msg):
-    """创建销售订单并持久化到本域存储表（SDK 自动将此注释注册为处理器说明）"""
-    # ❌ M5 违宪: print("creating order...")  -> 会破坏 stdout 协议管道！
-    # ✅ M5 合规: 使用 domain.logger
+    """创建销售订单并持久化（SDK 自动提取此注释为处理器说明）"""
     domain.logger.info("Creating order %s", msg.data.get("order_id"))
 
     if "amount" not in msg.data:
-        # ✅ B3 合规: 显式抛出异常，SDK 自动回传 ExecutionFailed 回执
         raise ValueError("Missing required field: amount")
 
-    # ✅ M3/M4 合规: 通过存储消息写入本域表 store_order_service
-    await domain.storage_insert_async(
+    # ✅ 1. 存储基础设施（本域写隔离）
+    await domain.storage.insert(
         record_id=msg.data["order_id"],
         category="order.v1",
-        data=msg.data,  # ✅ C2/B4: 如需敏感字段脱敏，由业务域在写入前自行处理
+        data=msg.data,
     )
 
-    # ✅ 查询内核当前可用处理器列表或指定处理器的说明
-    all_handlers = await domain.query_handlers_async()
-    pay_doc = await domain.get_handler_description_async("payment_service.pay")
+    # ✅ 2. 遥测基础设施（原生发射高频指标）
+    domain.telemetry.emit("order_created_total", 1, {"currency": "USD"})
 
-    # ✅ C2 合规: 按业务性质选择 Durable / Volatile / Ephemeral 投递策略
+    # ✅ 3. 注册表元数据基础设施（查询可用处理器与说明）
+    all_handlers = await domain.registry.query_handlers()
+    pay_doc = await domain.registry.get_description("payment_service.pay")
+
+    # ✅ 4. 运行时拓扑基础设施（查询各域当前状态）
+    topology = await domain.runtime.list_domains()
+
+    # ✅ 5. 跨域标准 RPC 消息投递（严格 4-stage 回执）
     await domain.send(["payment_service.pay"], MSG_DELIVERY_DURABLE, {}, msg.data)
-    await domain.send(["ui_stream.push_progress"], MSG_DELIVERY_EPHEMERAL, {}, {"step": "created"})
-    return {"ok": True, "pay_handler_doc": pay_doc, "active_count": all_handlers["count"]}
+    return {"ok": True, "pay_handler_doc": pay_doc, "active_domains": len(topology)}
 
 domain.run()
 ```
 
-**Node.js 域示例（自动提取函数上方 `//`、`/** ... */` 或函数首行注释）：**
+**Node.js 域示例（展示 8 大基础设施方法与优雅处理）：**
 ```javascript
 const { AtelierDomain, MSG_DELIVERY_VOLATILE } = require("atelier-sdk");
 
 const domain = new AtelierDomain({ domain: "telemetry_hub" });
 
-// 接收主机遥测指标并转发至实时仪表盘（SDK 自动提取上方或函数内首行注释作为处理器说明）
+// ✅ 原生监听日志流（过滤 WARNING 及以上）
+domain.onLog((record) => {
+  if (record.level === "ERROR") {
+    domain.notify("error", `Alert: ${record.message}`, "LogError");
+  }
+}, { level: "WARNING" });
+
+// 接收主机遥测指标并转发至实时仪表盘（SDK 自动提取上方注释作为处理器说明）
 domain.handler("report_metrics", async (msg) => {
-  // ❌ M5 违宪: console.log("metrics:", msg.data);
-  // ✅ M5 合规:
   domain.logger.info(`Received metrics from ${msg.data.host}`);
 
-  // ✅ 查询指定域的可用处理器列表及说明
-  const orderHandlers = await domain.queryHandlersAsync({ domain: "order_service" });
-  const createDoc = await domain.getHandlerDescriptionAsync("order_service.create_order");
+  // ✅ 1. 查询指定域的可用处理器列表与文档
+  const orderHandlers = await domain.registry.queryHandlers({ domain: "order_service" });
 
-  // ✅ M3 合规: 跨表只读查询其他域的数据（写操作仅限本域）
-  await domain.storageQueryAsync({ domain: "order_service", limit: 10 });
+  // ✅ 2. 跨表只读查询其他域的数据
+  const orders = await domain.storage.query({ domain: "order_service", limit: 10 });
 
-  // ✅ C2 合规: 高频状态同步使用 Volatile（纯内存账本，零磁盘 I/O）
+  // ✅ 3. 发射业务遥测指标
+  domain.telemetry.emit("host_load", msg.data.load, { host: msg.data.host });
+
+  // ✅ 4. 标准跨域消息投递
   await domain.send(["dashboard.refresh"], MSG_DELIVERY_VOLATILE, {}, msg.data);
-  return { status: "forwarded", createDoc, count: orderHandlers.count };
+  return { status: "forwarded", order_count: orders.length, handlers: orderHandlers.count };
 });
 
 domain.run();
@@ -124,7 +168,7 @@ domain.run();
 
 ---
 
-### 3. 提交前一键宪法自检（`--check`）
+### 4. 提交前一键宪法自检（`--check`）
 
 在提交代码或启动变体前，随时运行内置宪法检查器，自动扫描 `M1–M7` 机器宪法合规性（配置严格校验、域源码隔离扫描、`stdout` 管道污染检测、SQLite 表结构漂移检测）：
 

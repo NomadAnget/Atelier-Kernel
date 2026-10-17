@@ -18,16 +18,23 @@
 ### C2 · 两层消息结构与 10 类标准 `message_type` 契约
 - **上层为内核契约元数据**：包含 `logical_id`、`message_id`、`source_domain`、`targets`、`message_type`、`params`、`timestamp`。
 - **内层为业务数据包（`data`）**：标准 JSON 格式。业务数据结构演进、字段校验、前端数据脱敏等均由对应业务域自治，**内核行为与数据库表结构完全零感知**。
-- **`message_type` 三大类共 10 个标准值**：
-  1. **路由注册、注销与发现（`target = "kernel.registry"`）**：
-     - `RegisterHandlers`：注册本域处理器列表及说明（Python / Node.js SDK 自动提取处理器函数注释或 Docstring 作为说明，无需增加注册参数）；
-     - `UnregisterHandlers`：注销本域处理器；
-     - `QueryHandlers`：查询当前可用处理器列表及处理器说明（支持按 `domain`、`target`、`handler` 过滤）。
-  2. **存储即消息 CRUD（`target = "kernel.storage"`）**：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`
-  3. **域消息投递持久化策略（`target = "<domain>.<handler>"`）**：
+- **`message_type` 与内置基础设施契约**：
+  1. **跨域业务消息投递策略（`target = "<domain>.<handler>"`，严格 4-stage 回执闭环）**：
      - `Durable`：写入 SQLite 持久投递账本（`kernel_ledger`）+ 内存账本，支持跨重启状态恢复与审计（未显式指定时默认按 `Durable` 处理）；
      - `Volatile`：仅进入内存账本与实时观察器（`KernelObserver`），**零磁盘写入**；
      - `Ephemeral`：瞬态流式投递，不落盘，仅在途（In-Flight）驻留内存账本以完成四阶段回执，到达终态后立即自动从内存账本驱逐（$O(1)$ 内存开销）。
+  2. **内核 8 大内置基础设施（`target = "kernel.*"`，SDK 原生方法调用，不对外作为业务路由暴露）**：
+     - `kernel.registry`：`RegisterHandlers`、`UnregisterHandlers`、`QueryHandlers`（元数据发现，严格排除 `kernel.*`）；
+     - `kernel.storage`：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`（按域隔离存储）；
+     - `kernel.logger`：`QueryLogs`、`QueryProgress`、`SubscribeLogs`、`UnsubscribeLogs`（日志与进度查询/监听）；
+     - `kernel.telemetry`：`SubscribeTelemetry`、`UnsubscribeTelemetry`（高频遥测指标）；
+     - `kernel.notify`：`SubscribeNotify`、`UnsubscribeNotify`（系统告警通知广播）；
+     - `kernel.runtime`：`QueryRuntime`、`QueryDomainAssembly`（域运行态拓扑与装配查询）；
+     - `kernel.observer`：`QueryObserver`、`SubscribeObserver`、`UnsubscribeObserver`（生命周期观察与快照检索）；
+     - `kernel.supervisor`：`StartDomain`、`StopDomain`、`RestartDomain`、`UpdateDomain`（域进程管控与带探活的平滑滚动更新）。
+  3. **系统事件推流与零发布订阅约束**：
+     - 域与域之间**严禁发布订阅强绑定**，只允许精准单目标 RPC 通信；
+     - 仅有内核流（`LogEvent`、`TelemetryEvent`、`NotifyEvent`、`ObservationEvent`）由 SDK 原生方法监听，并强制采用 `DeliveryPolicy::Ephemeral` 瞬态直推（**零 Receipt 确认帧产生**，域断开或崩溃时内核自动解绑注销）。
 
 ### C3 · 四阶段回执与零盲发契约
 - **标准四阶段回执**：每条目标消息严格经历 `Sent`（已发出）$\rightarrow$ `Received`（已接收）$\rightarrow$ `Started`（开始执行）$\rightarrow$ `Completed`（执行完成），或进入异常终态 `TargetInvalid` / `ContractInvalid` / `ExecutionFailed`。

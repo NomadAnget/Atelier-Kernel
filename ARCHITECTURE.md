@@ -1,12 +1,12 @@
 # Atelier Kernel：Rust 单机多域微内核设计方案
 
-**文档版本：** V3.1（定稿实现基线）  
+**文档版本：** V3.2（全量基础设施与平滑更新基线）  
 **实现语言：** Rust（内核宿主与基础设施） / 语言无感（各业务域）  
-**系统定位：** 单机多域可组合系统内核基础设施（非分布式、零网络通信），负责接管域生命周期、生成全局消息 ID、保障逐目标幂等投递、跨域自动路由、四阶段状态回执、全局消息实时观察与按域数据存储。
+**系统定位：** 单机多域可组合系统内核基础设施（非分布式、零网络通信），负责接管域生命周期、生成全局消息 ID、保障逐目标幂等投递、跨域自动路由、四阶段状态回执、全局消息实时观察、按域数据存储以及原生基础设施方法提供。
 
 ---
 
-## 一、内核核心准则（9 条基线铁律）
+## 一、内核核心准则（11 条基线铁律）
 
 1. **非分布式、零网络通信**：系统为纯单机微内核架构，不监听任何 TCP/UDP/HTTP 网络端口。内核与各域之间仅通过操作系统内核态的**父子进程匿名管道（`stdin` / `stdout`）**按行传输标准 JSON 帧（JSON-Lines）。
 2. **域（Domain）为最小组装单元，生命周期由内核全权接管**：内核是系统的唯一启动入口与宿主，负责拉起（Spawn）、监控、重启和销毁各域子进程。任何语言编写的程序，只要能通过标准输入输出读写内核消息，即可成为一个合法的域。
@@ -19,9 +19,17 @@
    - **上层为内核契约元数据**：包含内核生成的 `message_id`、管道绑定的 `source_domain`、目标位置列表（`targets`）、消息类型（`message_type`）与参数列表（`params`），用于内核路由、幂等账本、回执关联和按域建表。
    - **内层为实际数据包（`data`）**：标准 JSON 格式。域内部业务数据结构的变化仅改变内层数据包结构，**内核行为与数据库表结构完全无差异**。
 9. **四阶段标准回执、实时观察与“存储即消息”**：
-   - 每条消息流转严格产出 **已发出（`Sent`）$\rightarrow$ 已接收（`Received`）$\rightarrow$ 开始执行（`Started`）$\rightarrow$ 执行完成（`Completed`）** 四阶段回执，发送端可接收全部状态。
-   - 内核内置专门的**消息观察组件（Observer）**，实时观测全系统所有消息状态。
-    - 内核以“域”为单位利用上层契约元数据自动建表，内层存标准 JSON 数据包；存储操作以 `message_type` 表示，**增、删、改、查（CRUD）完全等同于向内核发送一条标准消息**。写入操作（`StorageInsert` / `StorageUpdate` / `StorageDelete`）严格绑定物理管道所属域（禁止跨表写入），读取操作（`StorageQuery`）支持查询本域或通过 `params.domain` / `params.target_domain` 读取其他域表数据。
+   - 每条业务消息流转严格产出 **已发出（`Sent`）$\rightarrow$ 已接收（`Received`）$\rightarrow$ 开始执行（`Started`）$\rightarrow$ 执行完成（`Completed`）** 四阶段回执，发送端可接收全部状态。
+   - 内核以“域”为单位利用上层契约元数据自动建表，内层存标准 JSON 数据包；存储操作以 `message_type` 表示，**增、删、改、查（CRUD）完全等同于向内核发送一条标准消息**。写入操作严格绑定物理管道所属域（禁止跨表写入），读取操作支持通过 `params.domain` 跨表只读查询。
+10. **内核基础设施方法 vs 严格禁止域间发布订阅**：
+    - 内核将通用的系统级底层能力收敛为 8 大内置基础设施目标（`kernel.*`），直接作为多语言 SDK 的基础设施对象与方法提供，不作为外部可订阅的消息处理器。
+    - 业务路由列表（`available_handlers`）严格**排除**所有 `kernel.*` 处理器。
+    - **域间通信严格禁止 Pub-Sub 强绑定**，只允许点对点精确路由；只有内核流（日志、遥测、告警、观察者）可通过 SDK 原生方法监听，且全部采用 `DeliveryPolicy::Ephemeral` 瞬态推流，不占用账本、零收据产生，域断开连接时内核自动清理订阅。
+11. **候选隔离探活、平滑滚动更新与自动回滚（Zero Service Gap）**：
+    - 针对运行中域的更新，内核支持两阶段平滑滚动：拉起携带独立 `instance_id` 的候选版本进程，接入隔离管道并不承接任何业务流量。
+    - 内核对候选版本执行处理器就绪探测与主动 `probe_handler` 探活校验。
+    - 探活成功：原子切换路由，旧版本实例平滑移入 `Draining` 队列排干在途请求后终止，保障业务请求零中断、零间隙。
+    - 探活失败：立即销毁候选实例回收资源，原版本实例持续不受影响地对外服务，自动回滚。
 
 ---
 
@@ -29,17 +37,61 @@
 
 | 模块 | 源码文件 | 核心职责 |
 | :--- | :--- | :--- |
-| **核心协议与两层契约** | `src/protocol.rs` | 定义 `DomainToKernelFrame`、`KernelToDomainFrame`、`OutboundMessage`、`KernelMessage`、`MessageReceipt`、`ContractStatus` 及 `ObservationEvent`。 |
+| **核心协议与两层契约** | `src/protocol.rs` | 定义 `DomainToKernelFrame`、`KernelToDomainFrame`、`KernelMessage`、`MessageReceipt`、`ContractStatus`、`ObservationEvent` 及 8 大内置目标常量。 |
 | **ID 生成与三级幂等账本** | `src/ledger.rs` | 生成带内核实例 UUID 的唯一逻辑 ID 和子消息 ID；维护 `(source_domain, seq)` 提交幂等表与 `message_id` 四阶段单向状态机。 |
-| **实时消息观察组件** | `src/observer.rs` | 独立旁路观察器 `KernelObserver`，支持多订阅者实时流式观测与历史事件检索，不阻塞主投递链路。 |
+| **全局消息观察组件** | `src/observer.rs` | 独立旁路观察器 `KernelObserver`，支持多订阅者实时流式观测与历史事件快照检索，不阻塞主投递链路。 |
 | **按域存储引擎** | `src/storage.rs` | 基于 SQLite 的按域建表与“写隔离、读可跨表”存储引擎，响应 `StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete` 消息并产生标准四阶段回执。 |
-| **契约校验与自动路由器** | `src/router.rs` | 维护 `<domain>.<handler>` 路由表、执行 `TargetInvalid` 零盲发拦截、多目标独立分发、回执归属校验与状态推进。 |
-| **域宿主与管道生命周期** | `src/supervisor.rs` | 通过 OS `Stdio` 管道拉起多语言子进程、物理绑定 `domain_id` 身份、监控崩溃退出并自动触发 `ExecutionFailed` 恢复与自动重启。 |
+| **契约校验与自动路由器** | `src/router.rs` | 维护 `<domain>.<handler>` 路由表、执行 `TargetInvalid` 零盲发拦截、内置 8 大基础设施分发、系统流扇出与原子候选路由交接。 |
+| **域宿主与管道生命周期** | `src/supervisor.rs` | 通过 OS 匿名管道拉起子进程、物理绑定 `domain_id` 身份、代际隔离、崩溃自动恢复，以及**候选版本探活、灰度更新与自动回滚**。 |
 | **机器宪法与契约检查器** | `src/discipline.rs` | 实现机器宪法（M1–M7）静态与启动期执法（`atelier-kernel --check`），校验配置显式性、存储表结构防漂移及多语言域源码纪律。 |
-# Log origin contract (v0.1.1)
 
-Every log record exposes `source_domain`. For domain IPC frames the kernel overwrites this field with the authenticated pipe owner, regardless of any claimed origin. Captured stderr uses the supervised domain ID. Kernel-generated records use `kernel`. SQLite adds this nullable column without rewriting historical records; pre-upgrade rows remain null (unknown), never inferred from layer/component. History and SSE carry the same field; old SDKs remain compatible and need not provide it.
+---
 
-消息身份与拆分的现行契约见 [MESSAGE_IDENTITY.md](MESSAGE_IDENTITY.md)。每次提交共享 logical_id，每个目标拥有独立 message_id；不将内存账本承诺为跨重启 exactly-once。
+## 三、内核 8 大内置基础设施规范
 
-内核契约（C1–C3）与两级核心宪法（M1–M7 机器宪法 + B1–B6 行为规范）见 [CONSTITUTION.md](CONSTITUTION.md)。
+内核内置目标不属于任何业务域，由内核路由器直接接管处理，不向外界暴露为业务路由：
+
+### 1. `kernel.registry`（服务注册与元数据发现）
+- **接收消息类型**：`RegisterHandlers`, `UnregisterHandlers`, `QueryHandlers`
+- **说明**：域启动时自动通过 SDK 报备 handlers 列表及其文档注释；调用 `QueryHandlers` 可查询系统当前可用路由清单和方法说明。
+- **保护策略**：返回列表中严格排除所有 `kernel.*` 目标。
+
+### 2. `kernel.storage`（按域隔离存储即消息）
+- **接收消息类型**：`StorageInsert`, `StorageQuery`, `StorageUpdate`, `StorageDelete`
+- **说明**：按域自动建立 `store_<domain_id>` SQLite 数据表。写入类操作只允许操作本域数据表；读取类操作通过 `params.domain` 支持安全的跨域只读查询。
+
+### 3. `kernel.logger`（统一结构化日志与任务进度）
+- **接收消息类型**：`QueryLogs`, `QueryProgress`, `SubscribeLogs`, `UnsubscribeLogs`
+- **推流消息类型**：`LogEvent`（`DeliveryPolicy::Ephemeral`）
+- **说明**：各域通过专用管道向内核输出日志，杜绝标准输出污染；支持分级过滤（`level`）与来源过滤（`source_domain`）；支持长任务进度双向追踪与实时监听。
+
+### 4. `kernel.telemetry`（高频遥测指标与传感器流）
+- **接收消息类型**：`SubscribeTelemetry`, `UnsubscribeTelemetry`, 任意业务指标上报
+- **推流消息类型**：`TelemetryEvent`（`DeliveryPolicy::Ephemeral`）
+- **说明**：面向传感器数据、UI 刷新高频状态与系统性能指标，旁路推流，零 receipt 账单开销。
+
+### 5. `kernel.notify`（系统告警通知与事件广播）
+- **接收消息类型**：`SubscribeNotify`, `UnsubscribeNotify`, 任意告警消息
+- **推流消息类型**：`NotifyEvent`（`DeliveryPolicy::Ephemeral`）
+- **说明**：支持各域广播通知或触发严重告警（`severity`：info / warning / error / critical），推送到所有已订阅管道。
+
+### 6. `kernel.runtime`（域运行态拓扑与装配查询）
+- **接收消息类型**：`QueryRuntime`, `QueryDomainAssembly`
+- **说明**：提供当前内核所有受托管域的活跃状态、当前代际 `instance_id`、已就绪的路由列表、OS 进程信息（PID、启动命令、工作目录、重启策略与已重启计数）。
+
+### 7. `kernel.observer`（全局消息生命周期观察与快照）
+- **接收消息类型**：`QueryObserver`, `SubscribeObserver`, `UnsubscribeObserver`
+- **推流消息类型**：`ObservationEvent`（`DeliveryPolicy::Ephemeral`）
+- **说明**：允许审计与监控域检索内核全局消息最近的处理快照（支持按 `message_id`, `target`, `source_domain` 过滤）；支持实时流式监听全局消息状态变更事件，且在域异常断开时内核自动注销清理。
+
+### 8. `kernel.supervisor`（域生命周期管理与平滑更新）
+- **接收消息类型**：`StartDomain`, `StopDomain`, `RestartDomain`, `UpdateDomain`
+- **说明**：提供对指定域的显式拉起、受控停止（显式停止不触发崩溃自动重启）和重启；`UpdateDomain` 执行带候选实例探测验证的平滑滚动更新与自动回滚。
+
+---
+
+## 四、消息身份、日志与契约规范索引
+
+- **日志来源契约**：详见 [CONSTITUTION.md](CONSTITUTION.md) 中的 `M5`。所有日志记录强制注入内核认证的 `source_domain`，禁止伪造。
+- **消息身份契约**：详见 [MESSAGE_IDENTITY.md](MESSAGE_IDENTITY.md)。每次提交共享 `logical_id`，每个目标拥有独立 `message_id`。
+- **SDK 责任边界**：详见 [SDK_CONTRACT.md](SDK_CONTRACT.md)。SDK 负责协议适配与基础设施客户端封装，不包含业务验证或私有准入队列。

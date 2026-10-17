@@ -8,11 +8,7 @@ use atelier_kernel::{
 use serde_json::json;
 
 fn python_cmd() -> &'static str {
-    if cfg!(windows) {
-        "python"
-    } else {
-        "python3"
-    }
+    if cfg!(windows) { "python" } else { "python3" }
 }
 
 const PY_IPC_PREAMBLE: &str = r#"
@@ -952,41 +948,55 @@ for _ in ipc_in:
 fn test_auto_restart_respects_max_restarts_limit() {
     let kernel = AtelierKernel::new_in_memory().unwrap();
 
-    // Command that immediately fails every time
-    kernel
-        .spawn_process_domain(DomainProcessSpec {
-            domain_id: "doomed_domain".to_string(),
-            command: python_cmd().to_string(),
-            args: vec!["-c".to_string(), "import sys; sys.exit(1)".to_string()],
-            working_dir: None,
-            auto_restart: true,
-            max_restarts: Some(2),
-            restart_delay_ms: 30,
-        })
-        .expect("Spawn doomed_domain");
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join(format!("restart-limit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let starts = dir.join("starts.txt");
+    // Deliberately slower than the former 200ms test budget; count actual starts,
+    // not merely a scheduler counter (which includes the denied final attempt).
+    kernel.spawn_process_domain(DomainProcessSpec {
+        domain_id: "doomed_domain".to_string(),
+        command: python_cmd().to_string(),
+        args: vec!["-c".into(),
+            "import sys,time; f=open(sys.argv[1],'a'); f.write('start\\n'); f.close(); time.sleep(0.12); sys.exit(1)".into(),
+            starts.to_string_lossy().into_owned()],
+        working_dir: None,
+        auto_restart: true,
+        max_restarts: Some(2),
+        restart_delay_ms: 30,
+    }).expect("Spawn doomed_domain");
 
-    // Wait for retries to exhaust
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        if kernel.supervisor().restart_count("doomed_domain") >= 2
-            && kernel.router().domain_status("doomed_domain") == Some(DomainStatus::Faulted)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while kernel.supervisor().restart_count("doomed_domain") < 3
+        || kernel.router().domain_status("doomed_domain") != Some(DomainStatus::Faulted)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restart exhaustion timed out: count={}, status={:?}, starts={:?}",
+            kernel.supervisor().restart_count("doomed_domain"),
+            kernel.router().domain_status("doomed_domain"),
+            std::fs::read_to_string(&starts)
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
-
-    // Verify it attempted restarts up to limit and stopped
-    let count = kernel.supervisor().restart_count("doomed_domain");
-    assert!(
-        count >= 2,
-        "Expected at least 2 restart attempts, got {}",
-        count
+    assert_eq!(
+        std::fs::read_to_string(&starts).unwrap().lines().count(),
+        3,
+        "must launch the initial process plus exactly two replacements"
+    );
+    let final_instance = kernel.router().domain_instance_id("doomed_domain");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(kernel.supervisor().restart_count("doomed_domain"), 3);
+    assert_eq!(
+        kernel.router().domain_instance_id("doomed_domain"),
+        final_instance
     );
     assert_eq!(
         kernel.router().domain_status("doomed_domain"),
         Some(DomainStatus::Faulted)
     );
+    assert_eq!(std::fs::read_to_string(&starts).unwrap().lines().count(), 3);
 }
 
 /// 11. Tests the three built-in delivery persistence message types:
@@ -1520,7 +1530,10 @@ for raw in ipc_in:
     let _ = kernel.supervisor().stop_process_domain("blocked_domain");
     let _ = kernel.supervisor().stop_process_domain("healthy_domain");
 
-    for id in blocked_msg_ids.iter().chain(std::iter::once(&fanout_blocked_id)) {
+    for id in blocked_msg_ids
+        .iter()
+        .chain(std::iter::once(&fanout_blocked_id))
+    {
         let rec = kernel
             .ledger()
             .get_record(id, "blocked_domain.hang")
@@ -1607,7 +1620,11 @@ const rawFd = process.env.ATELIER_IPC_READ_FD;
 
     let rep_code = check_constitution(&domains_dir);
     assert!(!rep_code.is_ok());
-    let rules: Vec<&str> = rep_code.violations.iter().map(|v| v.rule.as_str()).collect();
+    let rules: Vec<&str> = rep_code
+        .violations
+        .iter()
+        .map(|v| v.rule.as_str())
+        .collect();
     assert_eq!(rules.iter().filter(|&&r| r == "M4").count(), 4);
     assert_eq!(rules.iter().filter(|&&r| r == "M5").count(), 2);
 
@@ -1699,7 +1716,10 @@ fn test_query_available_handlers_and_auto_comment_descriptions() {
 
     // 1. Check direct KernelRouter API for Python & Node.js handler descriptions
     assert_eq!(
-        kernel.router().handler_description("order.create").as_deref(),
+        kernel
+            .router()
+            .handler_description("order.create")
+            .as_deref(),
         Some("创建销售订单并持久化到本域存储表 store_order")
     );
     assert_eq!(
@@ -1784,7 +1804,3 @@ fn test_query_available_handlers_and_auto_comment_descriptions() {
     kernel.supervisor().stop_process_domain("order");
     kernel.supervisor().stop_process_domain("inventory");
 }
-
-
-
-

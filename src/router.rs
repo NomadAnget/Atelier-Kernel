@@ -31,6 +31,9 @@ struct DomainEntry {
 /// enforces three-level idempotency, intercepts invalid targets (`TargetInvalid`),
 /// routes 4-stage receipts, and dispatches storage messages.
 pub struct KernelRouter {
+    /// Serialize delivery transitions and publication to caller/observer together.
+    /// Dedicated pipe I/O runs outside this gate on supervisor pump threads.
+    receipt_publication: Mutex<()>,
     next_instance_id: AtomicU64,
     /// Per-domain serialization gate that closes the TOCTOU window between checking `instance_id`
     /// and processing an inbound frame or replacing a domain generation via `attach_domain_pipe`.
@@ -52,6 +55,7 @@ impl KernelRouter {
         logger: Arc<KernelLogHub>,
     ) -> Self {
         Self {
+            receipt_publication: Mutex::new(()),
             next_instance_id: AtomicU64::new(1),
             domain_gates: RwLock::new(HashMap::new()),
             domains: RwLock::new(HashMap::new()),
@@ -369,6 +373,9 @@ impl KernelRouter {
             self.ledger
                 .allocate_submission(authenticated_domain, outbound.seq, targets.len());
         if duplicate {
+            // Snapshot and replay under the publication gate too: otherwise a
+            // stale replay can arrive after a newer live receipt.
+            let _publication = self.receipt_publication.lock();
             for receipt in self.ledger.receipts_for_logical(&logical_id) {
                 self.send_to_domain_pipe(
                     authenticated_domain,
@@ -721,12 +728,13 @@ impl KernelRouter {
     /// Validates and routes a message targeting a business domain handler (`"<domain>.<handler>"`).
     /// If the target does not exist or is not Active, does NOT send the message and immediately returns `TargetInvalid`.
     fn dispatch_domain_target(&self, source_domain: &str, seq: u64, msg: KernelMessage) {
+        let publication = self.receipt_publication.lock();
         let target = msg.target.clone();
 
         // Check route table and target domain active pipe along with its generation `instance_id`.
         let target_pipe_opt = {
-            let routes = self.routes.read();
             let domains = self.domains.read();
+            let routes = self.routes.read();
             routes.get(&target).and_then(|target_domain| {
                 domains.get(target_domain).and_then(|entry| {
                     if entry.status == DomainStatus::Active {
@@ -792,6 +800,8 @@ impl KernelRouter {
             .is_err()
         {
             // Target pipe broke right as we tried to send; only fault if `target_instance_id` is still current.
+            // Fault publication takes the same gate, so release it before delegating.
+            drop(publication);
             if let Some((target_domain, _)) = parse_target_address(&target) {
                 self.mark_domain_faulted_for_instance(
                     target_domain,
@@ -824,6 +834,8 @@ impl KernelRouter {
         if !inbound.status.is_valid_inbound_receipt() {
             return;
         }
+
+        let _publication = self.receipt_publication.lock();
 
         match self.ledger.advance_status(
             reporting_domain,
@@ -871,6 +883,7 @@ impl KernelRouter {
         expected_instance_id: Option<u64>,
         reason: &str,
     ) -> bool {
+        let _publication = self.receipt_publication.lock();
         {
             let mut domains = self.domains.write();
             let mut routes = self.routes.write();

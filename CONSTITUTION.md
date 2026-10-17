@@ -31,6 +31,7 @@
 
 ### C3 · 四阶段回执与零盲发契约
 - **标准四阶段回执**：每条目标消息严格经历 `Sent`（已发出）$\rightarrow$ `Received`（已接收）$\rightarrow$ `Started`（开始执行）$\rightarrow$ `Completed`（执行完成），或进入异常终态 `TargetInvalid` / `ContractInvalid` / `ExecutionFailed`。
+- **发布顺序与账本一致**：独立双匿名管道的收发线程并行工作；初次投递、回执推进与故障终结在内核内串行完成状态推进和回执发布，保证发送端和观察器均不先看到后续阶段再看到 `Sent`。串行区不执行域业务，不等待子进程实际读写管道；SDK 不承担回执重排。
 - **零盲发前置拦截**：当目标 `<domain>.<handler>` 不存在或目标域未处于 `Active` 就绪态时，内核**绝不向管道盲发消息**，立即前置拦截并向发送端返回 `TargetInvalid`。
 
 ---

@@ -268,6 +268,22 @@ class DomainLogger:
         }
         self._domain._emit_log(record)
 
+    def query_logs(self, *args: Any, **kwargs: Any) -> Any:
+        """Queries persisted logs from SQLite hub_logs via kernel.logger."""
+        return self._domain.query_logs(*args, **kwargs)
+
+    async def query_logs_async(self, *args: Any, **kwargs: Any) -> Any:
+        """Asynchronously queries persisted logs from SQLite hub_logs via kernel.logger."""
+        return await self._domain.query_logs_async(*args, **kwargs)
+
+    def query_progress(self, *args: Any, **kwargs: Any) -> Any:
+        """Queries active in-flight task progress indicators via kernel.logger."""
+        return self._domain.query_progress(*args, **kwargs)
+
+    async def query_progress_async(self, *args: Any, **kwargs: Any) -> Any:
+        """Asynchronously queries active task progress indicators via kernel.logger."""
+        return await self._domain.query_progress_async(*args, **kwargs)
+
 
 class _StdlibLoggingHandler(logging.Handler):
     """Bridges standard Python `logging` into AtelierDomain's structured logger."""

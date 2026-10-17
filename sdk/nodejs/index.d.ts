@@ -75,6 +75,10 @@ export class DomainLogger {
   critical(msg: any, opts?: LogOptions): void;
   phase(level: string, phaseName: string, msg: any, opts?: LogOptions): void;
   progress(msg: any, options?: ProgressOptions): void;
+  queryLogs(options?: QueryLogsOptions, requestOptions?: RequestOptions): Promise<QueryLogsResponse>;
+  queryLogsAsync(options?: QueryLogsOptions, requestOptions?: RequestOptions): Promise<QueryLogsResponse>;
+  queryProgress(requestOptions?: RequestOptions): Promise<QueryProgressResponse>;
+  queryProgressAsync(requestOptions?: RequestOptions): Promise<QueryProgressResponse>;
 }
 
 export class DomainExecutionFailed extends Error {

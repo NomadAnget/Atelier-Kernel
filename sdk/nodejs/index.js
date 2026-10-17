@@ -188,6 +188,34 @@ class DomainLogger {
     };
     this._domain._emitLog(record);
   }
+
+  queryLogs(options = {}, ...args) {
+    if (typeof this._domain.queryLogsAsync === "function") {
+      return this._domain.queryLogsAsync(options, ...args);
+    }
+    return this._domain.queryLogs(options, ...args);
+  }
+
+  queryLogsAsync(options = {}, ...args) {
+    if (typeof this._domain.queryLogsAsync === "function") {
+      return this._domain.queryLogsAsync(options, ...args);
+    }
+    return this._domain.queryLogs(options, ...args);
+  }
+
+  queryProgress(options = {}, ...args) {
+    if (typeof this._domain.queryProgressAsync === "function") {
+      return this._domain.queryProgressAsync(options, ...args);
+    }
+    return this._domain.queryProgress(options, ...args);
+  }
+
+  queryProgressAsync(options = {}, ...args) {
+    if (typeof this._domain.queryProgressAsync === "function") {
+      return this._domain.queryProgressAsync(options, ...args);
+    }
+    return this._domain.queryProgress(options, ...args);
+  }
 }
 
 class DomainTelemetry {

@@ -62,10 +62,12 @@ async def infra_test(msg):
     res_runtime = await d.runtime.query(domain="domain_alpha")
     res_observer = await d.observer.query(limit=50)
     res_supervisor = await d.supervisor.update(domain="domain_alpha", probe_handler="ping", timeout_ms=3000)
+    res_logger = await d.logger.query_logs_async(level="WARNING", limit=10)
     return {
         "runtime": res_runtime,
         "observer": res_observer,
         "supervisor": res_supervisor,
+        "logger": res_logger,
     }
 
 d.run()
@@ -115,10 +117,12 @@ d.handler("infra_test", async () => {
   const resRuntime = await d.runtime.query({ domain: "domain_alpha" });
   const resObserver = await d.observer.query({ limit: 50 });
   const resSupervisor = await d.supervisor.update("domain_alpha", { probeHandler: "ping", timeoutMs: 3000 });
+  const resLogger = await d.logger.queryLogsAsync({ level: "WARNING", limit: 10 });
   return {
     runtime: resRuntime,
     observer: resObserver,
     supervisor: resSupervisor,
+    logger: resLogger,
   };
 });
 
@@ -400,6 +404,18 @@ def run_scenario(lang, code):
                         "data": {"success": True, "domain": "domain_alpha", "action": "update"},
                     }) + "\n")
                     in_file.flush()
+                elif target == "kernel.logger":
+                    assert f.get("params", {}).get("level") == "WARNING"
+                    assert f.get("params", {}).get("limit") == 10
+                    in_file.write(json.dumps({
+                        "frame_type": "receipt",
+                        "seq": seq,
+                        "message_id": mid,
+                        "target": "kernel.logger",
+                        "status": "completed",
+                        "data": {"logs": [{"level": "WARNING", "message": "disk high"}], "total": 1},
+                    }) + "\n")
+                    in_file.flush()
             elif f.get("frame_type") == "receipt" and f.get("message_id") == "rpc_infra_1" and f.get("status") == "completed":
                 infra_completed_data = f.get("data")
                 break
@@ -419,7 +435,8 @@ def run_scenario(lang, code):
     assert infra_completed_data["runtime"]["domain"]["domain_id"] == "domain_alpha"
     assert infra_completed_data["observer"] == [{"topic": "msg_delivered", "target": "domain_alpha.ping"}]
     assert infra_completed_data["supervisor"]["success"] is True
-    print(f"  [{lang}] Verified runtime, observer, and supervisor native client RPC roundtrips")
+    assert infra_completed_data["logger"]["total"] == 1
+    print(f"  [{lang}] Verified runtime, observer, supervisor, and logger native client RPC roundtrips")
 
     proc.terminate()
     try:

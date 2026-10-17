@@ -18,6 +18,46 @@ pub const MSG_STORAGE_QUERY: &str = "StorageQuery";
 pub const MSG_STORAGE_UPDATE: &str = "StorageUpdate";
 pub const MSG_STORAGE_DELETE: &str = "StorageDelete";
 
+/// Built-in domain message delivery persistence / QoS types.
+pub const MSG_DELIVERY_DURABLE: &str = "Durable";
+pub const MSG_DELIVERY_VOLATILE: &str = "Volatile";
+pub const MSG_DELIVERY_EPHEMERAL: &str = "Ephemeral";
+
+/// Delivery persistence policy resolved from `message_type` for domain messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryPolicy {
+    /// Persisted to the SQLite `kernel_ledger` table and retained in the in-memory ledger.
+    Durable,
+    /// Tracked in the in-memory ledger and observer only; never written to SQLite `kernel_ledger`.
+    Volatile,
+    /// High-frequency transient stream: tracked in-memory only while in-flight, never written to SQLite,
+    /// and automatically evicted from the in-memory ledger upon reaching a terminal status.
+    Ephemeral,
+}
+
+impl DeliveryPolicy {
+    /// Resolves the delivery persistence policy from `target` and `message_type`.
+    pub fn resolve(target: &str, message_type: &str) -> Self {
+        if target == KERNEL_REGISTRY_TARGET || target == KERNEL_STORAGE_TARGET {
+            return Self::Volatile;
+        }
+        Self::from_message_type(message_type)
+    }
+
+    /// Maps a `message_type` string to its `DeliveryPolicy`.
+    /// Defaults custom business message types to `Durable` for backwards compatibility.
+    pub fn from_message_type(message_type: &str) -> Self {
+        if message_type.eq_ignore_ascii_case(MSG_DELIVERY_VOLATILE) {
+            Self::Volatile
+        } else if message_type.eq_ignore_ascii_case(MSG_DELIVERY_EPHEMERAL) {
+            Self::Ephemeral
+        } else {
+            Self::Durable
+        }
+    }
+}
+
 /// Lifecycle states of a managed Domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -19,12 +19,32 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 __version__ = "0.1.3"
+
+MSG_REGISTER_HANDLERS = "RegisterHandlers"
+MSG_UNREGISTER_HANDLERS = "UnregisterHandlers"
+MSG_STORAGE_INSERT = "StorageInsert"
+MSG_STORAGE_QUERY = "StorageQuery"
+MSG_STORAGE_UPDATE = "StorageUpdate"
+MSG_STORAGE_DELETE = "StorageDelete"
+MSG_DELIVERY_DURABLE = "Durable"
+MSG_DELIVERY_VOLATILE = "Volatile"
+MSG_DELIVERY_EPHEMERAL = "Ephemeral"
+
 __all__ = [
     "AtelierDomain",
     "DeliveryMessage",
     "DomainExecutionFailed",
     "DomainLogger",
     "DomainRequestError",
+    "MSG_DELIVERY_DURABLE",
+    "MSG_DELIVERY_EPHEMERAL",
+    "MSG_DELIVERY_VOLATILE",
+    "MSG_REGISTER_HANDLERS",
+    "MSG_STORAGE_DELETE",
+    "MSG_STORAGE_INSERT",
+    "MSG_STORAGE_QUERY",
+    "MSG_STORAGE_UPDATE",
+    "MSG_UNREGISTER_HANDLERS",
     "__version__",
 ]
 

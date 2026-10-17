@@ -17,8 +17,9 @@ pub use logging::{KernelLogHub, LogFramePayload, LogRecord, LogStore};
 pub use observer::KernelObserver;
 pub use web_frontend::WebFrontendDomain;
 pub use protocol::{
-    ContractStatus, DomainStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
-    KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame, MSG_REGISTER_HANDLERS,
+    ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, InboundReceipt,
+    KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame,
+    MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_REGISTER_HANDLERS,
     MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
     MSG_UNREGISTER_HANDLERS, MessageReceipt, ObservationEvent, OutboundMessage,
 };
@@ -47,20 +48,25 @@ pub struct AtelierKernel {
 impl AtelierKernel {
     /// Creates a new Atelier Kernel backed by an in-memory SQLite database.
     pub fn new_in_memory() -> Result<Self, StorageError> {
+        let ledger = Arc::new(KernelLedger::open_with_db(None)?);
         let storage = Arc::new(DomainStorageEngine::new_in_memory()?);
         let logger = Arc::new(KernelLogHub::new(None)?);
-        Ok(Self::from_components(storage, logger))
+        Ok(Self::from_components(ledger, storage, logger))
     }
 
     /// Creates a new Atelier Kernel backed by a persistent SQLite database file.
     pub fn open_with_db(db_path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let ledger = Arc::new(KernelLedger::open_with_db(Some(db_path.as_ref()))?);
         let storage = Arc::new(DomainStorageEngine::open_file(db_path.as_ref())?);
         let logger = Arc::new(KernelLogHub::new(Some(db_path.as_ref()))?);
-        Ok(Self::from_components(storage, logger))
+        Ok(Self::from_components(ledger, storage, logger))
     }
 
-    fn from_components(storage: Arc<DomainStorageEngine>, logger: Arc<KernelLogHub>) -> Self {
-        let ledger = Arc::new(KernelLedger::new());
+    fn from_components(
+        ledger: Arc<KernelLedger>,
+        storage: Arc<DomainStorageEngine>,
+        logger: Arc<KernelLogHub>,
+    ) -> Self {
         let observer = Arc::new(KernelObserver::default());
         let router = Arc::new(KernelRouter::new(
             Arc::clone(&ledger),

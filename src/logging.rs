@@ -147,8 +147,8 @@ impl LogStore {
                 }
                 let w = Connection::open(path)?;
                 let r = Connection::open(path)?;
-                w.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
-                r.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+                w.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
+                r.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
                 (w, r)
             }
             None => {

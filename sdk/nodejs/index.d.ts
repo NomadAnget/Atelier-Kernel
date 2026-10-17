@@ -126,3 +126,13 @@ export class DomainRequestError extends Error {
   readonly message_id: string | null;
   constructor(status: string, data?: any, messageId?: string | null);
 }
+
+export const MSG_REGISTER_HANDLERS: "RegisterHandlers";
+export const MSG_UNREGISTER_HANDLERS: "UnregisterHandlers";
+export const MSG_STORAGE_INSERT: "StorageInsert";
+export const MSG_STORAGE_QUERY: "StorageQuery";
+export const MSG_STORAGE_UPDATE: "StorageUpdate";
+export const MSG_STORAGE_DELETE: "StorageDelete";
+export const MSG_DELIVERY_DURABLE: "Durable";
+export const MSG_DELIVERY_VOLATILE: "Volatile";
+export const MSG_DELIVERY_EPHEMERAL: "Ephemeral";

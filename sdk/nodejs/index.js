@@ -214,9 +214,28 @@ class AtelierDomain {
    */
 }
 
+const MSG_REGISTER_HANDLERS = "RegisterHandlers";
+const MSG_UNREGISTER_HANDLERS = "UnregisterHandlers";
+const MSG_STORAGE_INSERT = "StorageInsert";
+const MSG_STORAGE_QUERY = "StorageQuery";
+const MSG_STORAGE_UPDATE = "StorageUpdate";
+const MSG_STORAGE_DELETE = "StorageDelete";
+const MSG_DELIVERY_DURABLE = "Durable";
+const MSG_DELIVERY_VOLATILE = "Volatile";
+const MSG_DELIVERY_EPHEMERAL = "Ephemeral";
+
 module.exports = {
   ...require("./runtime").enhance(AtelierDomain, DomainRequestError, DomainExecutionFailed),
   DomainExecutionFailed,
   DomainLogger,
   DomainRequestError,
+  MSG_DELIVERY_DURABLE,
+  MSG_DELIVERY_EPHEMERAL,
+  MSG_DELIVERY_VOLATILE,
+  MSG_REGISTER_HANDLERS,
+  MSG_STORAGE_DELETE,
+  MSG_STORAGE_INSERT,
+  MSG_STORAGE_QUERY,
+  MSG_STORAGE_UPDATE,
+  MSG_UNREGISTER_HANDLERS,
 };

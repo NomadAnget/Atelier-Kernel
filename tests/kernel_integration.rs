@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use atelier_kernel::{
     AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KernelToDomainFrame,
-    MSG_STORAGE_DELETE, MSG_STORAGE_QUERY,
+    MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_STORAGE_DELETE,
+    MSG_STORAGE_QUERY,
 };
 use serde_json::json;
 
@@ -945,3 +946,556 @@ fn test_auto_restart_respects_max_restarts_limit() {
         Some(DomainStatus::Faulted)
     );
 }
+
+/// 11. Tests the three built-in delivery persistence message types:
+/// `Durable` (SQLite + memory), `Volatile` (memory only), and `Ephemeral` (in-flight memory only, evicted on completion).
+#[test]
+fn test_delivery_persistence_message_types_durable_volatile_ephemeral() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join(format!("ledger-policy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("kernel.db");
+
+    let durable_id;
+    let volatile_id;
+    let ephemeral_id;
+
+    {
+        let kernel = AtelierKernel::open_with_db(&db_path).unwrap();
+        let sender = kernel.attach_domain("sender");
+        let worker = kernel.attach_domain("worker");
+        worker.register_handlers(&["run"]);
+        let _ = worker.drain_frames();
+
+        // 1. Durable message: persisted in SQLite `kernel_ledger` and retained in memory
+        durable_id = sender.send_one(
+            vec!["worker.run".to_string()],
+            MSG_DELIVERY_DURABLE,
+            json!({}),
+            json!({"job": "durable-1"}),
+        );
+        assert_eq!(
+            kernel
+                .ledger()
+                .get_persisted_record(&durable_id)
+                .unwrap()
+                .status,
+            ContractStatus::Sent
+        );
+        worker.report_receipt(&durable_id, "worker.run", ContractStatus::Received, None);
+        worker.report_receipt(&durable_id, "worker.run", ContractStatus::Started, None);
+        worker.report_receipt(
+            &durable_id,
+            "worker.run",
+            ContractStatus::Completed,
+            Some(json!({"ok": "durable"})),
+        );
+        assert_eq!(
+            kernel
+                .ledger()
+                .get_record(&durable_id, "worker.run")
+                .unwrap()
+                .status,
+            ContractStatus::Completed
+        );
+        assert_eq!(
+            kernel
+                .ledger()
+                .get_persisted_record(&durable_id)
+                .unwrap()
+                .status,
+            ContractStatus::Completed
+        );
+
+        // 2. Volatile message: retained in memory, NEVER written to SQLite `kernel_ledger`
+        volatile_id = sender.send_one(
+            vec!["worker.run".to_string()],
+            MSG_DELIVERY_VOLATILE,
+            json!({}),
+            json!({"job": "volatile-1"}),
+        );
+        assert!(kernel.ledger().get_persisted_record(&volatile_id).is_none());
+        worker.report_receipt(&volatile_id, "worker.run", ContractStatus::Received, None);
+        worker.report_receipt(&volatile_id, "worker.run", ContractStatus::Started, None);
+        worker.report_receipt(
+            &volatile_id,
+            "worker.run",
+            ContractStatus::Completed,
+            Some(json!({"ok": "volatile"})),
+        );
+        assert_eq!(
+            kernel
+                .ledger()
+                .get_record(&volatile_id, "worker.run")
+                .unwrap()
+                .status,
+            ContractStatus::Completed
+        );
+        assert!(kernel.ledger().get_persisted_record(&volatile_id).is_none());
+
+        // 3. Ephemeral message: tracked in memory while in-flight, NEVER written to SQLite,
+        // and automatically evicted from memory once Completed.
+        ephemeral_id = sender.send_one(
+            vec!["worker.run".to_string()],
+            MSG_DELIVERY_EPHEMERAL,
+            json!({}),
+            json!({"token": "stream-1"}),
+        );
+        assert!(
+            kernel
+                .ledger()
+                .get_record(&ephemeral_id, "worker.run")
+                .is_some(),
+            "Ephemeral message must be tracked in-memory while in-flight"
+        );
+        assert!(
+            kernel
+                .ledger()
+                .get_persisted_record(&ephemeral_id)
+                .is_none(),
+            "Ephemeral message must never be persisted to SQLite"
+        );
+        worker.report_receipt(&ephemeral_id, "worker.run", ContractStatus::Received, None);
+        worker.report_receipt(&ephemeral_id, "worker.run", ContractStatus::Started, None);
+        worker.report_receipt(
+            &ephemeral_id,
+            "worker.run",
+            ContractStatus::Completed,
+            Some(json!({"ok": "ephemeral"})),
+        );
+        assert!(
+            kernel
+                .ledger()
+                .get_record(&ephemeral_id, "worker.run")
+                .is_none(),
+            "Ephemeral message must be evicted from in-memory ledger upon reaching terminal status"
+        );
+        assert_eq!(kernel.ledger().persisted_count(), 1);
+    }
+
+    // Reopen kernel with the same SQLite database file: only the Durable delivery record survives across restart.
+    let reopened = AtelierKernel::open_with_db(&db_path).unwrap();
+    assert_eq!(reopened.ledger().persisted_count(), 1);
+    let recovered = reopened
+        .ledger()
+        .get_record(&durable_id, "worker.run")
+        .expect("Durable delivery record should be reloaded from SQLite on reopen");
+    assert_eq!(recovered.status, ContractStatus::Completed);
+    assert_eq!(recovered.data, Some(json!({"ok": "durable"})));
+    assert!(
+        reopened
+            .ledger()
+            .get_record(&volatile_id, "worker.run")
+            .is_none()
+    );
+    assert!(
+        reopened
+            .ledger()
+            .get_record(&ephemeral_id, "worker.run")
+            .is_none()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 12. Concurrency Stress Test:
+/// Multi-threaded senders and workers concurrently dispatching `Durable`, `Volatile`, `Ephemeral`,
+/// fan-out, and `kernel.storage` CRUD messages against a file-backed SQLite kernel.
+#[test]
+fn test_concurrent_multidomain_stress() {
+    use std::sync::{Arc, Barrier};
+
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tmp")
+        .join(format!("stress-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("stress.db");
+
+    let kernel = Arc::new(AtelierKernel::open_with_db(&db_path).unwrap());
+    kernel.logger().set_console_enabled(false);
+
+    let num_workers = 4usize;
+    let num_senders = 8usize;
+    let msgs_per_sender = 60usize; // 480 outbound submissions (20 Durable, 20 Volatile, 20 Ephemeral per sender)
+
+    // Attach and register 4 worker domains, each driven by its own background thread
+    let mut worker_handles = Vec::new();
+    for w_idx in 0..num_workers {
+        let w_name = format!("worker_{w_idx}");
+        let client = kernel.attach_domain(&w_name);
+        client.register_handlers(&["process"]);
+        let _ = client.drain_frames();
+
+        let expected_deliveries = (num_senders * msgs_per_sender) / num_workers;
+        worker_handles.push(std::thread::spawn(move || {
+            let mut handled = 0usize;
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while handled < expected_deliveries && std::time::Instant::now() < deadline {
+                let frames = client.drain_frames();
+                if frames.is_empty() {
+                    std::thread::yield_now();
+                    continue;
+                }
+                for frame in frames {
+                    if let KernelToDomainFrame::Deliver(msg) = frame {
+                        client.report_receipt(
+                            &msg.message_id,
+                            &msg.target,
+                            ContractStatus::Received,
+                            None,
+                        );
+                        client.report_receipt(
+                            &msg.message_id,
+                            &msg.target,
+                            ContractStatus::Started,
+                            None,
+                        );
+                        client.report_receipt(
+                            &msg.message_id,
+                            &msg.target,
+                            ContractStatus::Completed,
+                            Some(json!({"worker": w_name, "seq": handled})),
+                        );
+                        handled += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                handled, expected_deliveries,
+                "Worker {w_name} did not receive all expected deliveries"
+            );
+        }));
+    }
+
+    let barrier = Arc::new(Barrier::new(num_senders));
+    let mut sender_handles = Vec::new();
+
+    for s_idx in 0..num_senders {
+        let k = Arc::clone(&kernel);
+        let b = Arc::clone(&barrier);
+        sender_handles.push(std::thread::spawn(move || {
+            let s_name = format!("sender_{s_idx}");
+            let client = k.attach_domain(&s_name);
+            client.register_handlers(&["noop"]);
+            let _ = client.drain_frames();
+
+            let mut durable_ids = Vec::new();
+            let mut volatile_ids = Vec::new();
+            let mut ephemeral_ids = Vec::new();
+
+            b.wait();
+
+            for i in 0..msgs_per_sender {
+                let target_worker = (s_idx + i) % num_workers;
+                let target = format!("worker_{target_worker}.process");
+                let msg_type = match i % 3 {
+                    0 => MSG_DELIVERY_DURABLE,
+                    1 => MSG_DELIVERY_VOLATILE,
+                    _ => MSG_DELIVERY_EPHEMERAL,
+                };
+                let mid = client.send_one(
+                    vec![target.clone()],
+                    msg_type,
+                    json!({"sender": s_idx, "idx": i}),
+                    json!({"payload": i}),
+                );
+                match i % 3 {
+                    0 => durable_ids.push((mid, target)),
+                    1 => volatile_ids.push((mid, target)),
+                    _ => ephemeral_ids.push((mid, target)),
+                }
+
+                // Interleave concurrent domain storage writes every 10 messages
+                if i % 10 == 0 {
+                    let _ = client.storage_insert(
+                        json!({"record_id": format!("rec_{s_idx}_{i}"), "category": "stress_cat", "upsert": true}),
+                        json!({"v": i}),
+                    );
+                }
+            }
+
+            // Wait until all 4-stage `Completed` receipts arrive at this sender
+            let mut completed_count = 0usize;
+            // Expect `msgs_per_sender` worker completions + `msgs_per_sender / 10` storage completions
+            let expected_completed = msgs_per_sender + (msgs_per_sender / 10);
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            while completed_count < expected_completed && std::time::Instant::now() < deadline {
+                let frames = client.drain_frames();
+                if frames.is_empty() {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                for frame in frames {
+                    if let KernelToDomainFrame::Receipt(r) = frame
+                        && r.status == ContractStatus::Completed
+                    {
+                        completed_count += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                completed_count, expected_completed,
+                "Sender {s_name} did not receive all Completed receipts"
+            );
+
+            (durable_ids, volatile_ids, ephemeral_ids)
+        }));
+    }
+
+    for wh in worker_handles {
+        wh.join().expect("Worker thread panicked");
+    }
+
+    let mut all_durable = Vec::new();
+    let mut all_volatile = Vec::new();
+    let mut all_ephemeral = Vec::new();
+    for sh in sender_handles {
+        let (d, v, e) = sh.join().expect("Sender thread panicked");
+        all_durable.extend(d);
+        all_volatile.extend(v);
+        all_ephemeral.extend(e);
+    }
+
+    let expected_per_tier = (num_senders * msgs_per_sender) / 3;
+    assert_eq!(all_durable.len(), expected_per_tier);
+    assert_eq!(all_volatile.len(), expected_per_tier);
+    assert_eq!(all_ephemeral.len(), expected_per_tier);
+
+    // Verify SQLite `kernel_ledger` has ONLY the `Durable` messages and all are `Completed`
+    assert_eq!(kernel.ledger().persisted_count(), expected_per_tier);
+    for (mid, target) in &all_durable {
+        let mem_rec = kernel.ledger().get_record(mid, target).unwrap();
+        let db_rec = kernel.ledger().get_persisted_record(mid).unwrap();
+        assert_eq!(mem_rec.status, ContractStatus::Completed);
+        assert_eq!(db_rec.status, ContractStatus::Completed);
+    }
+
+    // Verify `Volatile` messages are in memory (`Completed`), never in SQLite
+    for (mid, target) in &all_volatile {
+        let mem_rec = kernel.ledger().get_record(mid, target).unwrap();
+        assert_eq!(mem_rec.status, ContractStatus::Completed);
+        assert!(kernel.ledger().get_persisted_record(mid).is_none());
+    }
+
+    // Verify `Ephemeral` messages were evicted from memory upon terminal status and never in SQLite
+    for (mid, target) in &all_ephemeral {
+        assert!(kernel.ledger().get_record(mid, target).is_none());
+        assert!(kernel.ledger().get_persisted_record(mid).is_none());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 13. Single-Domain Blocking / Head-of-Line Isolation Test:
+/// Verifies that when one OS process domain hangs and stops reading its `stdin` pipe
+/// (even when flooded with >512KB of messages exceeding the OS pipe buffer),
+/// the Kernel Router and other healthy domains continue routing and completing messages without blocking.
+#[test]
+fn test_single_domain_blocking_head_of_line_isolation() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    kernel.logger().set_console_enabled(false);
+
+    // 1. Spawn `blocked_domain`: registers `hang`, then sleeps without ever reading stdin again.
+    let blocked_script = r#"
+import json, sys, time
+sys.stdout.write(json.dumps({
+    "frame_type": "send",
+    "seq": 1,
+    "targets": ["kernel.registry"],
+    "message_type": "RegisterHandlers",
+    "params": {"handlers": ["hang"]},
+    "data": {}
+}) + "\n")
+sys.stdout.flush()
+# Read the registration receipts, then freeze completely without reading stdin
+for _ in range(4):
+    sys.stdin.readline()
+time.sleep(3600)
+"#;
+
+    // 2. Spawn `healthy_domain`: registers `echo` and immediately completes every delivery.
+    let healthy_script = r#"
+import json, sys
+sys.stdout.write(json.dumps({
+    "frame_type": "send",
+    "seq": 1,
+    "targets": ["kernel.registry"],
+    "message_type": "RegisterHandlers",
+    "params": {"handlers": ["echo"]},
+    "data": {}
+}) + "\n")
+sys.stdout.flush()
+
+for raw in sys.stdin:
+    frame = json.loads(raw)
+    if frame.get("frame_type") == "deliver":
+        mid = frame["message_id"]
+        target = frame["target"]
+        for st in ("received", "started"):
+            sys.stdout.write(json.dumps({
+                "frame_type": "receipt",
+                "message_id": mid,
+                "target": target,
+                "status": st,
+                "data": None
+            }) + "\n")
+        sys.stdout.write(json.dumps({
+            "frame_type": "receipt",
+            "message_id": mid,
+            "target": target,
+            "status": "completed",
+            "data": {"echo": frame.get("data")}
+        }) + "\n")
+        sys.stdout.flush()
+"#;
+
+    kernel
+        .spawn_process_domain(DomainProcessSpec {
+            domain_id: "blocked_domain".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), blocked_script.to_string()],
+            working_dir: None,
+            auto_restart: false,
+            max_restarts: Some(0),
+            restart_delay_ms: 100,
+        })
+        .expect("Spawn blocked_domain");
+
+    kernel
+        .spawn_process_domain(DomainProcessSpec {
+            domain_id: "healthy_domain".to_string(),
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), healthy_script.to_string()],
+            working_dir: None,
+            auto_restart: false,
+            max_restarts: Some(0),
+            restart_delay_ms: 100,
+        })
+        .expect("Spawn healthy_domain");
+
+    // Wait for both domains to become Active
+    for _ in 0..50 {
+        if kernel.router().domain_status("blocked_domain") == Some(DomainStatus::Active)
+            && kernel.router().domain_status("healthy_domain") == Some(DomainStatus::Active)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        kernel.router().domain_status("blocked_domain"),
+        Some(DomainStatus::Active)
+    );
+    assert_eq!(
+        kernel.router().domain_status("healthy_domain"),
+        Some(DomainStatus::Active)
+    );
+
+    let caller = kernel.attach_domain("caller");
+    caller.register_handlers(&["cb"]);
+    let _ = caller.drain_frames();
+
+    // Flood `blocked_domain.hang` with 80 messages x 10KB (~800KB > 64KB OS pipe buffer)
+    let large_blob = "X".repeat(10_240);
+    let flood_start = std::time::Instant::now();
+    let mut blocked_msg_ids = Vec::new();
+    for i in 0..80 {
+        let mid = caller.send_one(
+            vec!["blocked_domain.hang".to_string()],
+            MSG_DELIVERY_DURABLE,
+            json!({"idx": i}),
+            json!({"blob": large_blob}),
+        );
+        blocked_msg_ids.push(mid);
+    }
+    assert!(
+        flood_start.elapsed() < Duration::from_secs(1),
+        "Flooding a blocked domain's pipe must NOT block the kernel router"
+    );
+
+    // Send a fan-out submission targeting BOTH the wedged domain and the healthy domain
+    let fanout_ids = caller.send(
+        vec![
+            "blocked_domain.hang".to_string(),
+            "healthy_domain.echo".to_string(),
+        ],
+        MSG_DELIVERY_DURABLE,
+        json!({}),
+        json!({"fanout": true}),
+    );
+    assert_eq!(fanout_ids.len(), 2);
+    let fanout_blocked_id = fanout_ids[0].clone();
+    let fanout_healthy_id = fanout_ids[1].clone();
+
+    // Send 20 direct messages to `healthy_domain.echo` while `blocked_domain` is wedged
+    let healthy_start = std::time::Instant::now();
+    let mut healthy_msg_ids = vec![fanout_healthy_id];
+    for i in 0..20 {
+        let mid = caller.send_one(
+            vec!["healthy_domain.echo".to_string()],
+            MSG_DELIVERY_VOLATILE,
+            json!({}),
+            json!({"ping": i}),
+        );
+        healthy_msg_ids.push(mid);
+    }
+
+    // Wait for all 21 healthy deliveries (1 fan-out + 20 direct) to reach `Completed`
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let _ = caller.drain_frames();
+        let all_done = healthy_msg_ids.iter().all(|id| {
+            kernel
+                .ledger()
+                .get_record(id, "healthy_domain.echo")
+                .map(|r| r.status == ContractStatus::Completed)
+                .unwrap_or(false)
+        });
+        if all_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    for id in &healthy_msg_ids {
+        let rec = kernel
+            .ledger()
+            .get_record(id, "healthy_domain.echo")
+            .expect("Healthy domain record must exist");
+        assert_eq!(
+            rec.status,
+            ContractStatus::Completed,
+            "Healthy domain must complete without being affected by blocked_domain"
+        );
+    }
+    assert!(
+        healthy_start.elapsed() < Duration::from_secs(2),
+        "Healthy domain traffic must remain low-latency even when another domain is completely wedged"
+    );
+
+    // Meanwhile, all messages targeting `blocked_domain.hang` are still in `Sent` status
+    assert_eq!(
+        kernel
+            .ledger()
+            .get_record(&fanout_blocked_id, "blocked_domain.hang")
+            .unwrap()
+            .status,
+        ContractStatus::Sent
+    );
+
+    // Now stop `blocked_domain` -> all 81 in-flight messages to `blocked_domain.hang` must transition to `ExecutionFailed`
+    let _ = kernel.supervisor().stop_process_domain("blocked_domain");
+    let _ = kernel.supervisor().stop_process_domain("healthy_domain");
+
+    for id in blocked_msg_ids.iter().chain(std::iter::once(&fanout_blocked_id)) {
+        let rec = kernel
+            .ledger()
+            .get_record(id, "blocked_domain.hang")
+            .unwrap();
+        assert_eq!(rec.status, ContractStatus::ExecutionFailed);
+        let db_rec = kernel.ledger().get_persisted_record(id).unwrap();
+        assert_eq!(db_rec.status, ContractStatus::ExecutionFailed);
+    }
+}
+
+

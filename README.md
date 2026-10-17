@@ -196,8 +196,8 @@ domain.run();
 
 输出产物位于 `dist/`：
 - **SDK 安装包**：
-  - Python Wheel：`dist/sdk/atelier_sdk-0.1.5-py3-none-any.whl`
-  - Node.js NPM 包：`dist/sdk/atelier-sdk-0.1.5.tgz`
+  - Python Wheel：`dist/sdk/atelier_sdk-0.1.8-py3-none-any.whl`
+  - Node.js NPM 包：`dist/sdk/atelier-sdk-0.1.8.tgz`
 - **内核运行包**：
   - 预编译二进制：`dist/kernel-runtime/atelier-kernel`
   - 启动配置模板：`dist/kernel-runtime/kernel_boot.template.json`
@@ -210,8 +210,8 @@ domain.run();
 ./dist/kernel-runtime/atelier-kernel --init ./my-variant
 
 # 2) 安装 Python / Node.js 域 SDK
-pip install ./dist/sdk/atelier_sdk-0.1.5-py3-none-any.whl
-npm install ./dist/sdk/atelier-sdk-0.1.5.tgz
+pip install ./dist/sdk/atelier_sdk-0.1.8-py3-none-any.whl
+npm install ./dist/sdk/atelier-sdk-0.1.8.tgz
 
 # 3) 运行宪法检查 & 启动变体（默认开启 http://127.0.0.1:8787 实时观察台；生产环境可加 --headless）
 ./dist/kernel-runtime/atelier-kernel --check ./my-variant

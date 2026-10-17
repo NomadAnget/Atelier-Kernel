@@ -5,7 +5,7 @@ Official zero-dependency Python SDK for building **Atelier Kernel** domains.
 ## Installation
 
 ```bash
-pip install atelier_sdk-0.1.7-py3-none-any.whl
+pip install atelier_sdk-0.1.8-py3-none-any.whl
 ```
 
 ---

@@ -37,32 +37,34 @@ chmod +x "${RUNTIME_OUT}/atelier-kernel"
 cp "${ROOT_DIR}/kernel_boot.json" "${RUNTIME_OUT}/kernel_boot.template.json"
 cp "${ROOT_DIR}/VARIANT_GUIDE.md" "${RUNTIME_OUT}/VARIANT_GUIDE.md"
 
-cat > "${RUNTIME_OUT}/README.md" <<'EOF'
-# Atelier Kernel Runtime Bundle
+VERSION="$(grep -m1 '^version = ' "${ROOT_DIR}/Cargo.toml" | cut -d '"' -f2)"
+
+cat > "${RUNTIME_OUT}/README.md" <<EOF
+# Atelier Kernel Runtime Bundle (v${VERSION})
 
 ## Contents
-- `atelier-kernel`: Precompiled Rust microkernel executable (zero external runtime dependencies)
-- `kernel_boot.template.json`: Default multi-domain startup configuration template
+- \`atelier-kernel\`: Precompiled Rust microkernel executable (zero external runtime dependencies)
+- \`kernel_boot.template.json\`: Default multi-domain startup configuration template
 
 ## Quick Start for a New Product Variant
 
 1. Initialize a new variant skeleton directory:
-   ```bash
+   \`\`\`bash
    ./atelier-kernel --init ./my-variant
-   ```
+   \`\`\`
 2. Install the Domain SDKs for your domain languages:
-   ```bash
-   pip install ../sdk/atelier_sdk-0.1.7-py3-none-any.whl
-   npm install ../sdk/atelier-sdk-0.1.7.tgz
-   ```
- 3. Boot your variant with Web Observer UI:
-   ```bash
+   \`\`\`bash
+   pip install ../sdk/atelier_sdk-${VERSION}-py3-none-any.whl
+   npm install ../sdk/atelier-sdk-${VERSION}.tgz
+   \`\`\`
+3. Boot your variant with Web Observer UI:
+   \`\`\`bash
    ./atelier-kernel --config ./my-variant/kernel_boot.json
-   ```
+   \`\`\`
    Or boot in headless production mode:
-   ```bash
+   \`\`\`bash
    ./atelier-kernel --config ./my-variant/kernel_boot.json --headless
-   ```
+   \`\`\`
 EOF
 
 ARCH="$(uname -m)"
@@ -74,15 +76,15 @@ echo "==> [5/5] Running End-to-End Variant Smoke Test (--init + --smoke-test)...
 SMOKE_DIR="${DIST_DIR}/_smoke_variant"
 rm -rf "${SMOKE_DIR}"
 "${RUNTIME_OUT}/atelier-kernel" --init "${SMOKE_DIR}"
-PYTHONPATH="${SDK_OUT}/atelier_sdk-0.1.7-py3-none-any.whl" \
+PYTHONPATH="${SDK_OUT}/atelier_sdk-${VERSION}-py3-none-any.whl" \
   "${RUNTIME_OUT}/atelier-kernel" --config "${SMOKE_DIR}/kernel_boot.json" --smoke-test
 rm -rf "${SMOKE_DIR}"
 
 echo ""
 echo "================================================================"
-echo "Atelier Kernel Automated Packaging & Verification Complete!"
-echo "  - Python SDK Wheel:   ${SDK_OUT}/atelier_sdk-0.1.7-py3-none-any.whl"
-echo "  - Node.js SDK NPM:    ${SDK_OUT}/atelier-sdk-0.1.7.tgz"
+echo "Atelier Kernel Automated Packaging & Verification Complete (v${VERSION})!"
+echo "  - Python SDK Wheel:   ${SDK_OUT}/atelier_sdk-${VERSION}-py3-none-any.whl"
+echo "  - Node.js SDK NPM:    ${SDK_OUT}/atelier-sdk-${VERSION}.tgz"
 echo "  - Kernel Binary:      ${RUNTIME_OUT}/atelier-kernel"
 echo "  - Config Template:    ${RUNTIME_OUT}/kernel_boot.template.json"
 echo "  - Full Release Tar:   ${DIST_DIR}/${ARCHIVE_NAME}"

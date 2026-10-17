@@ -55,7 +55,15 @@ d.handler('error',()=>{throw new DomainExecutionFailed({domain_defined:['free',7
 d.handler('echo',msg=>msg.data);
 d.handler('many',async()=>d.waitResults(await d.send(['worker.ok','worker.bad','worker.silent'],'Fanout'),{timeout:.08}));
 d.handler('store',async()=>[await d.storageInsertAsync('id','category',{n:1}),await d.storageUpdateAsync('id',{n:2}),await d.storageQueryAsync({domain:'shared',recordId:'id',category:'category',filter:{n:2},limit:7}),await d.storageDeleteAsync({recordId:'id'})]);
-d.runAsync({onStart:async()=>{if(mode==='startup')await new Promise(r=>setTimeout(r,150));},onClose:()=>d.logger.info(JSON.stringify({cleanup:true}))}).catch(e=>{process.stderr.write(String(e));process.exitCode=1;});
+d.runAsync({onStart:async()=>{
+ if(mode==='startup')await new Promise(r=>setTimeout(r,150));
+ // Model a bridge stuck in its input read on every platform, while the kernel
+ // input remains open. shutdown must terminate only this owned helper by deadline.
+ if(mode==='shutdown'&&!d._ipcBridge){
+   const child=require('child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true});
+   d._ipcBridge=child;d._ipcBridgeExit=new Promise(resolve=>{child.once('exit',resolve);child.once('error',resolve);});
+ }
+},onClose:()=>d.logger.info(JSON.stringify({cleanup:true}))}).catch(e=>{process.stderr.write(String(e));process.exitCode=1;});
 '''
 (WORK/'fixture.py').write_text(PY);(WORK/'fixture.cjs').write_text(JS)
 

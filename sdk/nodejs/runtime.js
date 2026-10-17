@@ -42,9 +42,10 @@ const _WIN32_BRIDGE_PY=[
   '   while mv:mv=mv[os.write(w_fd,mv):]',
   ' except Exception:pass',
   ' finally:',
-  '  for fd in (w_fd,r_fd):',
-  '   try:os.close(fd)',
-  '   except Exception:pass',
+  // Do not close r_fd while p_in owns a blocking CRT read on Windows: close
+  // waits for that descriptor lock. Process exit reclaims it without joining p_in.
+  '  try:os.close(w_fd)',
+  '  except Exception:pass',
   '  os._exit(0)',
   't1=threading.Thread(target=p_in,daemon=True);t2=threading.Thread(target=p_out,daemon=True)',
   't1.start();t2.start();t2.join()'
@@ -214,11 +215,16 @@ function enhance(Base,RequestError,ExecutionFailed) {
         if(this._ipcBridge){
           try{this._ipcOutput?.end();}catch(_){}
           let bridgeTimer;
+          let bridgeExited=false;
           try{
-            await Promise.race([this._ipcBridgeExit,new Promise(resolve=>{
+            await Promise.race([this._ipcBridgeExit.then(()=>{bridgeExited=true;}),new Promise(resolve=>{
               bridgeTimer=setTimeout(resolve,Math.max(50,this._limits.shutdownGrace*1000));
             })]);
           }finally{clearTimeout(bridgeTimer);}
+          if(!bridgeExited){
+            this._ipcBridge.kill();
+            await this._ipcBridgeExit;
+          }
         }
         this._ipcInput?.pause();this._ipcInput?.destroy();this._ipcOutput?.destroy();this._state='closed';this._startupError?this._rejectRun(this._startupError):this._resolveRun();
       })().catch(error=>{this._state='closed';this._rejectRun(error);});return this._finishing;

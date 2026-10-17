@@ -28,6 +28,8 @@ cancels cooperatively and calls the cleanup hook. It cannot kill arbitrary nativ
 work; process termination and restart remain the kernel supervisor's job.
 An IPC bridge that exits early cancels its cleanup deadline timer; a finished
 connection must not retain the Node event loop until shutdown_grace expires.
+When its cleanup deadline expires, the SDK terminates its own IPC bridge helper;
+it never waits for the kernel input to close before completing an explicit shutdown.
 
 Async storage helpers send existing kernel.storage CRUD messages and return kernel
 response data. They do not implement storage, transactions, migration or paging.

@@ -519,7 +519,51 @@ impl KernelLogHub {
             .query(limit, level, layer, component, phase, since_ts)
     }
 
-    /// Queries persisted logs from SQLite `hub_logs` with optional source_domain filter.
+    fn matches_filter(
+        r: &LogRecord,
+        level: Option<&str>,
+        layer: Option<&str>,
+        component: Option<&str>,
+        phase: Option<&str>,
+        since_ts: Option<f64>,
+        source_domain: Option<&str>,
+    ) -> bool {
+        if let Some(l) = level {
+            if !r.level.eq_ignore_ascii_case(l) {
+                return false;
+            }
+        }
+        if let Some(ly) = layer {
+            if !r.layer.eq_ignore_ascii_case(ly) {
+                return false;
+            }
+        }
+        if let Some(c) = component {
+            if !r.component.eq_ignore_ascii_case(c) {
+                return false;
+            }
+        }
+        if let Some(p) = phase {
+            if !r.phase.eq_ignore_ascii_case(p) {
+                return false;
+            }
+        }
+        if let Some(ts) = since_ts {
+            if r.ts < ts {
+                return false;
+            }
+        }
+        if let Some(domain) = source_domain {
+            let domain_match =
+                r.source_domain.as_deref() == Some(domain) || r.component == domain;
+            if !domain_match {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Queries logs from SQLite `hub_logs` and in-memory recent buffer with optional source_domain filter.
     pub fn query_logs_filtered(
         &self,
         limit: usize,
@@ -530,8 +574,38 @@ impl KernelLogHub {
         since_ts: Option<f64>,
         source_domain: Option<&str>,
     ) -> Result<Vec<LogRecord>, StorageError> {
-        self.store
-            .query_with_domain(limit, level, layer, component, phase, since_ts, source_domain)
+        let mut db_records = self.store.query_with_domain(
+            limit,
+            level,
+            layer,
+            component,
+            phase,
+            since_ts,
+            source_domain,
+        )?;
+
+        // Merge any recent in-memory records that have not yet flushed to SQLite
+        let recent = self.recent_logs.lock().clone();
+        for r in recent.into_iter().rev() {
+            if db_records.len() >= limit {
+                break;
+            }
+            if !Self::matches_filter(&r, level, layer, component, phase, since_ts, source_domain) {
+                continue;
+            }
+            let already_present = db_records
+                .iter()
+                .any(|d| (d.ts - r.ts).abs() < 0.001 && d.message == r.message && d.level == r.level);
+            if !already_present {
+                db_records.insert(0, r);
+            }
+        }
+
+        if db_records.len() > limit {
+            db_records.truncate(limit);
+        }
+
+        Ok(db_records)
     }
 
     // --- Ergonomic Kernel Logging Helpers ---

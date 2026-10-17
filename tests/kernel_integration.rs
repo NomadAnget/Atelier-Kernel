@@ -1840,31 +1840,40 @@ fn test_kernel_built_in_processors_logger_telemetry_notify() {
         ..Default::default()
     });
 
-    // Wait briefly for LogStore async batch to flush to SQLite
-    std::thread::sleep(Duration::from_millis(250));
-
     // 2. Query logs via IPC message targeting `kernel.logger` (`QueryLogs`)
-    let log_msg_ids = client.send(
-        vec![KERNEL_LOGGER_TARGET.to_string()],
-        MSG_QUERY_LOGS,
-        json!({ "limit": 20 }),
-        json!({}),
-    );
-    let frames = client.drain_frames();
-    let completed_log = frames
-        .into_iter()
-        .filter_map(|f| match f {
+    let mut logs = Vec::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let log_msg_ids = client.send(
+            vec![KERNEL_LOGGER_TARGET.to_string()],
+            MSG_QUERY_LOGS,
+            json!({ "limit": 20 }),
+            json!({}),
+        );
+        let frames = client.drain_frames();
+        let completed_log = frames.into_iter().find_map(|f| match f {
             KernelToDomainFrame::Receipt(r)
                 if r.message_id == log_msg_ids[0] && r.status == ContractStatus::Completed =>
             {
                 r.data
             }
             _ => None,
-        })
-        .next()
-        .expect("Expected Completed receipt for QueryLogs");
+        });
 
-    let logs = completed_log["logs"].as_array().expect("logs array");
+        if let Some(data) = completed_log {
+            if let Some(arr) = data["logs"].as_array() {
+                if arr
+                    .iter()
+                    .any(|l| l["message"].as_str() == Some("Kernel initial startup completed"))
+                {
+                    logs = arr.clone();
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     assert!(!logs.is_empty(), "Should return recorded logs");
     assert!(
         logs.iter()
@@ -1873,27 +1882,39 @@ fn test_kernel_built_in_processors_logger_telemetry_notify() {
     );
 
     // 3. Query active progress via IPC message targeting `kernel.logger` (`QueryProgress`)
-    let prog_msg_ids = client.send(
-        vec![KERNEL_LOGGER_TARGET.to_string()],
-        MSG_QUERY_PROGRESS,
-        json!({}),
-        json!({}),
-    );
-    let prog_frames = client.drain_frames();
-    let completed_prog = prog_frames
-        .into_iter()
-        .filter_map(|f| match f {
+    let mut progress_list = Vec::new();
+    let prog_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < prog_deadline {
+        let prog_msg_ids = client.send(
+            vec![KERNEL_LOGGER_TARGET.to_string()],
+            MSG_QUERY_PROGRESS,
+            json!({}),
+            json!({}),
+        );
+        let prog_frames = client.drain_frames();
+        let completed_prog = prog_frames.into_iter().find_map(|f| match f {
             KernelToDomainFrame::Receipt(r)
                 if r.message_id == prog_msg_ids[0] && r.status == ContractStatus::Completed =>
             {
                 r.data
             }
             _ => None,
-        })
-        .next()
-        .expect("Expected Completed receipt for QueryProgress");
+        });
 
-    let progress_list = completed_prog["progress"].as_array().expect("progress array");
+        if let Some(data) = completed_prog {
+            if let Some(arr) = data["progress"].as_array() {
+                if arr
+                    .iter()
+                    .any(|p| p["key"].as_str() == Some("batch_export_99"))
+                {
+                    progress_list = arr.clone();
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     assert!(
         progress_list
             .iter()

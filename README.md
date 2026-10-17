@@ -56,20 +56,20 @@
 
 ---
 
-### 2. 内核 8 大基础设施方法（Kernel Infrastructure Facilities）
+### 2. 内核 8 大基础设施方法速查表（Kernel Infrastructure Facilities）
 
-所有内核处理器均已沉淀为 SDK 语言原生的基础设施对象与方法，域无需将其作为普通消息调用：
+所有内核能力均已沉淀为 SDK 语言原生的基础设施对象与方法，区分明确的**发送端（发起/调用/上报）**与**接收端（监听/响应/流直推）**契约：
 
-| 基础设施模块 | 内核内部目标 | Python SDK 原生方法 | Node.js SDK 原生方法 | 特性说明 |
+| 基础设施模块 | 内核内置目标 | 发送 / 调用方式（How to Send） | 接收 / 监听方式（How to Receive） | 适用场景与底层机制 |
 | :--- | :--- | :--- | :--- | :--- |
-| **元数据注册与发现** | `kernel.registry` | `d.registry.query_handlers(...)`<br>`d.registry.get_description(...)` | `d.registry.queryHandlers(...)`<br>`d.registry.getDescription(...)` | 自动提取函数 Docstring/注释；严格排除 `kernel.*` |
-| **按域隔离存储** | `kernel.storage` | `d.storage.insert(...)`<br>`d.storage.query(...)`<br>`d.storage.update(...)`<br>`d.storage.delete(...)` | `d.storage.insert(...)`<br>`d.storage.query(...)`<br>`d.storage.update(...)`<br>`d.storage.delete(...)` | 严格按所属域隔离建表；支持 `domain` 跨表只读查询 |
-| **统一结构化日志** | `kernel.logger` | `d.logger.info(...)`<br>`d.logger.phase(...)`<br>`d.logger.progress(...)`<br>`@d.on_log(level="...")` | `d.logger.info(...)`<br>`d.logger.phase(...)`<br>`d.logger.progress(...)`<br>`d.onLog(fn, {level})` | 物理隔离 stdout 防管道污染；瞬态日志推流零 Receipt 负担 |
-| **高频遥测指标** | `kernel.telemetry` | `d.telemetry.emit(name, val, tags)`<br>`@d.on_telemetry` | `d.telemetry.emit(name, val, tags)`<br>`d.onTelemetry(fn)` | 原生指标发射；管道事件直推零收据 |
-| **系统告警广播** | `kernel.notify` | `d.notify(severity, msg, title)`<br>`@d.on_notify` | `d.notify(severity, msg, title)`<br>`d.onNotify(fn)` | 系统级通知与跨域告警流 |
-| **运行态装配拓扑** | `kernel.runtime` | `d.runtime.list_domains()`<br>`d.runtime.get_domain(id)`<br>`d.runtime.query(...)` | `d.runtime.listDomains()`<br>`d.runtime.getDomain(id)`<br>`d.runtime.query(...)` | 获取全系统所有受托管域的状态、代际 `instance_id` 与路由 |
-| **消息生命周期观察** | `kernel.observer` | `d.observer.query(limit=...)`<br>`@d.on_observation` | `d.observer.query({limit})`<br>`d.onObservation(fn)` | 检索四阶段生命周期快照；原生监听全局事件流 |
-| **进程更新与回滚** | `kernel.supervisor` | `d.supervisor.start(domain)`<br>`d.supervisor.stop(domain)`<br>`d.supervisor.restart(domain)`<br>`d.supervisor.update(domain, ...)` | `d.supervisor.start(domain)`<br>`d.supervisor.stop(domain)`<br>`d.supervisor.restart(domain)`<br>`d.supervisor.update(domain, ...)` | 候选版本隔离探活；探活成功原子切换并排干旧实例；探活失败零感自动回滚 |
+| **1. 注册与发现** | `kernel.registry` | • 启动时自动发送 `RegisterHandlers`<br>• `domain.registry.query_handlers(...)`<br>• `domain.registry.get_description(...)` | • 返回当前可用业务路由列表及方法文档注释<br>• 格式：`{ count, routes: [...], handlers: [...] }` | 启动握手；发现目标服务路由；**严格排除所有 `kernel.*` 处理器** |
+| **2. 隔离存储** | `kernel.storage` | • `domain.storage.insert(id, cat, data)`<br>• `domain.storage.update(id, data)`<br>• `domain.storage.delete(id)`<br>• `domain.storage.query(domain, ...)` | • 写入操作返回：`{ status: "ok", record_id, version }`<br>• 查询操作返回：记录对象数组 `[ { id, category, data, updated_at }, ... ]` | 存储即消息，按所属域独立建表；写操作仅限本域；读操作支持跨域安全只读 |
+| **3. 统一日志** | `kernel.logger` | • `domain.logger.info / warn / error(...)`<br>• `domain.logger.phase(...)`（阶段对偶）<br>• `domain.logger.progress(...)`（进度上报）<br>• `domain.logger.query_logs(...)` | • **实时日志流监听**：<br>  - Py: `@domain.on_log(level="...")`<br>  - JS: `domain.onLog(fn, { level })`<br>• 接收：`{ level, message, source_domain, ts }` | 专属日志管道隔离输出（防 stdout 污染）；日志流直推**零 Receipt** 负担 |
+| **4. 高频遥测** | `kernel.telemetry` | • `domain.telemetry.emit(metric, val, tags)` | • **实时遥测流监听**：<br>  - Py: `@domain.on_telemetry`<br>  - JS: `domain.onTelemetry(fn)`<br>• 接收：`{ metric_name, value, tags, source_domain }` | 高频传感器、性能指标上报；瞬态直推，零回执报账 |
+| **5. 系统告警** | `kernel.notify` | • 同步即发即弃：`domain.notify(...)`<br>• 异步等待确认：`await domain.notify_async(...)` | • **实时告警监听**：<br>  - Py: `@domain.on_notify`<br>  - JS: `domain.onNotify(fn)`<br>• 接收：`{ severity, message, notification_type, details }` | 系统异常广播与跨域告警通知；瞬态直推，零 Receipt |
+| **6. 装配拓扑** | `kernel.runtime` | • `domain.runtime.list_domains()`<br>• `domain.runtime.get_domain(domain_id)`<br>• `domain.runtime.query(...)` | • 返回全系统域装配拓扑数据：<br>  `{ count, domains: [ { domain_id, status, instance_id, routes, process: { pid, command, ... } } ] }` | 拓扑监控、探活与排障，随时获取活跃域与其 OS 进程信息 |
+| **7. 观察者流** | `kernel.observer` | • 快照检索：`domain.observer.query(...)`<br>• 订阅流控制：`subscribe()` / `unsubscribe()` | • **全局生命周期流监听**：<br>  - Py: `@domain.on_observation`<br>  - JS: `domain.onObservation(fn)`<br>• 接收：`{ topic, state, message_id, logical_id, target, source_domain }` | 审计与全链路监控；消息状态瞬态推送；订阅域断开时内核自动清理注销 |
+| **8. 更新与回滚** | `kernel.supervisor` | • `domain.supervisor.start(domain)`<br>• `domain.supervisor.stop(domain)`<br>• `domain.supervisor.restart(domain)`<br>• `domain.supervisor.update(domain, ...)` | • 返回更新与探活结果：<br>  `{ success: true, domain, old_instance_id, new_instance_id }`<br>  或探活失败自动回滚通知：`{ success: false, domain, message }` | 进程受控启停；平滑滚动更新（候选版本隔离探活成功后原子切换，失败自动回滚） |
 
 ---
 

@@ -5,7 +5,7 @@ Official zero-dependency Node.js / TypeScript SDK for building **Atelier Kernel*
 ## Installation
 
 ```bash
-npm install ./atelier-sdk-0.1.6.tgz
+npm install ./atelier-sdk-0.1.7.tgz
 ```
 
 ## Quick Start

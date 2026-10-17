@@ -332,24 +332,12 @@ fn scan_python_source(path: &Path, source: &str, report: &mut ConstitutionReport
             });
         }
 
-        // M5: Forbid bare print(...) writing to stdout
-        if contains_bare_call(trimmed, "print")
-            && !trimmed.contains("file=sys.stderr")
-            && !trimmed.contains("file = sys.stderr")
-        {
-            report.violations.push(ConstitutionViolation {
-                rule: "M5".to_string(),
-                location: location.clone(),
-                detail: "bare print() writes to stdout and corrupts the kernel JSON-Lines pipe; use domain.logger instead".to_string(),
-            });
-        }
-
-        // M5: Forbid direct sys.stdout.write(...) in business domain code
-        if trimmed.contains("sys.stdout.write(") {
+        // M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code
+        if raw_line.contains("ATELIER_IPC_READ_FD") || raw_line.contains("ATELIER_IPC_WRITE_FD") {
             report.violations.push(ConstitutionViolation {
                 rule: "M5".to_string(),
                 location,
-                detail: "direct sys.stdout.write() in domain code corrupts the kernel JSON-Lines pipe; use AtelierDomain SDK".to_string(),
+                detail: "direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD in domain code is forbidden; use AtelierDomain SDK".to_string(),
             });
         }
     }
@@ -395,44 +383,15 @@ fn scan_js_source(path: &Path, source: &str, report: &mut ConstitutionReport) {
             });
         }
 
-        // M5: Forbid console.log / console.info / console.debug (which write to stdout in Node.js)
-        if trimmed.contains("console.log(")
-            || trimmed.contains("console.info(")
-            || trimmed.contains("console.debug(")
-        {
-            report.violations.push(ConstitutionViolation {
-                rule: "M5".to_string(),
-                location: location.clone(),
-                detail: "console.log/info/debug writes to stdout and corrupts the kernel JSON-Lines pipe; use domain.logger instead".to_string(),
-            });
-        }
-
-        // M5: Forbid direct process.stdout.write(...) in business domain code
-        if trimmed.contains("process.stdout.write(") {
+        // M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code
+        if trimmed.contains("ATELIER_IPC_READ_FD") || trimmed.contains("ATELIER_IPC_WRITE_FD") {
             report.violations.push(ConstitutionViolation {
                 rule: "M5".to_string(),
                 location,
-                detail: "direct process.stdout.write() in domain code corrupts the kernel JSON-Lines pipe; use AtelierDomain SDK".to_string(),
+                detail: "direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD in domain code is forbidden; use AtelierDomain SDK".to_string(),
             });
         }
     }
-}
-
-fn contains_bare_call(line: &str, fn_name: &str) -> bool {
-    let pattern = format!("{fn_name}(");
-    let mut start = 0;
-    while let Some(pos) = line[start..].find(&pattern) {
-        let abs = start + pos;
-        if abs == 0 {
-            return true;
-        }
-        let prev = line.as_bytes()[abs - 1];
-        if !(prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.') {
-            return true;
-        }
-        start = abs + pattern.len();
-    }
-    false
 }
 
 /// Strips Python `#` comments and triple-quoted docstrings (`"""` / `'''`) from a single line.

@@ -63,14 +63,33 @@ class Driver:
     def __init__(self,lang,mode):
         self.lang,self.mode=lang,mode;self.events=[];self.ids=0;self.dep=0;self.requests=[];self.pending=[];self.logs=[]
         self.stderr=open(WORK/(lang+'-'+mode+'.stderr'),'w')
+        k2d_r,k2d_w=os.pipe()
+        d2k_r,d2k_w=os.pipe()
         cmd=[sys.executable,str(WORK/'fixture.py'),mode] if lang=='python' else ['node',str(WORK/'fixture.cjs'),str(ROOT/'sdk/nodejs'),mode]
-        self.proc=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.stderr,text=True,env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')},bufsize=1)
+        env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')}
+        kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':self.stderr,'text':True,'bufsize':1}
+        if os.name=='nt':
+            import msvcrt
+            os.set_inheritable(k2d_r,True);os.set_inheritable(d2k_w,True)
+            env['ATELIER_IPC_READ_FD']=str(msvcrt.get_osfhandle(k2d_r))
+            env['ATELIER_IPC_WRITE_FD']=str(msvcrt.get_osfhandle(d2k_w))
+            env['ATELIER_IPC_HANDLE_MODE']='win32'
+            kwargs['close_fds']=False
+        else:
+            env['ATELIER_IPC_READ_FD']=str(k2d_r)
+            env['ATELIER_IPC_WRITE_FD']=str(d2k_w)
+            kwargs['pass_fds']=(k2d_r,d2k_w)
+        self.proc=subprocess.Popen(cmd,env=env,**kwargs)
+        os.close(k2d_r);os.close(d2k_w)
+        self.ipc_tx=os.fdopen(k2d_w,'w',encoding='utf-8',buffering=1)
+        self.ipc_rx=os.fdopen(d2k_r,'r',encoding='utf-8',buffering=1)
         self.q=queue.Queue()
         def read():
-            for line in self.proc.stdout:self.q.put(json.loads(line))
+            for line in self.ipc_rx:self.q.put(json.loads(line))
+            self.ipc_rx.close()
             self.q.put(None)
         threading.Thread(target=read,daemon=True).start()
-    def write(self,frame):self.proc.stdin.write(json.dumps(frame,ensure_ascii=False)+'\n');self.proc.stdin.flush()
+    def write(self,frame):self.ipc_tx.write(json.dumps(frame,ensure_ascii=False)+'\n');self.ipc_tx.flush()
     def call(self,handler='work',data='__default__',source='allowed',trace=None):
         self.ids+=1;mid='call-'+str(self.ids)
         params={'caller_value':trace} if trace is not None else {}
@@ -105,7 +124,7 @@ class Driver:
     def done(self,mid):return self.until(lambda:next((f for f in self.events if f.get('message_id')==mid and f.get('status') in ('completed','execution_failed')),None))
     def registered(self):self.until(lambda:any(f.get('message_type')=='RegisterHandlers' for f in self.events));time.sleep(.02)
     def finish(self,already=False):
-        if not already:self.proc.stdin.close()
+        if not already:self.ipc_tx.close()
         for _ in range(500):
             frame=self.step()
             if frame is None:break

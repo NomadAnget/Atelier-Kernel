@@ -350,13 +350,9 @@ class AtelierDomain {
     });
   }
 
-  _writeFrame(frame) {
-    process.stdout.write(JSON.stringify(frame) + "\n");
+  _writeFrame(_frame) {
+    throw new Error("missing ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD: dedicated dual anonymous pipes are required");
   }
-
-  /**
-   * Registers all declared handlers with `kernel.registry` and starts the stdin event loop.
-   */
 }
 
 const MSG_REGISTER_HANDLERS = "RegisterHandlers";

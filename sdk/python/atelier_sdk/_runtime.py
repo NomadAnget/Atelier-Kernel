@@ -13,8 +13,47 @@ from ._messages import MessageClient
 from ._errors import DomainExecutionFailed,DomainRequestError
 
 _context=ContextVar('atelier_request',default=None)
+_CLAIMED_IPC_FDS=None
+_CLAIM_LOCK=threading.Lock()
+
+def _claim_ipc_fds():
+    global _CLAIMED_IPC_FDS
+    with _CLAIM_LOCK:
+        if _CLAIMED_IPC_FDS is not None:return _CLAIMED_IPC_FDS
+        r_raw=os.environ.pop('ATELIER_IPC_READ_FD',None)
+        w_raw=os.environ.pop('ATELIER_IPC_WRITE_FD',None)
+        mode=os.environ.pop('ATELIER_IPC_HANDLE_MODE',None)
+        if r_raw is None or w_raw is None:return None
+        try:r_val,w_val=int(r_raw),int(w_raw)
+        except ValueError as exc:raise RuntimeError('invalid ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD') from exc
+        if os.name=='nt' and mode in ('win32','win32_handle'):
+            import msvcrt
+            r_fd=msvcrt.open_osfhandle(r_val,os.O_RDONLY|getattr(os,'O_BINARY',0))
+            w_fd=msvcrt.open_osfhandle(w_val,getattr(os,'O_BINARY',0))
+        else:r_fd,w_fd=r_val,w_val
+        try:
+            os.set_inheritable(r_fd,False)
+            os.set_inheritable(w_fd,False)
+        except OSError:pass
+        _CLAIMED_IPC_FDS=(r_fd,w_fd)
+        return _CLAIMED_IPC_FDS
+
+_claim_ipc_fds()
 
 class AsyncRuntime(MessageClient):
+    def _require_ipc_fds(self):
+        fds=_claim_ipc_fds()
+        if fds is None:
+            raise RuntimeError('missing ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD: dedicated dual anonymous pipes are required')
+        return fds
+
+    def _write_ipc_bytes(self,w_fd,data_bytes):
+        pending=memoryview(data_bytes)
+        while pending:
+            count=os.write(w_fd,pending)
+            if count<=0:raise BrokenPipeError('IPC write pipe closed')
+            pending=pending[count:]
+
     def _diagnostic(self,message,*args):
         try:self.logger.error(message,*args)
         except Exception:sys.stderr.write((message % args if args else message)+'\n')
@@ -68,9 +107,11 @@ class AsyncRuntime(MessageClient):
 
     def _write_line(self,line):
         if self._state=='closed':raise DomainRequestError('connection_closed')
-        if len(line.encode('utf-8'))>self._limits['max_frame_bytes']:raise DomainRequestError('frame_too_large')
+        encoded=line.encode('utf-8')
+        if len(encoded)>self._limits['max_frame_bytes']:raise DomainRequestError('frame_too_large')
+        _,w_fd=self._require_ipc_fds()
         if self._outbox is None:
-            sys.stdout.write(line);sys.stdout.flush();return
+            self._write_ipc_bytes(w_fd,encoded);return
         try:self._outbox.put_nowait(line)
         except queue.Full as error:raise DomainRequestError('busy') from error
 
@@ -119,7 +160,7 @@ class AsyncRuntime(MessageClient):
         msg=DeliveryMessage(frame)
         token=_context.set(dict(logical_id=msg.logical_id,message_id=msg.message_id,source_domain=msg.source_domain,target=msg.target,message_type=msg.message_type))
         try:
-            self.report_receipt(msg.message_id,msg.target,'started')
+            self.report_receipt(msg.message_id,msg.target,'received' if False else 'started')
             if self._stage_delay_sec:await asyncio.sleep(self._stage_delay_sec)
             fn=self._handlers.get(msg.target.split('.',1)[-1])
             if fn is None:raise DomainExecutionFailed({'error':'Unknown handler: '+msg.target.split('.',1)[-1]})
@@ -160,6 +201,8 @@ class AsyncRuntime(MessageClient):
 
     async def run_async(self,on_start=None,on_close=None):
         if self._state!='new':raise RuntimeError('domain receive session already started or closed')
+        r_fd,w_fd=self._require_ipc_fds()
+        ipc_reader=self._ipc_reader=os.fdopen(r_fd,'r',encoding='utf-8',buffering=1,closefd=False)
         loop=self._async_loop=asyncio.get_running_loop();self._state='open';self._session_done=loop.create_future()
         inbox=self._inbox=asyncio.Queue(maxsize=self._limits['max_pending'])
         self._outbox=queue.Queue(maxsize=self._limits['max_outbox'])
@@ -168,24 +211,14 @@ class AsyncRuntime(MessageClient):
                 try:line=self._outbox.get(timeout=.05)
                 except queue.Empty:continue
                 try:
-                    # Write raw UTF-8 without holding Python's buffered stdout lock
-                    # while a slow pipe blocks the dedicated writer thread.
-                    try:fd=sys.stdout.fileno()
-                    except (AttributeError,OSError,ValueError):fd=None
-                    if fd is None:sys.stdout.write(line);sys.stdout.flush()
-                    else:
-                        pending=memoryview(line.encode('utf-8'))
-                        while pending:
-                            count=os.write(fd,pending)
-                            if count<=0:raise BrokenPipeError('stdout pipe closed')
-                            pending=pending[count:]
+                    self._write_ipc_bytes(w_fd,line.encode('utf-8'))
                 except Exception:
                     self._writer_error=True;self.close();return
                 finally:self._outbox.task_done()
         def reader():
             try:
                 while not self._closed:
-                    line=sys.stdin.readline(self._limits['max_frame_bytes']+1)
+                    line=ipc_reader.readline(self._limits['max_frame_bytes']+1)
                     if not line:break
                     if len(line.encode('utf-8'))>self._limits['max_frame_bytes']:
                         self._diagnostic('SDK frame limit exceeded');self.close();break
@@ -206,10 +239,10 @@ class AsyncRuntime(MessageClient):
                     if inspect.isawaitable(result):await result
             except Exception as error:
                 self._startup_error=error;self._diagnostic('SDK startup failed: %s',error);self.close()
-        threading.Thread(target=writer,name='atelier-sdk-stdout',daemon=True).start()
+        threading.Thread(target=writer,name='atelier-sdk-ipc-tx',daemon=True).start()
         if self._handlers:self._submit(['kernel.registry'],'RegisterHandlers',{'handlers':list(self._handlers),'descriptions':dict(getattr(self,'_handler_docs',{}))},{})
         self._startup=asyncio.create_task(start())
-        threading.Thread(target=reader,name='atelier-sdk-stdin',daemon=True).start()
+        threading.Thread(target=reader,name='atelier-sdk-ipc-rx',daemon=True).start()
         try:
             while not self._closed:
                 line=await inbox.get()

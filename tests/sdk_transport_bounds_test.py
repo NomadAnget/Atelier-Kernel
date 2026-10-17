@@ -12,11 +12,9 @@ async def start():
     if sys.argv[1]=='startup':raise RuntimeError('start failed')
     if sys.argv[1]=='input':d.logger.info(json.dumps({'ready':True}));return
     if sys.argv[1]=='outbox':
-        original=sys.stdout;entered=threading.Event();gate=threading.Event()
-        class Blocked:
-            def write(self,text):entered.set();gate.wait();return original.write(text)
-            def flush(self):return original.flush()
-        sys.stdout=Blocked()
+        original=d._write_ipc_bytes;entered=threading.Event();gate=threading.Event()
+        def blocked(w_fd,data_bytes):entered.set();gate.wait();return original(w_fd,data_bytes)
+        d._write_ipc_bytes=blocked
         d._submit(['worker.test'],'Manual')
         while not entered.is_set():await asyncio.sleep(.001)
         d._submit(['worker.test'],'Manual')
@@ -24,7 +22,7 @@ async def start():
         except DomainRequestError as e:assert e.status=='busy'
         gate.set()
         while d._outbox.unfinished_tasks:await asyncio.sleep(.001)
-        sys.stdout=original
+        d._write_ipc_bytes=original
     else:
         try:await d.request('worker.test','Large',data={'text':'x'*4096});raise AssertionError('frame did not reject')
         except DomainRequestError as e:assert e.status=='frame_too_large'
@@ -39,10 +37,11 @@ d.runAsync({onStart:async()=>{
  if(process.argv[3]==='startup')throw new Error('start failed');
  if(process.argv[3]==='input'){d.logger.info(JSON.stringify({ready:true}));return;}
  if(process.argv[3]==='outbox'){
-   const original=process.stdout.write;process.stdout.write=function(...args){original.apply(this,args);return false;};
+   const out=d._ensureIpcOutput();
+   const original=out.write;out.write=function(...args){original.apply(this,args);return false;};
    d._submit(['worker.test'],'Manual');d._submit(['worker.test'],'Manual');
    try{d._submit(['worker.test'],'Manual');throw new Error('queue did not reject');}catch(e){if(e.status!=='busy')throw e;}
-   process.stdout.write=original;process.stdout.emit('drain');
+   out.write=original;out.emit('drain');
  }else{
    try{await d.request('worker.test','Large',{}, {text:'x'.repeat(4096)});throw new Error('frame did not reject');}catch(e){if(e.status!=='frame_too_large')throw e;}
  }
@@ -53,23 +52,41 @@ d.runAsync({onStart:async()=>{
 report=[]
 for lang in ['python','node']:
     for mode in ['outbox','frame','input','startup']:
+        k2d_r,k2d_w=os.pipe()
+        d2k_r,d2k_w=os.pipe()
         cmd=[sys.executable,str(WORK/'fixture.py'),mode] if lang=='python' else ['node',str(WORK/'fixture.cjs'),str(ROOT/'sdk/nodejs'),mode]
-        proc=subprocess.Popen(cmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')})
+        env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')}
+        kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.PIPE,'text':True}
+        if os.name=='nt':
+            import msvcrt
+            os.set_inheritable(k2d_r,True);os.set_inheritable(d2k_w,True)
+            env['ATELIER_IPC_READ_FD']=str(msvcrt.get_osfhandle(k2d_r))
+            env['ATELIER_IPC_WRITE_FD']=str(msvcrt.get_osfhandle(d2k_w))
+            env['ATELIER_IPC_HANDLE_MODE']='win32'
+            kwargs['close_fds']=False
+        else:
+            env['ATELIER_IPC_READ_FD']=str(k2d_r)
+            env['ATELIER_IPC_WRITE_FD']=str(d2k_w)
+            kwargs['pass_fds']=(k2d_r,d2k_w)
+        proc=subprocess.Popen(cmd,env=env,**kwargs)
+        os.close(k2d_r);os.close(d2k_w)
+        ipc_tx=os.fdopen(k2d_w,'w',encoding='utf-8',buffering=1)
+        ipc_rx=os.fdopen(d2k_r,'r',encoding='utf-8',buffering=1)
         watchdog=threading.Timer(4,lambda:proc.kill() if proc.poll() is None else None);watchdog.start()
         frames=[]
         try:
             while True:
-                line=proc.stdout.readline()
+                line=ipc_rx.readline()
                 if not line and mode in ('startup','input'):break
                 assert line,(lang,mode,'early EOF',proc.stderr.read())
                 frame=json.loads(line);frames.append(frame)
                 if frame['frame_type']=='log' and frame['record']['message'].startswith('{'):
                     value=json.loads(frame['record']['message'])
                     if mode=='input' and value.get('ready'):
-                        proc.stdin.write(json.dumps({'frame_type':'deliver','data':'x'*4096})+'\n');proc.stdin.flush()
+                        ipc_tx.write(json.dumps({'frame_type':'deliver','data':'x'*4096})+'\n');ipc_tx.flush()
                     elif mode in ('outbox','frame') and value.get('passed'):
                         assert value=={'passed':True,'pending':0};break
-            proc.stdin.close();proc.wait(timeout=3)
+            ipc_tx.close();proc.wait(timeout=3);ipc_rx.close()
             error=proc.stderr.read()
             if mode=='startup':assert proc.returncode!=0 and 'start failed' in error
             else:assert proc.returncode==0 and not error,(lang,mode,error)

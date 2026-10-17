@@ -225,12 +225,66 @@ struct RestartRequest {
     exit_status: Option<String>,
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    fn fcntl(fd: std::os::raw::c_int, cmd: std::os::raw::c_int, ...) -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+fn clear_cloexec(fd: std::os::raw::c_int) -> std::io::Result<()> {
+    const F_SETFD: std::os::raw::c_int = 2;
+    let rc = unsafe { fcntl(fd, F_SETFD, 0 as std::os::raw::c_int) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn allocate_non_stdio_pipes() -> std::io::Result<(
+    std::io::PipeReader,
+    std::io::PipeWriter,
+    std::io::PipeReader,
+    std::io::PipeWriter,
+)> {
+    use std::os::fd::AsRawFd;
+    let mut held = Vec::new();
+    loop {
+        let (k2d_rx, k2d_tx) = std::io::pipe()?;
+        let (d2k_rx, d2k_tx) = std::io::pipe()?;
+        if k2d_rx.as_raw_fd() >= 3 && d2k_tx.as_raw_fd() >= 3 {
+            drop(held);
+            return Ok((k2d_rx, k2d_tx, d2k_rx, d2k_tx));
+        }
+        held.push((k2d_rx, k2d_tx, d2k_rx, d2k_tx));
+        if held.len() > 8 {
+            return Err(std::io::Error::other(
+                "failed to allocate IPC pipe descriptors >= 3",
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn SetHandleInformation(
+        hObject: *mut std::ffi::c_void,
+        dwMask: u32,
+        dwFlags: u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+
 struct DomainSupervisorInner {
     router: Arc<KernelRouter>,
     specs: RwLock<HashMap<String, DomainProcessSpec>>,
     processes: Mutex<HashMap<String, ManagedProcess>>,
     stopped_domains: Mutex<HashSet<String>>,
     restart_trackers: Mutex<HashMap<String, RestartTracker>>,
+    spawn_lock: Mutex<()>,
 }
 
 impl DomainSupervisorInner {
@@ -265,67 +319,138 @@ impl DomainSupervisorInner {
         // Stop any existing process for this domain first.
         let _ = self.stop_process_internal(&domain_id);
 
-        let mut cmd = Command::new(&spec.command);
-        cmd.args(&spec.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // Critical section for allocating dedicated dual anonymous pipes and spawning the child
+        // so concurrent domain spawns never leak inheritable pipe endpoints across domains.
+        let (mut child, k2d_tx, d2k_rx) = {
+            let _spawn_guard = self.spawn_lock.lock();
 
-        if let Some(dir) = &spec.working_dir {
-            cmd.current_dir(dir);
-        }
+            #[cfg(unix)]
+            let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) =
+                allocate_non_stdio_pipes().map_err(|source| SupervisorError::SpawnFailed {
+                    domain: domain_id.clone(),
+                    source,
+                })?;
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let alt_cmd = if spec.command == "python3" {
-                    Some("python")
-                } else if spec.command == "python" {
-                    Some("python3")
-                } else {
-                    None
-                };
-
-                if let Some(alt) = alt_cmd {
-                    let mut fallback = Command::new(alt);
-                    fallback
-                        .args(&spec.args)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-                    if let Some(dir) = &spec.working_dir {
-                        fallback.current_dir(dir);
-                    }
-                    fallback
-                        .spawn()
-                        .map_err(|source| SupervisorError::SpawnFailed {
-                            domain: domain_id.clone(),
-                            source,
-                        })?
-                } else {
-                    return Err(SupervisorError::SpawnFailed {
+            #[cfg(windows)]
+            let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) = {
+                let (k2d_rx, k2d_tx) =
+                    std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
                         domain: domain_id.clone(),
-                        source: e,
-                    });
+                        source,
+                    })?;
+                let (d2k_rx, d2k_tx) =
+                    std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
+                        domain: domain_id.clone(),
+                        source,
+                    })?;
+                (k2d_rx, k2d_tx, d2k_rx, d2k_tx)
+            };
+
+            #[cfg(unix)]
+            let (r_fd, w_fd) = {
+                use std::os::fd::AsRawFd;
+                (k2d_rx.as_raw_fd(), d2k_tx.as_raw_fd())
+            };
+
+            #[cfg(windows)]
+            let (r_handle, w_handle) = {
+                use std::os::windows::io::AsRawHandle;
+                let r_h = k2d_rx.as_raw_handle();
+                let w_h = d2k_tx.as_raw_handle();
+                unsafe {
+                    if SetHandleInformation(r_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                        == 0
+                        || SetHandleInformation(
+                            w_h as *mut _,
+                            HANDLE_FLAG_INHERIT,
+                            HANDLE_FLAG_INHERIT,
+                        ) == 0
+                    {
+                        return Err(SupervisorError::SpawnFailed {
+                            domain: domain_id.clone(),
+                            source: std::io::Error::last_os_error(),
+                        });
+                    }
                 }
-            }
-            Err(e) => {
-                return Err(SupervisorError::SpawnFailed {
+                (r_h as usize, w_h as usize)
+            };
+
+            let configure_cmd = |cmd: &mut Command| {
+                cmd.args(&spec.args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                if let Some(dir) = &spec.working_dir {
+                    cmd.current_dir(dir);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::CommandExt;
+                    cmd.env("ATELIER_IPC_READ_FD", r_fd.to_string())
+                        .env("ATELIER_IPC_WRITE_FD", w_fd.to_string());
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            clear_cloexec(r_fd)?;
+                            clear_cloexec(w_fd)?;
+                            Ok(())
+                        });
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    cmd.env("ATELIER_IPC_READ_FD", r_handle.to_string())
+                        .env("ATELIER_IPC_WRITE_FD", w_handle.to_string())
+                        .env("ATELIER_IPC_HANDLE_MODE", "win32");
+                }
+            };
+
+            let mut cmd = Command::new(&spec.command);
+            configure_cmd(&mut cmd);
+
+            let child_res = match cmd.spawn() {
+                Ok(c) => Ok(c),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let alt_cmd = if spec.command == "python3" {
+                        Some("python")
+                    } else if spec.command == "python" {
+                        Some("python3")
+                    } else {
+                        None
+                    };
+
+                    if let Some(alt) = alt_cmd {
+                        let mut fallback = Command::new(alt);
+                        configure_cmd(&mut fallback);
+                        fallback
+                            .spawn()
+                            .map_err(|source| SupervisorError::SpawnFailed {
+                                domain: domain_id.clone(),
+                                source,
+                            })
+                    } else {
+                        Err(SupervisorError::SpawnFailed {
+                            domain: domain_id.clone(),
+                            source: e,
+                        })
+                    }
+                }
+                Err(e) => Err(SupervisorError::SpawnFailed {
                     domain: domain_id.clone(),
                     source: e,
-                });
-            }
+                }),
+            };
+
+            // Explicitly drop the child-side pipe endpoints in the parent process immediately
+            // so the Kernel only holds (k2d_tx, d2k_rx) and receives immediate EOF when the domain exits.
+            drop(k2d_rx);
+            drop(d2k_tx);
+
+            let child = child_res?;
+            (child, k2d_tx, d2k_rx)
         };
 
         let pid = child.id();
-        let child_stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| SupervisorError::StdioCaptureFailed(domain_id.clone()))?;
-        let child_stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SupervisorError::StdioCaptureFailed(domain_id.clone()))?;
+        let child_stdout = child.stdout.take();
         let child_stderr = child.stderr.take();
 
         let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
@@ -354,15 +479,15 @@ impl DomainSupervisorInner {
             tracker.last_spawn_instant = Some(Instant::now());
         }
 
-        // Writer thread: Kernel -> Domain ChildStdin (JSON-Lines)
+        // Writer thread: Kernel -> Domain dedicated pipe A (k2d_tx, JSON-Lines)
         let writer_domain = domain_id.clone();
         thread::Builder::new()
             .name(format!("kernel-pipe-tx-{writer_domain}-{instance_id}"))
             .spawn(move || {
-                let mut stdin = child_stdin;
+                let mut pipe_tx = k2d_tx;
                 while let Ok(frame) = rx.recv() {
                     if let Ok(line) = serde_json::to_string(&frame) {
-                        if writeln!(stdin, "{line}").is_err() || stdin.flush().is_err() {
+                        if writeln!(pipe_tx, "{line}").is_err() || pipe_tx.flush().is_err() {
                             break;
                         }
                     }
@@ -370,7 +495,7 @@ impl DomainSupervisorInner {
             })
             .ok();
 
-        // Reader thread: Domain ChildStdout -> Kernel (physically bound to `(domain_id, instance_id)`)
+        // Reader thread: Domain -> Kernel dedicated pipe B (d2k_rx, physically bound to `(domain_id, instance_id)`)
         let reader_domain = domain_id.clone();
         let router_ref = Arc::clone(&self.router);
         let stopping_ref = Arc::clone(&stopping);
@@ -379,7 +504,7 @@ impl DomainSupervisorInner {
         thread::Builder::new()
             .name(format!("kernel-pipe-rx-{reader_domain}-{instance_id}"))
             .spawn(move || {
-                let reader = BufReader::new(child_stdout);
+                let reader = BufReader::new(d2k_rx);
                 for line in reader.lines() {
                     match line {
                         Ok(raw_line) => {
@@ -392,13 +517,13 @@ impl DomainSupervisorInner {
                         Err(_) => break,
                     }
                 }
-                // When stdout EOF is reached, if not intentionally stopped by kernel,
+                // When dedicated IPC pipe EOF is reached, if not intentionally stopped by kernel,
                 // mark domain as Faulted ONLY IF `instance_id` is still the current generation.
                 if !stopping_ref.load(Ordering::SeqCst) {
                     router_ref.mark_domain_faulted_for_instance(
                         &reader_domain,
                         Some(instance_id),
-                        "domain process exited or closed stdout pipe",
+                        "domain process exited or closed IPC pipe",
                     );
 
                     // Reap child process to get exit status and prevent zombie process
@@ -416,7 +541,45 @@ impl DomainSupervisorInner {
             })
             .ok();
 
-        // Fallback Stderr text pump: captures unhandled stderr / print / tracebacks and routes into unified logger
+        // Diagnostic Stdout text pump: captures third-party print() / C++ stdout output without polluting the IPC pipe
+        if let Some(child_stdout) = child_stdout {
+            let stdout_domain = domain_id.clone();
+            let logger_ref = Arc::clone(self.router.logger());
+            let stopping_ref = Arc::clone(&stopping);
+            thread::Builder::new()
+                .name(format!("kernel-pipe-out-{stdout_domain}-{instance_id}"))
+                .spawn(move || {
+                    let reader = BufReader::new(child_stdout);
+                    for line in reader.lines().flatten() {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if stopping_ref.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        logger_ref.reinject(LogRecord {
+                            source_domain: Some(stdout_domain.clone()),
+                            id: None,
+                            ts: now_secs_f64(),
+                            level: "INFO".to_string(),
+                            layer: "SUBPROC".to_string(),
+                            component: stdout_domain.clone(),
+                            message: trimmed.to_string(),
+                            phase: String::new(),
+                            console_only: false,
+                            ephemeral: false,
+                            key: None,
+                            frac: None,
+                            waiting: false,
+                            done: false,
+                        });
+                    }
+                })
+                .ok();
+        }
+
+        // Diagnostic Stderr text pump: captures unhandled stderr / warnings / tracebacks and routes into unified logger
         if let Some(child_stderr) = child_stderr {
             let stderr_domain = domain_id;
             let logger_ref = Arc::clone(self.router.logger());
@@ -679,6 +842,7 @@ impl DomainSupervisor {
             processes: Mutex::new(HashMap::new()),
             stopped_domains: Mutex::new(HashSet::new()),
             restart_trackers: Mutex::new(HashMap::new()),
+            spawn_lock: Mutex::new(()),
         });
         let (restart_tx, restart_rx) = mpsc::channel::<RestartRequest>();
 

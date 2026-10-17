@@ -7,6 +7,20 @@ use atelier_kernel::{
 };
 use serde_json::json;
 
+const PY_IPC_PREAMBLE: &str = r#"
+import json, os, sys, time
+r_val = int(os.environ["ATELIER_IPC_READ_FD"])
+w_val = int(os.environ["ATELIER_IPC_WRITE_FD"])
+if os.name == "nt" and os.environ.get("ATELIER_IPC_HANDLE_MODE") in ("win32", "win32_handle"):
+    import msvcrt
+    r_fd = msvcrt.open_osfhandle(r_val, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    w_fd = msvcrt.open_osfhandle(w_val, getattr(os, "O_BINARY", 0))
+else:
+    r_fd, w_fd = r_val, w_val
+ipc_in = os.fdopen(r_fd, "r", encoding="utf-8", buffering=1, closefd=False)
+ipc_out = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1, closefd=False)
+"#;
+
 #[test]
 fn test_log_origin_additive_migration_and_restart() {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -397,33 +411,36 @@ fn test_os_process_stdio_supervision_and_observer() {
     let observer_rx = kernel.observer().subscribe();
     let caller = kernel.attach_domain("caller");
 
-    // Spawn a real external OS process (using `/bin/sh -c`) that speaks the Atelier Kernel JSON-Lines protocol over stdin/stdout!
+    // Spawn a real external OS process that speaks the Atelier Kernel JSON-Lines protocol over dedicated pipes.
     // It registers handler `echo`, reads one delivered message from stdin, emits Received -> Started -> Completed, and then exits.
-    let shell_script = r#"
-        echo '{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{"handlers":["echo"]},"data":{}}'
-        while IFS= read -r line; do
-            case "$line" in
-                *'"frame_type":"deliver"'*)
-                    msg_id=$(echo "$line" | sed -n 's/.*"message_id":"\([^"]*\)".*/\1/p')
-                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"ext_sh.echo\",\"status\":\"received\",\"data\":null}"
-                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"ext_sh.echo\",\"status\":\"started\",\"data\":null}"
-                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"ext_sh.echo\",\"status\":\"completed\",\"data\":{\"echoed_by\":\"os_pipe_sh\"}}"
-                    break
-                    ;;
-            esac
-        done
-    "#;
+    let script = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+print("normal stdout noise from child process")
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["echo"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
+for line in ipc_in:
+    frame = json.loads(line)
+    if frame.get("frame_type") == "deliver":
+        msg_id = frame["message_id"]
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"ext_sh.echo","status":"received","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"ext_sh.echo","status":"started","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"ext_sh.echo","status":"completed","data":{{"echoed_by":"os_pipe_sh"}}}}) + "\n")
+        ipc_out.flush()
+        break
+"#
+    );
 
     let pid = kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "ext_sh".to_string(),
-            command: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), shell_script.to_string()],
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script],
             working_dir: None,
             auto_restart: false,
             ..Default::default()
         })
-        .expect("Failed to spawn external shell domain process");
+        .expect("Failed to spawn external domain process");
     assert!(pid > 0);
 
     // Wait briefly for `ext_sh` child process to register its `echo` handler over stdout pipe
@@ -731,32 +748,31 @@ fn test_domain_auto_restart_on_unexpected_exit() {
     let kernel = AtelierKernel::new_in_memory().unwrap();
     let caller = kernel.attach_domain("test_client");
 
-    // Shell script that registers `ping`, handles messages, and crashes if told to
-    let script = r#"
-        echo '{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{"handlers":["ping"]},"data":{}}'
-        while IFS= read -r line; do
-            case "$line" in
-                *'"frame_type":"deliver"'*)
-                    msg_id=$(echo "$line" | sed -n 's/.*"message_id":"\([^"]*\)".*/\1/p')
-                    if echo "$line" | grep -q '"crash":true'; then
-                        echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"received\",\"data\":null}"
-                        echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"started\",\"data\":null}"
-                        # Exit unexpectedly!
-                        exit 99
-                    fi
-                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"received\",\"data\":null}"
-                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"started\",\"data\":null}"
-                    echo "{\"frame_type\":\"receipt\",\"message_id\":\"$msg_id\",\"target\":\"resilient_sh.ping\",\"status\":\"completed\",\"data\":{\"reply\":\"pong\"}}"
-                    ;;
-            esac
-        done
-    "#;
+    // Python script that registers `ping`, handles messages, and crashes if told to
+    let script = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["ping"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
+for line in ipc_in:
+    frame = json.loads(line)
+    if frame.get("frame_type") == "deliver":
+        msg_id = frame["message_id"]
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"resilient_sh.ping","status":"received","data":None}}) + "\n")
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"resilient_sh.ping","status":"started","data":None}}) + "\n")
+        if frame.get("data", {{}}).get("crash") == True:
+            ipc_out.flush()
+            sys.exit(99)
+        ipc_out.write(json.dumps({{"frame_type":"receipt","message_id":msg_id,"target":"resilient_sh.ping","status":"completed","data":{{"reply":"pong"}}}}) + "\n")
+        ipc_out.flush()
+"#
+    );
 
     let pid1 = kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "resilient_sh".to_string(),
-            command: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script],
             working_dir: None,
             auto_restart: true,
             max_restarts: Some(5),
@@ -867,18 +883,21 @@ fn test_domain_auto_restart_on_unexpected_exit() {
 fn test_explicit_stop_does_not_auto_restart() {
     let kernel = AtelierKernel::new_in_memory().unwrap();
 
-    let script = r#"
-        echo '{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{"handlers":["ping"]},"data":{}}'
-        while IFS= read -r line; do
-            :
-        done
-    "#;
+    let script = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["ping"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
+for _ in ipc_in:
+    pass
+"#
+    );
 
     kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "stop_test".to_string(),
-            command: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script],
             working_dir: None,
             auto_restart: true,
             max_restarts: Some(5),
@@ -922,8 +941,8 @@ fn test_auto_restart_respects_max_restarts_limit() {
     kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "doomed_domain".to_string(),
-            command: "/bin/sh".to_string(),
-            args: vec!["-c", "exit 1"].iter().map(|s| s.to_string()).collect(),
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), "import sys; sys.exit(1)".to_string()],
             working_dir: None,
             auto_restart: true,
             max_restarts: Some(2),
@@ -1295,59 +1314,49 @@ fn test_single_domain_blocking_head_of_line_isolation() {
     let kernel = AtelierKernel::new_in_memory().unwrap();
     kernel.logger().set_console_enabled(false);
 
-    // 1. Spawn `blocked_domain`: registers `hang`, then sleeps without ever reading stdin again.
-    let blocked_script = r#"
-import json, sys, time
-sys.stdout.write(json.dumps({
-    "frame_type": "send",
-    "seq": 1,
-    "targets": ["kernel.registry"],
-    "message_type": "RegisterHandlers",
-    "params": {"handlers": ["hang"]},
-    "data": {}
-}) + "\n")
-sys.stdout.flush()
-# Read the registration receipts, then freeze completely without reading stdin
+    // 1. Spawn `blocked_domain`: registers `hang`, then sleeps without ever reading IPC read pipe again.
+    let blocked_script = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["hang"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
+# Read the registration receipts, then freeze completely without reading IPC pipe
 for _ in range(4):
-    sys.stdin.readline()
+    ipc_in.readline()
 time.sleep(3600)
-"#;
+"#
+    );
 
     // 2. Spawn `healthy_domain`: registers `echo` and immediately completes every delivery.
-    let healthy_script = r#"
-import json, sys
-sys.stdout.write(json.dumps({
-    "frame_type": "send",
-    "seq": 1,
-    "targets": ["kernel.registry"],
-    "message_type": "RegisterHandlers",
-    "params": {"handlers": ["echo"]},
-    "data": {}
-}) + "\n")
-sys.stdout.flush()
+    let healthy_script = format!(
+        r#"
+{PY_IPC_PREAMBLE}
+ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["echo"]}},"data":{{}}}}) + "\n")
+ipc_out.flush()
 
-for raw in sys.stdin:
+for raw in ipc_in:
     frame = json.loads(raw)
     if frame.get("frame_type") == "deliver":
         mid = frame["message_id"]
         target = frame["target"]
         for st in ("received", "started"):
-            sys.stdout.write(json.dumps({
+            ipc_out.write(json.dumps({{
                 "frame_type": "receipt",
                 "message_id": mid,
                 "target": target,
                 "status": st,
                 "data": None
-            }) + "\n")
-        sys.stdout.write(json.dumps({
+            }}) + "\n")
+        ipc_out.write(json.dumps({{
             "frame_type": "receipt",
             "message_id": mid,
             "target": target,
             "status": "completed",
-            "data": {"echo": frame.get("data")}
-        }) + "\n")
-        sys.stdout.flush()
-"#;
+            "data": {{"echo": frame.get("data")}}
+        }}) + "\n")
+        ipc_out.flush()
+"#
+    );
 
     kernel
         .spawn_process_domain(DomainProcessSpec {
@@ -1543,16 +1552,19 @@ fn test_machine_constitution_checker_m1_to_m7() {
     assert!(rep_m1.violations.iter().any(|v| v.rule == "M1"));
 
     // M4 & M5 violations in Python and JS domain files
+    // Note: print() and console.log() are allowed (stdout is isolated from dedicated IPC pipes),
+    // while direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD is an M5 violation.
     let bad_py = domains_dir.join("bad_domain.py");
     std::fs::write(
         &bad_py,
         r#"
 from ..other_domain import internal_helper
 import sqlite3
+import os
 
 def handler(msg):
-    print("unauthorized stdout pollution")
-    print("stderr is allowed", file=sys.stderr)
+    print("normal stdout print is safe with dedicated dual anonymous pipes")
+    raw_fd = os.environ.get("ATELIER_IPC_WRITE_FD")
 "#,
     )
     .unwrap();
@@ -1563,8 +1575,8 @@ def handler(msg):
         r#"
 const secret = require('../other_domain/private');
 const sqlite3 = require('sqlite3');
-console.log("stdout pollution");
-console.error("stderr is allowed");
+console.log("normal stdout console.log is safe");
+const rawFd = process.env.ATELIER_IPC_READ_FD;
 "#,
     )
     .unwrap();

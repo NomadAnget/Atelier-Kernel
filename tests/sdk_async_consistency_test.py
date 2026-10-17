@@ -65,16 +65,34 @@ d.runAsync({onStart:()=>d._submit(['worker.manual'],'Manual',{}, {},10000),onClo
 
 def exercise(language):
     stderr=open(WORK/(language+'.stderr'),'w')
+    k2d_r,k2d_w=os.pipe()
+    d2k_r,d2k_w=os.pipe()
     env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')}
+    kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':stderr,'text':True,'bufsize':1}
+    if os.name=='nt':
+        import msvcrt
+        os.set_inheritable(k2d_r,True);os.set_inheritable(d2k_w,True)
+        env['ATELIER_IPC_READ_FD']=str(msvcrt.get_osfhandle(k2d_r))
+        env['ATELIER_IPC_WRITE_FD']=str(msvcrt.get_osfhandle(d2k_w))
+        env['ATELIER_IPC_HANDLE_MODE']='win32'
+        kwargs['close_fds']=False
+    else:
+        env['ATELIER_IPC_READ_FD']=str(k2d_r)
+        env['ATELIER_IPC_WRITE_FD']=str(d2k_w)
+        kwargs['pass_fds']=(k2d_r,d2k_w)
     command=[sys.executable,str(WORK/'fixture.py')] if language=='python' else ['node',str(WORK/'fixture.cjs'),str(ROOT/'sdk/nodejs')]
-    process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=stderr,text=True,env=env,bufsize=1)
+    process=subprocess.Popen(command,env=env,**kwargs)
+    os.close(k2d_r);os.close(d2k_w)
+    ipc_tx=os.fdopen(k2d_w,'w',encoding='utf-8',buffering=1)
+    ipc_rx=os.fdopen(d2k_r,'r',encoding='utf-8',buffering=1)
     inbox=queue.Queue()
     def read():
-        for line in process.stdout:inbox.put(json.loads(line))
+        for line in ipc_rx:inbox.put(json.loads(line))
+        ipc_rx.close()
         inbox.put(None)
     threading.Thread(target=read,daemon=True).start()
     sent=[];logs=[];batch=[];sequence=0
-    def write(frame):process.stdin.write(json.dumps(frame,ensure_ascii=False)+'\n');process.stdin.flush()
+    def write(frame):ipc_tx.write(json.dumps(frame,ensure_ascii=False)+'\n');ipc_tx.flush()
     def deliver(action,token='',blob=''):
         nonlocal sequence
         sequence+=1;mid='incoming-'+str(sequence)
@@ -110,7 +128,7 @@ def exercise(language):
     results=[]
     try:
         while not sent:next_frame()
-        process.stdin.write('invalid json\n[]\n');process.stdin.flush()
+        ipc_tx.write('invalid json\n[]\n');ipc_tx.flush()
         mids=[deliver('concurrent',str(i)) for i in range(8)]
         got={}
         while len(got)<8:
@@ -138,7 +156,7 @@ def exercise(language):
         results.append('512KiB delivery and receipt / pending cleanup')
         mid=deliver('disconnect')
         while not any(f.get('data',{}).get('action')=='disconnect' for f in sent):next_frame()
-        process.stdin.close()
+        ipc_tx.close()
         while True:
             frame=inbox.get(timeout=5)
             if frame is None:break

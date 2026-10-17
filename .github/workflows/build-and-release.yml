@@ -17,9 +17,13 @@ permissions:
 
 jobs:
   ci-test:
-    name: Fast CI Verification (Rust Kernel & Cross-Language SDKs)
+    name: Fast CI Verification (${{ matrix.os }})
     if: ${{ !startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -50,12 +54,13 @@ jobs:
         run: cargo test
 
       - name: Run Cross-Language SDK Consistency Test Suite
+        shell: bash
         run: |
-          python3 tests/sdk_consistency_test.py
-          python3 tests/sdk_async_consistency_test.py
-          python3 tests/sdk_portable_features_test.py
-          python3 tests/sdk_transport_bounds_test.py
-          python3 tests/sdk_message_ids_test.py
+          python3 tests/sdk_consistency_test.py || python tests/sdk_consistency_test.py
+          python3 tests/sdk_async_consistency_test.py || python tests/sdk_async_consistency_test.py
+          python3 tests/sdk_portable_features_test.py || python tests/sdk_portable_features_test.py
+          python3 tests/sdk_transport_bounds_test.py || python tests/sdk_transport_bounds_test.py
+          python3 tests/sdk_message_ids_test.py || python tests/sdk_message_ids_test.py
 
   build-sdk-packages:
     name: Build Domain SDKs (Python Wheel & Node.js NPM)
@@ -126,6 +131,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Install Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -139,7 +149,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run Kernel Unit & Integration Tests
-        if: matrix.os == 'ubuntu-latest'
         run: cargo test
 
       - name: Build Release Kernel Binary

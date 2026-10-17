@@ -331,6 +331,41 @@ class AtelierDomain {
   }
 
   /**
+   * Queries persisted logs from SQLite `hub_logs` via `kernel.logger` (`QueryLogs`).
+   */
+  queryLogs(arg1 = {}, level, layer, component, phase, sinceTs, limit = 200) {
+    const params = { limit };
+    if (typeof arg1 === "object" && arg1 !== null) {
+      if (arg1.domain !== undefined) params.domain_id = arg1.domain;
+      if (arg1.domainId !== undefined) params.domain_id = arg1.domainId;
+      if (arg1.domain_id !== undefined) params.domain_id = arg1.domain_id;
+      if (arg1.source_domain !== undefined) params.domain_id = arg1.source_domain;
+      if (arg1.level !== undefined) params.level = arg1.level;
+      if (arg1.layer !== undefined) params.layer = arg1.layer;
+      if (arg1.component !== undefined) params.component = arg1.component;
+      if (arg1.phase !== undefined) params.phase = arg1.phase;
+      if (arg1.sinceTs !== undefined) params.since_ts = arg1.sinceTs;
+      if (arg1.since_ts !== undefined) params.since_ts = arg1.since_ts;
+      if (arg1.limit !== undefined) params.limit = arg1.limit;
+    } else {
+      if (arg1 !== undefined) params.domain_id = arg1;
+      if (level !== undefined) params.level = level;
+      if (layer !== undefined) params.layer = layer;
+      if (component !== undefined) params.component = component;
+      if (phase !== undefined) params.phase = phase;
+      if (sinceTs !== undefined) params.since_ts = sinceTs;
+    }
+    return this.send("kernel.logger", "QueryLogs", params, {});
+  }
+
+  /**
+   * Queries active in-flight task progress indicators via `kernel.logger` (`QueryProgress`).
+   */
+  queryProgress() {
+    return this.send("kernel.logger", "QueryProgress", {}, {});
+  }
+
+  /**
    * Reports a lifecycle stage receipt (`received`, `started`, `completed`, `execution_failed`).
    */
   reportReceipt(messageId, target, status, data = null) {
@@ -355,9 +390,17 @@ class AtelierDomain {
   }
 }
 
+const KERNEL_REGISTRY_TARGET = "kernel.registry";
+const KERNEL_STORAGE_TARGET = "kernel.storage";
+const KERNEL_LOGGER_TARGET = "kernel.logger";
+const KERNEL_TELEMETRY_TARGET = "kernel.telemetry";
+const KERNEL_NOTIFY_TARGET = "kernel.notify";
+
 const MSG_REGISTER_HANDLERS = "RegisterHandlers";
 const MSG_UNREGISTER_HANDLERS = "UnregisterHandlers";
 const MSG_QUERY_HANDLERS = "QueryHandlers";
+const MSG_QUERY_LOGS = "QueryLogs";
+const MSG_QUERY_PROGRESS = "QueryProgress";
 const MSG_STORAGE_INSERT = "StorageInsert";
 const MSG_STORAGE_QUERY = "StorageQuery";
 const MSG_STORAGE_UPDATE = "StorageUpdate";
@@ -371,10 +414,17 @@ module.exports = {
   DomainExecutionFailed,
   DomainLogger,
   DomainRequestError,
+  KERNEL_LOGGER_TARGET,
+  KERNEL_NOTIFY_TARGET,
+  KERNEL_REGISTRY_TARGET,
+  KERNEL_STORAGE_TARGET,
+  KERNEL_TELEMETRY_TARGET,
   MSG_DELIVERY_DURABLE,
   MSG_DELIVERY_EPHEMERAL,
   MSG_DELIVERY_VOLATILE,
   MSG_QUERY_HANDLERS,
+  MSG_QUERY_LOGS,
+  MSG_QUERY_PROGRESS,
   MSG_REGISTER_HANDLERS,
   MSG_STORAGE_DELETE,
   MSG_STORAGE_INSERT,

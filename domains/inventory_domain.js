@@ -98,7 +98,7 @@ async function tick() {
     });
   } else {
     await submit(
-      ["web_ui.metric_tick"],
+      ["kernel.telemetry"],
       "StockTelemetry",
       { warehouse: "WH-NODE-01" },
       { sku, stock: stockLedger[sku], total_skus: skus.length }

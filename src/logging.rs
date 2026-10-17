@@ -152,9 +152,15 @@ impl LogStore {
                 (w, r)
             }
             None => {
-                let w = Connection::open_in_memory()?;
-                // In-memory mode: use shared cache or clone DDL
-                let r = Connection::open_in_memory()?;
+                let uri = format!(
+                    "file:hub_logs_{:x}?mode=memory&cache=shared",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
+                let w = Connection::open(&uri)?;
+                let r = Connection::open(&uri)?;
                 (w, r)
             }
         };
@@ -305,6 +311,20 @@ impl LogStore {
         phase: Option<&str>,
         since_ts: Option<f64>,
     ) -> Result<Vec<LogRecord>, StorageError> {
+        self.query_with_domain(limit, level, layer, component, phase, since_ts, None)
+    }
+
+    /// Queries historical records from `hub_logs` with optional source_domain filter.
+    pub fn query_with_domain(
+        &self,
+        limit: usize,
+        level: Option<&str>,
+        layer: Option<&str>,
+        component: Option<&str>,
+        phase: Option<&str>,
+        since_ts: Option<f64>,
+        source_domain: Option<&str>,
+    ) -> Result<Vec<LogRecord>, StorageError> {
         let conn = self.query_conn.lock();
         let mut sql = format!(
             "SELECT id, ts, level, layer, component, message, phase, source_domain FROM {LOGS_TABLE} WHERE 1=1"
@@ -338,6 +358,13 @@ impl LogStore {
         if let Some(ts) = since_ts {
             sql.push_str(" AND ts >= ?");
             params_vec.push(Box::new(ts));
+        }
+        if let Some(domain) = source_domain {
+            if !domain.is_empty() {
+                sql.push_str(" AND (source_domain = ? OR component = ?)");
+                params_vec.push(Box::new(domain.to_string()));
+                params_vec.push(Box::new(domain.to_string()));
+            }
         }
 
         sql.push_str(" ORDER BY id DESC LIMIT ?");
@@ -496,6 +523,21 @@ impl KernelLogHub {
     ) -> Result<Vec<LogRecord>, StorageError> {
         self.store
             .query(limit, level, layer, component, phase, since_ts)
+    }
+
+    /// Queries persisted logs from SQLite `hub_logs` with optional source_domain filter.
+    pub fn query_logs_filtered(
+        &self,
+        limit: usize,
+        level: Option<&str>,
+        layer: Option<&str>,
+        component: Option<&str>,
+        phase: Option<&str>,
+        since_ts: Option<f64>,
+        source_domain: Option<&str>,
+    ) -> Result<Vec<LogRecord>, StorageError> {
+        self.store
+            .query_with_domain(limit, level, layer, component, phase, since_ts, source_domain)
     }
 
     // --- Ergonomic Kernel Logging Helpers ---

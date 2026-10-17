@@ -14,6 +14,7 @@ use serde_json::json;
 const DEFAULT_TEMPLATE_JSON: &str = r#"{
   "db_path": "./data/atelier_kernel.db",
   "web_ui_bind": "0.0.0.0:8787",
+  "web_ui_enabled": false,
   "domains": [
     {
       "domain_id": "sample_py",
@@ -247,7 +248,8 @@ fn print_help() {
     println!();
     println!("OPTIONS:");
     println!("  --config <path>   Path to boot configuration JSON (default: ./kernel_boot.json)");
-    println!("  --headless        Run pure microkernel supervisor without Web UI dashboard");
+    println!("  --web-ui, --dashboard  Launch optional browser testing & observation console");
+    println!("  --headless        Run pure microkernel supervisor without Web UI (default)");
     println!(
         "  --smoke-test      Boot variant, verify domain registration & 4-stage messaging, and exit"
     );
@@ -333,23 +335,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if args.iter().any(|a| a == "--headless") {
-        let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
-        let spawned = kernel.supervisor().boot_from_config(&boot_config);
-        println!(
-            "[AtelierKernel] Headless runtime started ({} domains supervised from {})",
-            spawned.len(),
-            config_path
-        );
-        loop {
-            thread::sleep(Duration::from_secs(3600));
-        }
+    let enable_web_ui = (args.iter().any(|a| a == "--web-ui" || a == "--dashboard")
+        || boot_config.web_ui_enabled)
+        && !args.iter().any(|a| a == "--headless");
+
+    if enable_web_ui {
+        let kernel = Arc::new(AtelierKernel::open_with_db(&boot_config.db_path)?);
+        let web_domain = Arc::new(WebFrontendDomain::attach_with_config(kernel, &boot_config));
+        web_domain.serve_http(&boot_config.web_ui_bind)?;
+        return Ok(());
     }
 
-    // Default: Boot AtelierKernel from `kernel_boot.json` + Web Frontend Domain (`web_ui`)
-    let kernel = Arc::new(AtelierKernel::open_with_db(&boot_config.db_path)?);
-    let web_domain = Arc::new(WebFrontendDomain::attach_with_config(kernel, &boot_config));
-    web_domain.serve_http(&boot_config.web_ui_bind)?;
-
-    Ok(())
+    // Default: Headless microkernel runtime without HTTP server port overhead
+    let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
+    let spawned = kernel.supervisor().boot_from_config(&boot_config);
+    println!(
+        "[AtelierKernel] Microkernel headless runtime active ({} domain(s) supervised from {})",
+        spawned.len(),
+        config_path
+    );
+    println!(
+        "  Web UI is disabled by default. Pass --web-ui / --dashboard or set \"web_ui_enabled\": true to enable observation console."
+    );
+    loop {
+        thread::sleep(Duration::from_secs(3600));
+    }
 }

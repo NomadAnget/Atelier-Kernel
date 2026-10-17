@@ -105,6 +105,30 @@ export interface QueryHandlersResponse {
   description?: string | null;
 }
 
+export interface QueryLogsOptions {
+  domain?: string;
+  domainId?: string;
+  domain_id?: string;
+  source_domain?: string;
+  level?: string;
+  layer?: string;
+  component?: string;
+  phase?: string;
+  sinceTs?: number;
+  since_ts?: number;
+  limit?: number;
+}
+
+export interface QueryLogsResponse {
+  logs: Array<Record<string, any>>;
+  total: number;
+}
+
+export interface QueryProgressResponse {
+  progress: Array<Record<string, any>>;
+  count: number;
+}
+
 export class AtelierDomain {
   readonly context:DomainContext;
   shutdown(options?:{grace?:number}):Promise<void>;
@@ -114,6 +138,8 @@ export class AtelierDomain {
   forgetResult(messageId:string):boolean;
   queryHandlersAsync(options?:QueryHandlersOptions,requestOptions?:RequestOptions):Promise<QueryHandlersResponse>;
   getHandlerDescriptionAsync(target:string,requestOptions?:RequestOptions):Promise<string|null>;
+  queryLogsAsync(options?:QueryLogsOptions,requestOptions?:RequestOptions):Promise<QueryLogsResponse>;
+  queryProgressAsync(requestOptions?:RequestOptions):Promise<QueryProgressResponse>;
   storageInsertAsync(recordId:string,category:string,data:Record<string,any>,upsert?:boolean,options?:RequestOptions):Promise<any>;
   storageUpdateAsync(recordId:string,data:Record<string,any>,patch?:boolean,options?:RequestOptions):Promise<any>;
   storageDeleteAsync(options?:StorageDeleteOptions,requestOptions?:RequestOptions):Promise<any>;
@@ -134,6 +160,8 @@ export class AtelierDomain {
   onReceipt(fn: (receiptFrame: Record<string, any>) => void): this;
   queryHandlers(options?:QueryHandlersOptions):Promise<string>;
   queryHandlers(domain?:string,target?:string,handler?:string):Promise<string>;
+  queryLogs(options?:QueryLogsOptions):Promise<string>;
+  queryProgress():Promise<string>;
   send(target:string,messageType:string,params?:Record<string,any>,data?:any,options?:RequestOptions):Promise<string>;
   send(targets:string[],messageType:string,params?:Record<string,any>,data?:any,options?:RequestOptions):Promise<string[]>;
   storageInsert(recordId:string,category:string,data:any,upsert?:boolean):Promise<string>;
@@ -158,9 +186,17 @@ export class DomainRequestError extends Error {
   constructor(status: string, data?: any, messageId?: string | null);
 }
 
+export const KERNEL_REGISTRY_TARGET: "kernel.registry";
+export const KERNEL_STORAGE_TARGET: "kernel.storage";
+export const KERNEL_LOGGER_TARGET: "kernel.logger";
+export const KERNEL_TELEMETRY_TARGET: "kernel.telemetry";
+export const KERNEL_NOTIFY_TARGET: "kernel.notify";
+
 export const MSG_REGISTER_HANDLERS: "RegisterHandlers";
 export const MSG_UNREGISTER_HANDLERS: "UnregisterHandlers";
 export const MSG_QUERY_HANDLERS: "QueryHandlers";
+export const MSG_QUERY_LOGS: "QueryLogs";
+export const MSG_QUERY_PROGRESS: "QueryProgress";
 export const MSG_STORAGE_INSERT: "StorageInsert";
 export const MSG_STORAGE_QUERY: "StorageQuery";
 export const MSG_STORAGE_UPDATE: "StorageUpdate";

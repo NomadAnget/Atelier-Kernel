@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    AtelierKernel, ContractStatus, DomainPipeClient, DomainStatus, KernelBootConfig, KernelMessage,
+    AtelierKernel, ContractStatus, DomainPipeClient, DomainStatus, KernelBootConfig,
     KernelToDomainFrame, MessageReceipt,
 };
 
@@ -50,70 +50,36 @@ struct FlowSummary {
     last_ts: i64,
 }
 
-/// Web Frontend Domain (`web_ui`) plugged into `AtelierKernel`.
+/// Web Dashboard Frontend plugged into `AtelierKernel`.
 ///
-/// Communicates with `AtelierKernel` strictly through its bound domain pipe (`domain_id = "web_ui"`),
-/// while serving an interactive browser dashboard & real-time `KernelObserver` visualizer.
+/// Serves an optional browser dashboard & real-time `KernelObserver` visualizer.
+/// Sends interactive test messages via an internal `test_runner` client, while
+/// displaying notifications and telemetry directly from `KernelRouter::ui_inbox`.
 pub struct WebFrontendDomain {
     kernel: Arc<AtelierKernel>,
     client: Arc<DomainPipeClient>,
-    inbox_history: Arc<Mutex<Vec<KernelMessage>>>,
     receipt_history: Arc<Mutex<Vec<MessageReceipt>>>,
 }
 
 impl WebFrontendDomain {
-    /// Attaches the `web_ui` domain to `kernel`, registers `web_ui.push_alert` & `web_ui.metric_tick`,
+    /// Initializes WebFrontendDomain with `kernel`, sets up a test client,
     /// and boots all domains configured in `boot_config` (`kernel_boot.json`).
     pub fn attach_with_config(kernel: Arc<AtelierKernel>, boot_config: &KernelBootConfig) -> Self {
-        let client = Arc::new(kernel.attach_domain("web_ui"));
-        client.register_handlers(&["push_alert", "metric_tick"]);
-        let _ = client.drain_frames();
-
-        let inbox_history = Arc::new(Mutex::new(Vec::new()));
+        let client = Arc::new(kernel.attach_domain("test_runner"));
         let receipt_history = Arc::new(Mutex::new(Vec::new()));
 
-        // Background pump for `web_ui`'s own domain pipe
+        // Background pump to collect outbound receipts from manual dashboard actions
         let client_bg = Arc::clone(&client);
-        let inbox_bg = Arc::clone(&inbox_history);
         let receipt_bg = Arc::clone(&receipt_history);
         thread::Builder::new()
-            .name("web-ui-domain-pipe-pump".to_string())
+            .name("web-dashboard-test-pump".to_string())
             .spawn(move || {
                 while let Ok(frame) = client_bg.recv_frame() {
-                    match frame {
-                        KernelToDomainFrame::Deliver(msg) => {
-                            // Emit 4-stage receipts back to Kernel for messages delivered to `web_ui.*`
-                            client_bg.report_receipt(
-                                &msg.message_id,
-                                &msg.target,
-                                ContractStatus::Received,
-                                None,
-                            );
-                            client_bg.report_receipt(
-                                &msg.message_id,
-                                &msg.target,
-                                ContractStatus::Started,
-                                None,
-                            );
-                            client_bg.report_receipt(
-                                &msg.message_id,
-                                &msg.target,
-                                ContractStatus::Completed,
-                                Some(json!({"rendered_by": "web_ui"})),
-                            );
-
-                            let mut inbox = inbox_bg.lock();
-                            inbox.insert(0, msg);
-                            if inbox.len() > 40 {
-                                inbox.truncate(40);
-                            }
-                        }
-                        KernelToDomainFrame::Receipt(r) => {
-                            let mut recs = receipt_bg.lock();
-                            recs.insert(0, r);
-                            if recs.len() > 50 {
-                                recs.truncate(50);
-                            }
+                    if let KernelToDomainFrame::Receipt(r) = frame {
+                        let mut recs = receipt_bg.lock();
+                        recs.insert(0, r);
+                        if recs.len() > 50 {
+                            recs.truncate(50);
                         }
                     }
                 }
@@ -137,7 +103,6 @@ impl WebFrontendDomain {
         Self {
             kernel,
             client,
-            inbox_history,
             receipt_history,
         }
     }
@@ -464,7 +429,7 @@ impl WebFrontendDomain {
             .collect();
 
         let recent_events: Vec<_> = all_events.into_iter().rev().take(60).collect();
-        let webui_inbox = self.inbox_history.lock().clone();
+        let webui_inbox = self.kernel.router().ui_inbox();
         let webui_receipts = self.receipt_history.lock().clone();
         let recent_logs = self.kernel.logger().recent_logs();
         let active_progress = self.kernel.logger().active_progress();

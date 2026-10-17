@@ -435,8 +435,8 @@
   <header>
     <div class="brand">
       <h1>
-        Atelier Kernel 实时观察与测试前端域
-        <span class="badge-kernel">域身份: web_ui (OS Pipe 物理绑定)</span>
+        Atelier Kernel 实时观察与测试控制台
+        <span class="badge-kernel">测试客户端: test_runner (调试控制台)</span>
       </h1>
       <p>单机多域微内核 • 零网络内部通信 (Stdio JSON-Lines) • 内核生成 message_id • 四阶段回执 • 存储即消息</p>
     </div>
@@ -462,7 +462,7 @@
 
       <div class="card">
         <div class="card-header">
-          <h2>2. 一键功能测试场景（以 `web_ui` 域身份发送）</h2>
+          <h2>2. 一键功能测试场景（以 `test_runner` 身份发送）</h2>
           <span class="sub-hint">覆盖路由 / 幂等 / 存储 CRUD</span>
         </div>
         <div class="preset-grid">
@@ -471,7 +471,7 @@
           <button onclick="runPreset('multi_fanout')">③ 多目标并发扇出<br><span class="sub-hint">同时发 2 个有效 + 1 个无效目标</span></button>
           <button onclick="runPreset('target_invalid')">④ 测试无效目标拦截<br><span class="sub-hint">ghost.missing -> TargetInvalid</span></button>
           <button onclick="runPreset('idempotent_seq')">⑤ 测试同 seq 幂等防重<br><span class="sub-hint">连发2次同seq，不生成新ID不重投</span></button>
-          <button onclick="runPreset('reverse_push')">⑥ 触发其他域反向推前端<br><span class="sub-hint">order.callback_ui -> web_ui</span></button>
+          <button onclick="runPreset('reverse_push')">⑥ 触发其他域反向推前端<br><span class="sub-hint">order.callback_ui -> kernel.notify</span></button>
           <button onclick="runPreset('storage_insert')">⑦ 存储即消息: 新增<br><span class="sub-hint">StorageInsert 写入本域表</span></button>
           <button onclick="runPreset('storage_evolve')">⑧ 存储即消息: 结构演进<br><span class="sub-hint">StorageUpdate 动态加字段不改表</span></button>
           <button onclick="runPreset('storage_query')">⑨ 存储即消息: 跨域读取<br><span class="sub-hint">StorageQuery 读取 order 域表</span></button>
@@ -507,7 +507,7 @@
           <textarea id="inp-data">{"sku": "ATELIER-GEAR-01", "qty": 2, "custom_field_v2": {"nested": true}}</textarea>
         </div>
         <button class="primary" style="width:100%; padding:8px;" onclick="sendCustomMessage()">
-          🚀 通过 web_ui 域管道发送消息至内核
+          🚀 通过 test_runner 管道发送消息至内核
         </button>
       </div>
     </div>
@@ -521,7 +521,7 @@
             <span class="sub-hint">点击任意消息行展开查看内层 JSON 数据包与回执返回值</span>
             <select id="filter-domain" onchange="renderAll()" style="background:#0b0f17;color:#e2e8f0;border:1px solid #26334d;border-radius:5px;padding:3px 6px;font-size:11px;">
               <option value="ALL">全部发送/目标域</option>
-              <option value="web_ui">仅看 web_ui 相关</option>
+              <option value="test_runner">仅看 test_runner 相关</option>
               <option value="order">仅看 order (Python)</option>
               <option value="inventory">仅看 inventory (Node)</option>
               <option value="sensor_hub">仅看 sensor_hub (Python)</option>
@@ -537,15 +537,15 @@
       <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px;">
         <div class="card">
           <div class="card-header">
-            <h2>实时收件箱：其他域推给 `web_ui.*` 的消息</h2>
-            <span class="sub-hint">自动回传 Received/Started/Completed</span>
+            <h2>实时收件箱：其他域推给 `kernel.notify / kernel.telemetry` 的消息</h2>
+            <span class="sub-hint">微内核消息处理器原生回传</span>
           </div>
           <div id="webui-inbox" class="inbox-list"></div>
         </div>
 
         <div class="card">
           <div class="card-header">
-            <h2>`web_ui` 域最近操作结果回执</h2>
+            <h2>测试客户端最近操作结果回执</h2>
             <span class="sub-hint">包含存储查询结果与幂等反馈</span>
           </div>
           <div id="webui-receipts" class="inbox-list"></div>
@@ -847,7 +847,7 @@
               <div style="color:#cbd5e1;margin-top:2px;">${JSON.stringify(item.data)}</div>
             </div>
           `).join('')
-        : `<div class="sub-hint">等待其他域向 web_ui.push_alert / metric_tick 发送消息...</div>`;
+        : `<div class="sub-hint">等待其他域向 kernel.notify / kernel.telemetry 发送消息...</div>`;
 
       // 4. Render web_ui outbound receipts
       const recEl = document.getElementById('webui-receipts');

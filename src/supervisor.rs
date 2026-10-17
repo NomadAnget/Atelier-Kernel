@@ -56,6 +56,8 @@ pub struct KernelBootConfig {
     #[serde(default = "default_web_bind")]
     pub web_ui_bind: String,
     #[serde(default)]
+    pub web_ui_enabled: bool,
+    #[serde(default)]
     pub domains: Vec<DomainProcessSpec>,
 }
 

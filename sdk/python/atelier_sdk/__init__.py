@@ -20,9 +20,17 @@ from typing import Any, Callable, Dict, List, Optional
 
 __version__ = "0.1.6"
 
+KERNEL_REGISTRY_TARGET = "kernel.registry"
+KERNEL_STORAGE_TARGET = "kernel.storage"
+KERNEL_LOGGER_TARGET = "kernel.logger"
+KERNEL_TELEMETRY_TARGET = "kernel.telemetry"
+KERNEL_NOTIFY_TARGET = "kernel.notify"
+
 MSG_REGISTER_HANDLERS = "RegisterHandlers"
 MSG_UNREGISTER_HANDLERS = "UnregisterHandlers"
 MSG_QUERY_HANDLERS = "QueryHandlers"
+MSG_QUERY_LOGS = "QueryLogs"
+MSG_QUERY_PROGRESS = "QueryProgress"
 MSG_STORAGE_INSERT = "StorageInsert"
 MSG_STORAGE_QUERY = "StorageQuery"
 MSG_STORAGE_UPDATE = "StorageUpdate"
@@ -37,10 +45,17 @@ __all__ = [
     "DomainExecutionFailed",
     "DomainLogger",
     "DomainRequestError",
+    "KERNEL_LOGGER_TARGET",
+    "KERNEL_NOTIFY_TARGET",
+    "KERNEL_REGISTRY_TARGET",
+    "KERNEL_STORAGE_TARGET",
+    "KERNEL_TELEMETRY_TARGET",
     "MSG_DELIVERY_DURABLE",
     "MSG_DELIVERY_EPHEMERAL",
     "MSG_DELIVERY_VOLATILE",
     "MSG_QUERY_HANDLERS",
+    "MSG_QUERY_LOGS",
+    "MSG_QUERY_PROGRESS",
     "MSG_REGISTER_HANDLERS",
     "MSG_STORAGE_DELETE",
     "MSG_STORAGE_INSERT",
@@ -388,6 +403,46 @@ class AtelierDomain(AsyncRuntime):
             targets="kernel.storage",
             message_type="StorageQuery",
             params=params,
+            data={},
+        )
+
+    async def query_logs(
+        self,
+        domain: Optional[str] = None,
+        level: Optional[str] = None,
+        layer: Optional[str] = None,
+        component: Optional[str] = None,
+        phase: Optional[str] = None,
+        since_ts: Optional[float] = None,
+        limit: int = 200,
+    ):
+        """Queries persisted logs via `kernel.logger` (`QueryLogs`)."""
+        params: Dict[str, Any] = {"limit": limit}
+        if domain is not None:
+            params["domain_id"] = domain
+        if level is not None:
+            params["level"] = level
+        if layer is not None:
+            params["layer"] = layer
+        if component is not None:
+            params["component"] = component
+        if phase is not None:
+            params["phase"] = phase
+        if since_ts is not None:
+            params["since_ts"] = since_ts
+        return await self.send(
+            targets=KERNEL_LOGGER_TARGET,
+            message_type=MSG_QUERY_LOGS,
+            params=params,
+            data={},
+        )
+
+    async def query_progress(self):
+        """Queries active in-flight task progress via `kernel.logger` (`QueryProgress`)."""
+        return await self.send(
+            targets=KERNEL_LOGGER_TARGET,
+            message_type=MSG_QUERY_PROGRESS,
+            params={},
             data={},
         )
 

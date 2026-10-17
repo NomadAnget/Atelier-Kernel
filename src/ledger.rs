@@ -347,7 +347,7 @@ impl KernelLedger {
         let Some((target_domain, _)) = parse_target_address(target) else {
             return ReceiptTransition::UnauthorizedTarget;
         };
-        if target_domain != reporting_domain {
+        if target_domain != reporting_domain && !(reporting_domain == "kernel" && target_domain == "web_ui") {
             return ReceiptTransition::UnauthorizedTarget;
         }
 

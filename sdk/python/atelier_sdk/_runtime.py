@@ -105,6 +105,20 @@ class AsyncRuntime(MessageClient):
         params={k:v for k,v in dict(domain=domain,record_id=record_id,category=category,filter=filter if filter is not None else filter_map,limit=limit).items() if v is not None}
         return (await self.request('kernel.storage','StorageQuery',params,{},timeout))['data']
 
+    async def query_logs_async(self,domain=None,domain_id=None,source_domain=None,level=None,layer=None,component=None,phase=None,since_ts=None,limit=200,timeout=30):
+        params={'limit':limit}
+        d=domain if domain is not None else (domain_id if domain_id is not None else source_domain)
+        if d is not None:params['domain_id']=d
+        if level is not None:params['level']=level
+        if layer is not None:params['layer']=layer
+        if component is not None:params['component']=component
+        if phase is not None:params['phase']=phase
+        if since_ts is not None:params['since_ts']=since_ts
+        return (await self.request('kernel.logger','QueryLogs',params,{},timeout))['data']
+
+    async def query_progress_async(self,timeout=30):
+        return (await self.request('kernel.logger','QueryProgress',{},{},timeout))['data']
+
     def _write_line(self,line):
         if self._state=='closed':raise DomainRequestError('connection_closed')
         encoded=line.encode('utf-8')

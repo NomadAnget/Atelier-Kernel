@@ -122,6 +122,8 @@ function enhance(Base,RequestError,ExecutionFailed) {
     async storageUpdateAsync(recordId,data,patch=true,options={}){return (await this.request('kernel.storage','StorageUpdate',{record_id:recordId,patch},data,options)).data;}
     async storageDeleteAsync({recordId,record_id,category}={},options={}){const params={};if(recordId!==undefined||record_id!==undefined)params.record_id=recordId??record_id;if(category!==undefined)params.category=category;return (await this.request('kernel.storage','StorageDelete',params,{},options)).data;}
     async storageQueryAsync({domain,recordId,record_id,category,filter,filter_map,limit=500}={},options={}){const params={limit};for(const [key,value] of Object.entries({domain,record_id:recordId??record_id,category,filter:filter??filter_map}))if(value!==undefined)params[key]=value;return (await this.request('kernel.storage','StorageQuery',params,{},options)).data;}
+    async queryLogsAsync({domain,domainId,domain_id,source_domain,level,layer,component,phase,sinceTs,since_ts,limit=200}={},options={}){const params={limit};const d=domain??domainId??domain_id??source_domain;if(d!==undefined)params.domain_id=d;if(level!==undefined)params.level=level;if(layer!==undefined)params.layer=layer;if(component!==undefined)params.component=component;if(phase!==undefined)params.phase=phase;const ts=sinceTs??since_ts;if(ts!==undefined)params.since_ts=ts;return (await this.request('kernel.logger','QueryLogs',params,{},options)).data;}
+    async queryProgressAsync(options={}){return (await this.request('kernel.logger','QueryProgress',{},{},options)).data;}
     _writeFrame(frame) {
       if(this._state==='closed')throw new RequestError('connection_closed');
       let line;

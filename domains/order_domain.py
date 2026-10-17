@@ -46,9 +46,9 @@ async def on_slow_op(msg):
 
 @domain.handler('callback_ui')
 async def on_callback_ui(msg):
-    """向前端观察台发送反向通知消息"""
-    await domain.wait_results(await domain.send(targets=['web_ui.push_alert', 'frontend.notify'], message_type='OrderDomainNotification', params={'severity': 'info'}, data={'greeting': f'来自 Python order 域的反向通知（响应 {msg.source_domain} 的消息 {msg.message_id}）'}))
-    return {'pushed_notification_to': ['web_ui.push_alert', 'frontend.notify']}
+    """向系统通知处理器发送反向通知消息"""
+    await domain.wait_results(await domain.send(targets=['kernel.notify', 'frontend.notify'], message_type='OrderDomainNotification', params={'severity': 'info'}, data={'greeting': f'来自 Python order 域的反向通知（响应 {msg.source_domain} 的消息 {msg.message_id}）'}))
+    return {'pushed_notification_to': ['kernel.notify', 'frontend.notify']}
 
 @domain.handler('set_auto_traffic')
 def on_set_auto_traffic(msg):
@@ -77,7 +77,7 @@ async def random_traffic_worker():
         elif roll < 0.8:
             await domain.storage_insert_async(record_id=oid, category='auto_order', data={'order_id': oid, 'sku': sku, 'qty': qty, 'status': 'created'})
         else:
-            await domain.wait_results(await domain.send(targets=['web_ui.push_alert'], message_type='OrderFlashEvent', params={'level': 'info'}, data={'text': f'订单域自动生成新订单 {oid} ({sku} x{qty})'}))
+            await domain.wait_results(await domain.send(targets=['kernel.notify'], message_type='OrderFlashEvent', params={'level': 'info'}, data={'text': f'订单域自动生成新订单 {oid} ({sku} x{qty})'}))
 
 async def main():
     task = None

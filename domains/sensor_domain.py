@@ -37,11 +37,11 @@ async def random_sensor_worker():
         load = round(random.uniform(0.15, 0.95), 2)
         r = random.random()
         if r < 0.55:
-            await domain.wait_results(await domain.send(targets=['risk.evaluate', 'web_ui.metric_tick'], message_type='SensorTelemetry', params={'zone': f'ZONE-{random.randint(1, 3)}', 'tick': tick}, data={'temperature_c': temp, 'cpu_load': load}))
+            await domain.wait_results(await domain.send(targets=['risk.evaluate', 'kernel.telemetry'], message_type='SensorTelemetry', params={'zone': f'ZONE-{random.randint(1, 3)}', 'tick': tick}, data={'temperature_c': temp, 'cpu_load': load}))
         elif r < 0.85:
             await domain.storage_insert_async(record_id=f'sensor_tick_{tick % 10}', category='telemetry', data={'tick': tick, 'temperature_c': temp, 'cpu_load': load})
         else:
-            await domain.wait_results(await domain.send(targets=['legacy_alarm.trigger', 'web_ui.push_alert'], message_type='HighTempProbe', params={'probe': 'thermal_watch'}, data={'text': f'传感器探测脉冲 #{tick} (温度 {temp}°C)，同时测试未注册目标拦截'}))
+            await domain.wait_results(await domain.send(targets=['legacy_alarm.trigger', 'kernel.notify'], message_type='HighTempProbe', params={'probe': 'thermal_watch'}, data={'text': f'传感器探测脉冲 #{tick} (温度 {temp}°C)，同时测试未注册目标拦截'}))
 
 async def main():
     task = None

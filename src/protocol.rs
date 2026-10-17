@@ -7,11 +7,21 @@ use crate::logging::LogFramePayload;
 pub const KERNEL_REGISTRY_TARGET: &str = "kernel.registry";
 /// Built-in kernel target for message-driven domain storage CRUD.
 pub const KERNEL_STORAGE_TARGET: &str = "kernel.storage";
+/// Built-in kernel target for querying logs and active task progress.
+pub const KERNEL_LOGGER_TARGET: &str = "kernel.logger";
+/// Built-in kernel target for streaming runtime telemetry and metrics.
+pub const KERNEL_TELEMETRY_TARGET: &str = "kernel.telemetry";
+/// Built-in kernel target for system notifications and alerts.
+pub const KERNEL_NOTIFY_TARGET: &str = "kernel.notify";
 
 /// Built-in lifecycle / registry message types.
 pub const MSG_REGISTER_HANDLERS: &str = "RegisterHandlers";
 pub const MSG_UNREGISTER_HANDLERS: &str = "UnregisterHandlers";
 pub const MSG_QUERY_HANDLERS: &str = "QueryHandlers";
+
+/// Built-in logging message types.
+pub const MSG_QUERY_LOGS: &str = "QueryLogs";
+pub const MSG_QUERY_PROGRESS: &str = "QueryProgress";
 
 /// Built-in storage CRUD message types ("Storage as Messaging").
 pub const MSG_STORAGE_INSERT: &str = "StorageInsert";
@@ -55,8 +65,16 @@ pub enum DeliveryPolicy {
 impl DeliveryPolicy {
     /// Resolves the delivery persistence policy from `target` and `message_type`.
     pub fn resolve(target: &str, message_type: &str) -> Self {
-        if target == KERNEL_REGISTRY_TARGET || target == KERNEL_STORAGE_TARGET {
+        if target == KERNEL_REGISTRY_TARGET
+            || target == KERNEL_STORAGE_TARGET
+            || target == KERNEL_LOGGER_TARGET
+            || target == KERNEL_NOTIFY_TARGET
+            || target == "web_ui.push_alert"
+        {
             return Self::Volatile;
+        }
+        if target == KERNEL_TELEMETRY_TARGET || target == "web_ui.metric_tick" {
+            return Self::Ephemeral;
         }
         Self::from_message_type(message_type)
     }

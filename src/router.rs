@@ -11,9 +11,10 @@ use crate::logging::KernelLogHub;
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DomainStatus, DomainToKernelFrame, HandlerDescriptor, InboundReceipt,
-    KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET, KernelMessage, KernelToDomainFrame,
-    MSG_QUERY_HANDLERS, MSG_REGISTER_HANDLERS, MSG_UNREGISTER_HANDLERS, MessageReceipt,
-    OutboundMessage, now_millis, parse_target_address,
+    KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_REGISTRY_TARGET, KERNEL_STORAGE_TARGET,
+    KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_HANDLERS,
+    MSG_QUERY_LOGS, MSG_QUERY_PROGRESS, MSG_REGISTER_HANDLERS, MSG_UNREGISTER_HANDLERS,
+    MessageReceipt, OutboundMessage, now_millis, parse_target_address,
 };
 use crate::storage::DomainStorageEngine;
 
@@ -45,6 +46,8 @@ pub struct KernelRouter {
     observer: Arc<KernelObserver>,
     storage: Arc<DomainStorageEngine>,
     logger: Arc<KernelLogHub>,
+    /// In-memory ring buffer of recent notifications and telemetry frames for observation consoles.
+    ui_inbox: RwLock<Vec<KernelMessage>>,
 }
 
 impl KernelRouter {
@@ -64,6 +67,7 @@ impl KernelRouter {
             observer,
             storage,
             logger,
+            ui_inbox: RwLock::new(Vec::new()),
         }
     }
 
@@ -81,6 +85,20 @@ impl KernelRouter {
 
     pub fn logger(&self) -> &Arc<KernelLogHub> {
         &self.logger
+    }
+
+    /// Returns a snapshot of recently ingested system notifications and telemetry messages.
+    pub fn ui_inbox(&self) -> Vec<KernelMessage> {
+        self.ui_inbox.read().clone()
+    }
+
+    /// Ingests a message into the UI inbox ring buffer (bounded at 500 entries).
+    pub fn push_ui_inbox(&self, msg: KernelMessage) {
+        let mut inbox = self.ui_inbox.write();
+        inbox.insert(0, msg);
+        if inbox.len() > 500 {
+            inbox.truncate(500);
+        }
     }
 
     /// Returns the per-domain serialization mutex used to guarantee atomic generation isolation.
@@ -428,6 +446,22 @@ impl KernelRouter {
                 self.dispatch_kernel_registry(authenticated_domain, outbound.seq, &kernel_msg);
             } else if target == KERNEL_STORAGE_TARGET {
                 self.dispatch_kernel_storage(authenticated_domain, outbound.seq, &kernel_msg);
+            } else if target == KERNEL_LOGGER_TARGET {
+                self.dispatch_kernel_logger(authenticated_domain, outbound.seq, &kernel_msg);
+            } else if target == KERNEL_TELEMETRY_TARGET
+                || target == "web_ui.metric_tick"
+                || (target.starts_with("web_ui")
+                    && (kernel_msg.message_type == "MetricTick"
+                        || kernel_msg.message_type == "StockTelemetry"
+                        || kernel_msg.message_type == "SensorTelemetry"))
+            {
+                self.dispatch_kernel_telemetry(authenticated_domain, outbound.seq, &kernel_msg);
+            } else if target == KERNEL_NOTIFY_TARGET
+                || target == "web_ui.push_alert"
+                || target == "web_ui"
+                || target.starts_with("web_ui.")
+            {
+                self.dispatch_kernel_notify(authenticated_domain, outbound.seq, &kernel_msg);
             } else {
                 self.dispatch_domain_target(authenticated_domain, outbound.seq, kernel_msg);
             }
@@ -648,7 +682,140 @@ impl KernelRouter {
         }
     }
 
-    /// Emits `Sent -> Received -> Started` receipts for kernel built-in targets (`kernel.registry`, `kernel.storage`).
+    /// Dispatches a log or progress query message targeting `kernel.logger`.
+    fn dispatch_kernel_logger(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+        self.emit_kernel_internal_stages(source_domain, seq, msg);
+
+        match msg.message_type.as_str() {
+            MSG_QUERY_LOGS => {
+                let limit = msg
+                    .params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(200) as usize;
+                let level = msg.params.get("level").and_then(Value::as_str);
+                let layer = msg.params.get("layer").and_then(Value::as_str);
+                let component = msg.params.get("component").and_then(Value::as_str);
+                let phase = msg.params.get("phase").and_then(Value::as_str);
+                let since_ts = msg.params.get("since_ts").and_then(Value::as_f64);
+                let domain_id = msg
+                    .params
+                    .get("domain_id")
+                    .or_else(|| msg.params.get("domain"))
+                    .or_else(|| msg.params.get("source_domain"))
+                    .and_then(Value::as_str);
+
+                match self.logger.query_logs_filtered(
+                    limit, level, layer, component, phase, since_ts, domain_id,
+                ) {
+                    Ok(logs) => {
+                        let total = logs.len();
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::Completed,
+                            Some(json!({
+                                "logs": logs,
+                                "total": total,
+                            })),
+                        );
+                    }
+                    Err(err) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({
+                                "error": "query_logs_failed",
+                                "reason": err.to_string(),
+                            })),
+                        );
+                    }
+                }
+            }
+            MSG_QUERY_PROGRESS => {
+                let active = self.logger.active_progress();
+                let count = active.len();
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({
+                        "progress": active,
+                        "count": count,
+                    })),
+                );
+            }
+            other => {
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::ExecutionFailed,
+                    Some(json!({
+                        "error": "unsupported_logger_message_type",
+                        "message_type": other,
+                    })),
+                );
+            }
+        }
+    }
+
+    /// Dispatches a high-frequency metric/telemetry stream targeting `kernel.telemetry`.
+    fn dispatch_kernel_telemetry(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        self.push_ui_inbox(msg.clone());
+
+        self.complete_kernel_internal_target(
+            source_domain,
+            msg,
+            ContractStatus::Completed,
+            Some(json!({
+                "status": "recorded",
+                "telemetry_type": msg.message_type,
+                "source": source_domain,
+            })),
+        );
+    }
+
+    /// Dispatches an asynchronous system notification or alert targeting `kernel.notify`.
+    fn dispatch_kernel_notify(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        self.push_ui_inbox(msg.clone());
+
+        let severity = msg
+            .params
+            .get("severity")
+            .or_else(|| msg.params.get("level"))
+            .and_then(Value::as_str)
+            .unwrap_or("info");
+
+        let text = msg
+            .data
+            .get("text")
+            .or_else(|| msg.data.get("greeting"))
+            .or_else(|| msg.data.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or(&msg.message_type);
+
+        match severity.to_lowercase().as_str() {
+            "warn" | "warning" => self.logger.warning("NOTIFY", source_domain, text),
+            "error" | "critical" => self.logger.error("NOTIFY", source_domain, text),
+            _ => self.logger.info("NOTIFY", source_domain, text),
+        }
+
+        self.complete_kernel_internal_target(
+            source_domain,
+            msg,
+            ContractStatus::Completed,
+            Some(json!({
+                "status": "delivered",
+                "notification_type": msg.message_type,
+                "source": source_domain,
+            })),
+        );
+    }
+
+    /// Emits `Sent -> Received -> Started` receipts for kernel built-in targets (`kernel.registry`, `kernel.storage`, `kernel.logger`, etc.).
     fn emit_kernel_internal_stages(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         let (sent_rec, created) = self.ledger.record_initial_target_state(
             &msg.message_id,

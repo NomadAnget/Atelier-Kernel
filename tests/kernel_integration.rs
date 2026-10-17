@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use atelier_kernel::{
     AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KernelToDomainFrame,
-    MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_STORAGE_DELETE,
-    MSG_STORAGE_QUERY, check_constitution,
+    KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_TELEMETRY_TARGET, MSG_DELIVERY_DURABLE,
+    MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_QUERY_LOGS, MSG_QUERY_PROGRESS,
+    MSG_STORAGE_DELETE, MSG_STORAGE_QUERY, check_constitution,
 };
 use serde_json::json;
 
@@ -1803,4 +1804,192 @@ fn test_query_available_handlers_and_auto_comment_descriptions() {
 
     kernel.supervisor().stop_process_domain("order");
     kernel.supervisor().stop_process_domain("inventory");
+}
+
+/// 16. Tests kernel native built-in message processors: `kernel.logger`, `kernel.telemetry`, `kernel.notify`,
+/// verifying that the fake `web_ui` domain is gone and external child domains can query logs over standard IPC.
+#[test]
+fn test_kernel_built_in_processors_logger_telemetry_notify() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    kernel.logger().set_console_enabled(false);
+
+    // Verify no fake `web_ui` domain is attached to the kernel
+    let domain_names: Vec<String> = kernel
+        .router()
+        .all_domains()
+        .into_iter()
+        .map(|(id, _, _)| id)
+        .collect();
+    assert!(
+        !domain_names.contains(&"web_ui".to_string()),
+        "Microkernel must not contain fake 'web_ui' domain in domain table"
+    );
+
+    let client = kernel.attach_domain("worker_domain");
+
+    // 1. Emit some logs and active progress
+    kernel.logger().info("CORE", "system", "Kernel initial startup completed");
+    kernel.logger().warning("ORDER", "order_svc", "Order rate approaching soft limit");
+
+    use atelier_kernel::LogRecord;
+    kernel.logger().reinject(LogRecord {
+        ephemeral: true,
+        key: Some("batch_export_99".to_string()),
+        frac: Some(0.42),
+        message: "Processing export chunk 4/10".to_string(),
+        ..Default::default()
+    });
+
+    // Wait briefly for LogStore async batch to flush to SQLite
+    std::thread::sleep(Duration::from_millis(250));
+
+    // 2. Query logs via IPC message targeting `kernel.logger` (`QueryLogs`)
+    let log_msg_ids = client.send(
+        vec![KERNEL_LOGGER_TARGET.to_string()],
+        MSG_QUERY_LOGS,
+        json!({ "limit": 20 }),
+        json!({}),
+    );
+    let frames = client.drain_frames();
+    let completed_log = frames
+        .into_iter()
+        .filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r)
+                if r.message_id == log_msg_ids[0] && r.status == ContractStatus::Completed =>
+            {
+                r.data
+            }
+            _ => None,
+        })
+        .next()
+        .expect("Expected Completed receipt for QueryLogs");
+
+    let logs = completed_log["logs"].as_array().expect("logs array");
+    assert!(!logs.is_empty(), "Should return recorded logs");
+    assert!(
+        logs.iter()
+            .any(|l| l["message"].as_str() == Some("Kernel initial startup completed")),
+        "Should find the startup log entry"
+    );
+
+    // 3. Query active progress via IPC message targeting `kernel.logger` (`QueryProgress`)
+    let prog_msg_ids = client.send(
+        vec![KERNEL_LOGGER_TARGET.to_string()],
+        MSG_QUERY_PROGRESS,
+        json!({}),
+        json!({}),
+    );
+    let prog_frames = client.drain_frames();
+    let completed_prog = prog_frames
+        .into_iter()
+        .filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r)
+                if r.message_id == prog_msg_ids[0] && r.status == ContractStatus::Completed =>
+            {
+                r.data
+            }
+            _ => None,
+        })
+        .next()
+        .expect("Expected Completed receipt for QueryProgress");
+
+    let progress_list = completed_prog["progress"].as_array().expect("progress array");
+    assert!(
+        progress_list
+            .iter()
+            .any(|p| p["key"].as_str() == Some("batch_export_99")),
+        "Active progress key should be present in QueryProgress response"
+    );
+
+    // 4. Test telemetry ingestion via `kernel.telemetry`
+    let telem_msg_ids = client.send(
+        vec![KERNEL_TELEMETRY_TARGET.to_string()],
+        "StockTelemetry",
+        json!({ "warehouse": "WH-01" }),
+        json!({ "sku": "ATELIER-01", "stock": 120 }),
+    );
+    let telem_frames = client.drain_frames();
+    let telem_receipts: Vec<ContractStatus> = telem_frames
+        .into_iter()
+        .filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r) if r.message_id == telem_msg_ids[0] => Some(r.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        telem_receipts,
+        vec![
+            ContractStatus::Sent,
+            ContractStatus::Received,
+            ContractStatus::Started,
+            ContractStatus::Completed,
+        ],
+        "kernel.telemetry must emit full 4-stage lifecycle"
+    );
+
+    // Verify recorded in ui_inbox
+    let inbox = kernel.router().ui_inbox();
+    assert!(
+        inbox
+            .iter()
+            .any(|m| m.target == KERNEL_TELEMETRY_TARGET && m.message_type == "StockTelemetry"),
+        "Telemetry frame must be preserved in ui_inbox"
+    );
+
+    // 5. Test system notification ingestion via `kernel.notify`
+    let notify_msg_ids = client.send(
+        vec![KERNEL_NOTIFY_TARGET.to_string()],
+        "PushAlert",
+        json!({ "severity": "warning" }),
+        json!({ "text": "Storage threshold exceeded 90%" }),
+    );
+    let notify_frames = client.drain_frames();
+    let notify_receipts: Vec<ContractStatus> = notify_frames
+        .into_iter()
+        .filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r) if r.message_id == notify_msg_ids[0] => Some(r.status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        notify_receipts,
+        vec![
+            ContractStatus::Sent,
+            ContractStatus::Received,
+            ContractStatus::Started,
+            ContractStatus::Completed,
+        ],
+        "kernel.notify must emit full 4-stage lifecycle"
+    );
+    let inbox2 = kernel.router().ui_inbox();
+    assert!(
+        inbox2
+            .iter()
+            .any(|m| m.target == KERNEL_NOTIFY_TARGET && m.message_type == "PushAlert"),
+        "Notification frame must be preserved in ui_inbox"
+    );
+
+    // 6. Test backward compatibility aliases (`web_ui.push_alert` and `web_ui.metric_tick`)
+    let alias_ids = client.send(
+        vec![
+            "web_ui.push_alert".to_string(),
+            "web_ui.metric_tick".to_string(),
+        ],
+        "LegacyForward",
+        json!({}),
+        json!({ "legacy": true }),
+    );
+    let alias_frames = client.drain_frames();
+    let mut alias_completed = 0;
+    for f in alias_frames {
+        if let KernelToDomainFrame::Receipt(r) = f {
+            if alias_ids.contains(&r.message_id) && r.status == ContractStatus::Completed {
+                alias_completed += 1;
+            }
+        }
+    }
+    assert_eq!(
+        alias_completed, 2,
+        "Both legacy web_ui.* aliases must route and complete successfully"
+    );
 }

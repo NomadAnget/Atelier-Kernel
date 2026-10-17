@@ -1,0 +1,69 @@
+# Atelier Kernel 宪法与核心契约（V4.0）
+
+> 本文档是 **Atelier Kernel（Rust 单机多域微内核）** 的最高架构宪法与契约基线。
+> 内核只做一件事的地基：**跨语言子进程物理管道通信中转站 + 三级投递幂等账本 + 按域存储枢纽 + 统一结构化日志黑匣子**。
+> 一切设计服务于 **进程级认知隔离**：新增或修改一个业务域时，只需理解本域收发的 `<domain>.<handler>` 消息契约与本域目录代码，无需阅读其他域的实现。
+
+---
+
+## 一、三大内核契约（Kernel Contracts）
+
+### C1 · 物理管道身份与命名空间契约
+- **管道即身份**：内核在拉起子进程时，直接将子进程的 OS `stdin/stdout` 匿名管道句柄与 `domain_id` 物理绑定。
+- **命名空间强绑定**：
+  - 路由地址固定为 `<domain_id>.<handler>`；
+  - 专属存储表固定为 `store_<domain_id>`；
+  - 入站日志与 `stderr` 来源固定由内核覆写为 `source_domain = domain_id`，彻底杜绝身份伪造。
+
+### C2 · 两层消息结构与 9 类标准 `message_type` 契约
+- **上层为内核契约元数据**：包含 `logical_id`、`message_id`、`source_domain`、`targets`、`message_type`、`params`、`timestamp`。
+- **内层为业务数据包（`data`）**：标准 JSON 格式。业务数据结构演进、字段校验、前端数据脱敏等均由对应业务域自治，**内核行为与数据库表结构完全零感知**。
+- **`message_type` 三大类共 9 个标准值**：
+  1. **路由注册与注销（`target = "kernel.registry"`）**：`RegisterHandlers`、`UnregisterHandlers`
+  2. **存储即消息 CRUD（`target = "kernel.storage"`）**：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`
+  3. **域消息投递持久化策略（`target = "<domain>.<handler>"`）**：
+     - `Durable`：写入 SQLite 持久投递账本（`kernel_ledger`）+ 内存账本，支持跨重启状态恢复与审计（未显式指定时默认按 `Durable` 处理）；
+     - `Volatile`：仅进入内存账本与实时观察器（`KernelObserver`），**零磁盘写入**；
+     - `Ephemeral`：瞬态流式投递，不落盘，仅在途（In-Flight）驻留内存账本以完成四阶段回执，到达终态后立即自动从内存账本驱逐（$O(1)$ 内存开销）。
+
+### C3 · 四阶段回执与零盲发契约
+- **标准四阶段回执**：每条目标消息严格经历 `Sent`（已发出）$\rightarrow$ `Received`（已接收）$\rightarrow$ `Started`（开始执行）$\rightarrow$ `Completed`（执行完成），或进入异常终态 `TargetInvalid` / `ContractInvalid` / `ExecutionFailed`。
+- **零盲发前置拦截**：当目标 `<domain>.<handler>` 不存在或目标域未处于 `Active` 就绪态时，内核**绝不向管道盲发消息**，立即前置拦截并向发送端返回 `TargetInvalid`。
+
+---
+
+## 二、宪法分两级
+
+| 级别 | 定义 | 执法者 |
+| :--- | :--- | :--- |
+| **第一级 · 机器宪法（M1–M7）** | 机器可精确判定对错的硬性规则 | 内核运行时闸门 + 启动期自检 + `atelier-kernel --check` 静态检查器 |
+| **第二级 · 行为规范（B1–B6）** | 机器宪法全集 + 架构与工程自律准则 | 开发者与 AI Agent 共同遵守、代码审查把关 |
+
+**项目级宪法检查内置于内核可执行文件中**，一条命令即可检查变体配置、数据库表结构与各语言业务域源码：
+
+```bash
+atelier-kernel --check ./kernel_boot.json
+# 或直接指定变体/域目录：
+atelier-kernel --check .
+```
+
+### 第一级 · 机器宪法（M1–M7）
+
+| 编号 | 规则名称 | 核心约束内容 | 静态检查 (`--check`) | 启动期 / 运行时执法 |
+| :--- | :--- | :--- | :--- | :--- |
+| **M1** | **域标识与路由注册律** | `domain_id` 必须为非空 ASCII 字母、数字或 `_`，且在变体内全局唯一；处理器名非空且不含 `.`，注册后生成 `<domain_id>.<handler>` | ✓ 校验 `domain_id` 合法性与唯一性 | 运行时 [`KernelRouter`](src/router.rs) 强校验 |
+| **M2** | **管道即身份律（防伪造）** | 一切入站消息、回执、日志的发送域身份由物理管道决定；回执上报的目标 `<domain>.<handler>` 首段必须等于上报管道所属 `domain_id` | — | 运行时 [`KernelLedger`](src/ledger.rs) 越权拒收（`UnauthorizedTarget`） |
+| **M3** | **写权随域走（写隔离、读共享）** | `StorageInsert` / `StorageUpdate` / `StorageDelete` 只能修改本域 `store_<source_domain>`；`StorageQuery` 支持只读跨域查询 | — | 运行时 [`DomainStorageEngine`](src/storage.rs) 拒越域写（`CrossDomainWriteForbidden`） |
+| **M4** | **进程即边界律（禁跨域私调与直连库）** | 各域为独立子进程，严禁在域源码中跨目录相对 `import` / `require` 其他域的私有文件，严禁业务域绕过 `kernel.storage` 直接读写内核 SQLite 数据库文件 | ✓ AST/源码扫描跨域相对导入与直连 SQLite | OS 独立进程地址空间物理隔离 |
+| **M5** | **协议管道纯净律（禁裸输出污染 `stdout`）** | 子进程 `stdout` 为内核 JSON-Lines 协议专用通道，业务域代码严禁使用裸 `print()` / `console.log()` / `sys.stdout.write()` 污染 `stdout`；日志一律走 SDK `domain.logger` | ✓ 静态扫描业务域源码裸 `stdout` 输出 | 运行时非法帧立即拦截并返回 `ContractInvalid` |
+| **M6** | **配置显式律** | `kernel_boot.json` 严禁包含未知字段（`deny_unknown_fields`），`domain_id` 不得重复，工作目录与入口脚本路径必须真实存在 | ✓ 严格反序列化与入口文件存在性校验 | 启动期 [`KernelBootConfig::load_from_file`](src/supervisor.rs) 即刻报错 |
+| **M7** | **两层存储防漂移律** | 内核核心表（`kernel_ledger`、`hub_logs`、`store_<domain>`）固定为上层契约列结构，启动时校验实表列结构完整性；实表结构漂移立即报错，绝不静默改表 | ✓ 若存在数据库文件则校验表结构 | 启动期与建表期 `PRAGMA table_info` 结构防漂移校验 |
+
+### 第二级 · 行为规范（B1–B6）
+
+- **B1 单一逻辑**：同一逻辑不散落多处。新增能力前先检索现有模块。
+- **B2 认知隔离**：修改一个域只需关注本域收发的 `<domain>.<handler>` 消息契约与本域代码，跨域协作一律走内核消息。
+- **B3 显式失败，不静默兜底**：前置条件缺失、配置错误、契约不符、目标不可达（`TargetInvalid`）立即显式返回错误状态，绝不静默吞掉。
+- **B4 内核零业务绑定**：内核与 SDK 严守传输与契约边界（零业务逻辑、零业务 Schema 耦合）；业务数据脱敏、AI 推理引擎执行队列管理等一律由对应业务域/引擎域自治。
+- **B5 契约同步律**：协议、宪法或 SDK 行为发生变更时，必须同步更新本文档与 Python / Node.js 双端 SDK。
+- **B6 Handler 异步与幂等律**：Handler 保持非阻塞响应（耗时计算或排队交由域内异步任务或自有执行队列处理），并基于内核分配的 `message_id` 保障幂等。

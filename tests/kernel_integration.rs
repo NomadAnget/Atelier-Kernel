@@ -3,7 +3,7 @@ use std::time::Duration;
 use atelier_kernel::{
     AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KernelToDomainFrame,
     MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_STORAGE_DELETE,
-    MSG_STORAGE_QUERY,
+    MSG_STORAGE_QUERY, check_constitution,
 };
 use serde_json::json;
 
@@ -1497,5 +1497,124 @@ for raw in sys.stdin:
         assert_eq!(db_rec.status, ContractStatus::ExecutionFailed);
     }
 }
+
+/// 14. Tests Machine Constitution (M1–M7) static & pre-boot checker (`check_constitution`).
+#[test]
+fn test_machine_constitution_checker_m1_to_m7() {
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    // 1. Repository's own `kernel_boot.json` and `domains/` must be 100% M1–M7 compliant
+    let repo_report = check_constitution(repo_root.join("kernel_boot.json"));
+    assert!(
+        repo_report.is_ok(),
+        "Expected 0 constitutional violations in repo, got: {:?}",
+        repo_report.violations
+    );
+    assert!(repo_report.checked_configs >= 1);
+    assert!(repo_report.checked_files >= 4);
+
+    // 2. Test M1, M4, M5, M6, M7 violations on synthetic broken variant
+    let dir = repo_root
+        .join("tmp")
+        .join(format!("constitution-test-{}", uuid::Uuid::new_v4()));
+    let domains_dir = dir.join("domains");
+    std::fs::create_dir_all(&domains_dir).unwrap();
+
+    // M6 violation: unknown field in `kernel_boot.json`
+    let unknown_field_cfg = dir.join("unknown_field.json");
+    std::fs::write(
+        &unknown_field_cfg,
+        r#"{"db_path": "./test.db", "unknown_option": 123, "domains": []}"#,
+    )
+    .unwrap();
+    let rep_m6 = check_constitution(&unknown_field_cfg);
+    assert!(!rep_m6.is_ok());
+    assert!(rep_m6.violations.iter().any(|v| v.rule == "M6"));
+
+    // M1 violation: invalid domain_id with hyphen
+    let bad_id_cfg = dir.join("bad_id.json");
+    std::fs::write(
+        &bad_id_cfg,
+        r#"{"db_path": "./test.db", "domains": [{"domain_id": "bad-domain", "command": "python3", "args": []}]}"#,
+    )
+    .unwrap();
+    let rep_m1 = check_constitution(&bad_id_cfg);
+    assert!(!rep_m1.is_ok());
+    assert!(rep_m1.violations.iter().any(|v| v.rule == "M1"));
+
+    // M4 & M5 violations in Python and JS domain files
+    let bad_py = domains_dir.join("bad_domain.py");
+    std::fs::write(
+        &bad_py,
+        r#"
+from ..other_domain import internal_helper
+import sqlite3
+
+def handler(msg):
+    print("unauthorized stdout pollution")
+    print("stderr is allowed", file=sys.stderr)
+"#,
+    )
+    .unwrap();
+
+    let bad_js = domains_dir.join("bad_domain.js");
+    std::fs::write(
+        &bad_js,
+        r#"
+const secret = require('../other_domain/private');
+const sqlite3 = require('sqlite3');
+console.log("stdout pollution");
+console.error("stderr is allowed");
+"#,
+    )
+    .unwrap();
+
+    let rep_code = check_constitution(&domains_dir);
+    assert!(!rep_code.is_ok());
+    let rules: Vec<&str> = rep_code.violations.iter().map(|v| v.rule.as_str()).collect();
+    assert_eq!(rules.iter().filter(|&&r| r == "M4").count(), 4);
+    assert_eq!(rules.iter().filter(|&&r| r == "M5").count(), 2);
+
+    // M7 violation: drifted SQLite table schema
+    let drifted_db = dir.join("drifted.db");
+    {
+        let conn = rusqlite::Connection::open(&drifted_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE store_order (record_id TEXT PRIMARY KEY, wrong_column TEXT);",
+        )
+        .unwrap();
+    }
+    let valid_py = domains_dir.join("valid_order.py");
+    std::fs::remove_file(&bad_py).unwrap();
+    std::fs::remove_file(&bad_js).unwrap();
+    std::fs::write(
+        &valid_py,
+        "from atelier_sdk import AtelierDomain\ndomain = AtelierDomain()\n",
+    )
+    .unwrap();
+
+    let drift_cfg = dir.join("kernel_boot.json");
+    std::fs::write(
+        &drift_cfg,
+        r#"{
+            "db_path": "./drifted.db",
+            "domains": [
+                {
+                    "domain_id": "order",
+                    "command": "python3",
+                    "args": ["./domains/valid_order.py"]
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+
+    let rep_m7 = check_constitution(&drift_cfg);
+    assert!(!rep_m7.is_ok());
+    assert!(rep_m7.violations.iter().any(|v| v.rule == "M7"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 
 

@@ -27,6 +27,46 @@ pub enum StorageError {
     DuplicateRecord(String, String),
     #[error("cross-domain write forbidden: domain '{0}' cannot modify storage of domain '{1}'")]
     CrossDomainWriteForbidden(String, String),
+    #[error(
+        "[M7] storage schema drift on table '{table}': expected columns {expected:?}, found {actual:?}"
+    )]
+    SchemaDrift {
+        table: String,
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+}
+
+pub const DOMAIN_TABLE_COLUMNS: &[&str] = &[
+    "record_id",
+    "message_id",
+    "category",
+    "message_type",
+    "params",
+    "data",
+    "created_at",
+    "updated_at",
+];
+
+/// Verifies that an existing SQLite table's columns match `expected_cols` (Rule M7: No Schema Drift).
+pub fn verify_sqlite_table_columns(
+    conn: &Connection,
+    table: &str,
+    expected_cols: &[&str],
+) -> Result<(), StorageError> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let actual: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected: Vec<String> = expected_cols.iter().map(|s| (*s).to_string()).collect();
+    if actual != expected {
+        return Err(StorageError::SchemaDrift {
+            table: table.to_string(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 /// Stored row representation returned by `StorageQuery`.
@@ -85,7 +125,7 @@ impl DomainStorageEngine {
         })
     }
 
-    /// Ensures the dedicated storage table `store_<domain>` exists for `domain`.
+    /// Ensures the dedicated storage table `store_<domain>` exists for `domain` and verifies M7 schema integrity.
     pub fn ensure_domain_table(&self, domain: &str) -> Result<String, StorageError> {
         let table = Self::table_name(domain)?;
         let ddl = format!(
@@ -102,7 +142,9 @@ impl DomainStorageEngine {
             CREATE INDEX IF NOT EXISTS idx_{table}_category ON {table}(category);
             CREATE INDEX IF NOT EXISTS idx_{table}_msg_id ON {table}(message_id);"
         );
-        self.conn.lock().execute_batch(&ddl)?;
+        let conn = self.conn.lock();
+        conn.execute_batch(&ddl)?;
+        verify_sqlite_table_columns(&conn, &table, DOMAIN_TABLE_COLUMNS)?;
         Ok(table)
     }
 

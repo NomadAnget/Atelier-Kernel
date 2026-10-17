@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use atelier_kernel::{
     AtelierKernel, ContractStatus, DomainStatus, InteractiveFrontendDomain, KernelBootConfig,
-    KernelToDomainFrame, WebFrontendDomain,
+    KernelToDomainFrame, WebFrontendDomain, check_constitution,
 };
 use serde_json::json;
 
@@ -253,6 +253,7 @@ fn print_help() {
     );
     println!("  --cli             Run interactive CLI REPL frontend domain");
     println!("  --auto, -a        Run automated 7-stage kernel verification suite and exit");
+    println!("  --check [path]    Run Machine Constitution (M1-M7) check on config or domain directory");
     println!("  --init <dir>      Initialize a new product variant directory with config template");
     println!("  --version, -v     Print version information");
     println!("  --help, -h        Print this help message");
@@ -285,6 +286,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|w| w[0] == "--config")
         .map(|w| w[1].as_str())
         .unwrap_or("./kernel_boot.json");
+
+    if let Some(check_pos) = args.iter().position(|a| a == "--check") {
+        let check_target = args
+            .get(check_pos + 1)
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| s.as_str())
+            .unwrap_or(config_path);
+        let report = check_constitution(check_target);
+        println!(
+            "[ConstitutionCheck] Target: {} (configs={}, files={}, tables={})",
+            report.target, report.checked_configs, report.checked_files, report.checked_tables
+        );
+        if report.is_ok() {
+            println!("[ConstitutionCheck] PASSED — 0 violations found (M1–M7 compliant).");
+            return Ok(());
+        } else {
+            eprintln!(
+                "[ConstitutionCheck] FAILED — {} violation(s) found:",
+                report.violations.len()
+            );
+            for v in &report.violations {
+                eprintln!("  - {}", v);
+            }
+            std::process::exit(1);
+        }
+    }
 
     let boot_config = KernelBootConfig::load_from_file(config_path)?;
 

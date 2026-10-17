@@ -10,9 +10,21 @@ use serde_json::{Value, json};
 use crate::protocol::{
     ContractStatus, DeliveryPolicy, MessageReceipt, now_millis, parse_target_address,
 };
-use crate::storage::StorageError;
+use crate::storage::{StorageError, verify_sqlite_table_columns};
 
 pub const KERNEL_LEDGER_TABLE: &str = "kernel_ledger";
+pub const KERNEL_LEDGER_COLUMNS: &[&str] = &[
+    "message_id",
+    "logical_id",
+    "seq",
+    "source_domain",
+    "target",
+    "message_type",
+    "status",
+    "data",
+    "created_at",
+    "updated_at",
+];
 
 /// Authoritative per-target delivery record stored in the Kernel Ledger.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +141,7 @@ impl KernelLedger {
              CREATE INDEX IF NOT EXISTS idx_{KERNEL_LEDGER_TABLE}_logical ON {KERNEL_LEDGER_TABLE}(logical_id);
              CREATE INDEX IF NOT EXISTS idx_{KERNEL_LEDGER_TABLE}_status ON {KERNEL_LEDGER_TABLE}(status);"
         ))?;
+        verify_sqlite_table_columns(&conn, KERNEL_LEDGER_TABLE, KERNEL_LEDGER_COLUMNS)?;
 
         let mut deliveries_map = HashMap::new();
         let mut logical_map: HashMap<String, Vec<String>> = HashMap::new();

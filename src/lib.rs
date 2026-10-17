@@ -1,3 +1,4 @@
+pub mod discipline;
 pub mod frontend;
 pub mod ledger;
 pub mod logging;
@@ -11,6 +12,7 @@ pub mod web_frontend;
 use std::path::Path;
 use std::sync::Arc;
 
+pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
 pub use frontend::InteractiveFrontendDomain;
 pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
 pub use logging::{KernelLogHub, LogFramePayload, LogRecord, LogStore};

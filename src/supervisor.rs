@@ -32,6 +32,8 @@ pub enum SupervisorError {
         path: String,
         source: serde_json::Error,
     },
+    #[error("invalid boot config '{path}': {reason}")]
+    ConfigValidationFailed { path: String, reason: String },
     #[error("failed to spawn process for domain '{domain}': {source}")]
     SpawnFailed {
         domain: String,
@@ -47,6 +49,7 @@ pub enum SupervisorError {
 /// Adding a new domain only requires adding an entry here and providing the executable/script,
 /// without modifying or recompiling Rust kernel source code.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KernelBootConfig {
     #[serde(default = "default_db_path")]
     pub db_path: String,
@@ -65,8 +68,8 @@ fn default_web_bind() -> String {
 }
 
 impl KernelBootConfig {
-    /// Loads `KernelBootConfig` from a JSON file path and resolves relative `db_path`
-    /// and `working_dir` entries relative to the configuration file's parent directory.
+    /// Loads `KernelBootConfig` from a JSON file path, enforces M1/M6 explicit configuration rules,
+    /// and resolves relative `db_path` and `working_dir` entries relative to the configuration file's parent directory.
     pub fn load_from_file(path: impl AsRef<std::path::Path>) -> Result<Self, SupervisorError> {
         let path_ref = path.as_ref();
         let path_str = path_ref.display().to_string();
@@ -78,7 +81,7 @@ impl KernelBootConfig {
         })?;
         let mut cfg: Self =
             serde_json::from_str(&raw).map_err(|source| SupervisorError::ConfigParseFailed {
-                path: path_str,
+                path: path_str.clone(),
                 source,
             })?;
 
@@ -103,7 +106,42 @@ impl KernelBootConfig {
             }
         }
 
+        cfg.validate(&path_str)?;
         Ok(cfg)
+    }
+
+    /// Validates constitutional rules M1 (domain identifier format & uniqueness) and M6 (explicit config).
+    pub fn validate(&self, path_str: &str) -> Result<(), SupervisorError> {
+        let mut seen = HashSet::new();
+        for spec in &self.domains {
+            let id = spec.domain_id.trim();
+            if id.is_empty()
+                || !id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                return Err(SupervisorError::ConfigValidationFailed {
+                    path: path_str.to_string(),
+                    reason: format!(
+                        "[M1] invalid domain_id '{}': must be non-empty ASCII alphanumeric or '_'",
+                        spec.domain_id
+                    ),
+                });
+            }
+            if !seen.insert(id.to_string()) {
+                return Err(SupervisorError::ConfigValidationFailed {
+                    path: path_str.to_string(),
+                    reason: format!("[M1/M6] duplicate domain_id '{id}' in domains list"),
+                });
+            }
+            if spec.command.trim().is_empty() {
+                return Err(SupervisorError::ConfigValidationFailed {
+                    path: path_str.to_string(),
+                    reason: format!("[M6] domain '{id}' has an empty command"),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -121,6 +159,7 @@ pub fn default_restart_delay_ms() -> u64 {
 
 /// Configuration for spawning a language-agnostic OS process Domain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DomainProcessSpec {
     pub domain_id: String,
     pub command: String,

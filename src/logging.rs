@@ -152,13 +152,8 @@ impl LogStore {
                 (w, r)
             }
             None => {
-                let uri = format!(
-                    "file:hub_logs_{:x}?mode=memory&cache=shared",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_nanos())
-                        .unwrap_or(0)
-                );
+                let unique_id = uuid::Uuid::new_v4().simple();
+                let uri = format!("file:hub_logs_{unique_id}?mode=memory&cache=shared");
                 let w = Connection::open(&uri)?;
                 let r = Connection::open(&uri)?;
                 (w, r)
@@ -174,7 +169,8 @@ impl LogStore {
                 layer TEXT DEFAULT '',
                 component TEXT DEFAULT '',
                 message TEXT NOT NULL,
-                phase TEXT DEFAULT ''
+                phase TEXT DEFAULT '',
+                source_domain TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_{LOGS_TABLE}_ts ON {LOGS_TABLE}(ts);
             CREATE INDEX IF NOT EXISTS idx_{LOGS_TABLE}_level ON {LOGS_TABLE}(level);
@@ -183,16 +179,14 @@ impl LogStore {
         conn_writer.execute_batch(&ddl)?;
         conn_reader.execute_batch(&ddl)?;
 
-        // Additive migration; preserve unknown origins of pre-upgrade rows.
-        for conn in [&conn_writer, &conn_reader] {
-            let present = {
-                let mut stmt = conn.prepare("PRAGMA table_info(hub_logs)")?;
-                let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                names.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == "source_domain")
-            };
-            if !present {
-                conn.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;")?;
-            }
+        // Additive migration for legacy databases; preserve unknown origins of pre-upgrade rows.
+        let present = {
+            let mut stmt = conn_writer.prepare("PRAGMA table_info(hub_logs)")?;
+            let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            names.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == "source_domain")
+        };
+        if !present {
+            let _ = conn_writer.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;");
         }
 
         let (tx, rx) = mpsc::sync_channel::<LogRecord>(10_000);

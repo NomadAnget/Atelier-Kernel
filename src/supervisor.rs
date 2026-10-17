@@ -349,7 +349,17 @@ impl DomainSupervisorInner {
             #[cfg(unix)]
             let (r_fd, w_fd) = {
                 use std::os::fd::AsRawFd;
-                (k2d_rx.as_raw_fd(), d2k_tx.as_raw_fd())
+                let r = k2d_rx.as_raw_fd();
+                let w = d2k_tx.as_raw_fd();
+                clear_cloexec(r).map_err(|source| SupervisorError::SpawnFailed {
+                    domain: domain_id.clone(),
+                    source,
+                })?;
+                clear_cloexec(w).map_err(|source| SupervisorError::SpawnFailed {
+                    domain: domain_id.clone(),
+                    source,
+                })?;
+                (r, w)
             };
 
             #[cfg(windows)]
@@ -385,16 +395,8 @@ impl DomainSupervisorInner {
                 }
                 #[cfg(unix)]
                 {
-                    use std::os::unix::process::CommandExt;
                     cmd.env("ATELIER_IPC_READ_FD", r_fd.to_string())
                         .env("ATELIER_IPC_WRITE_FD", w_fd.to_string());
-                    unsafe {
-                        cmd.pre_exec(move || {
-                            clear_cloexec(r_fd)?;
-                            clear_cloexec(w_fd)?;
-                            Ok(())
-                        });
-                    }
                 }
                 #[cfg(windows)]
                 {
@@ -404,15 +406,20 @@ impl DomainSupervisorInner {
                 }
             };
 
-            let mut cmd = Command::new(&spec.command);
+            let command_str = if cfg!(windows) && spec.command == "python3" {
+                "python"
+            } else {
+                &spec.command
+            };
+            let mut cmd = Command::new(command_str);
             configure_cmd(&mut cmd);
 
             let child_res = match cmd.spawn() {
                 Ok(c) => Ok(c),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let alt_cmd = if spec.command == "python3" {
+                    let alt_cmd = if command_str == "python3" {
                         Some("python")
-                    } else if spec.command == "python" {
+                    } else if command_str == "python" {
                         Some("python3")
                     } else {
                         None

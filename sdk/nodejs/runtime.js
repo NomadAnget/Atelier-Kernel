@@ -21,7 +21,7 @@ const _WIN32_BRIDGE_PY=[
   ' k32.CloseHandle(h_p)',
   'msvcrt.setmode(0,os.O_BINARY);msvcrt.setmode(1,os.O_BINARY)',
   'r_fd=msvcrt.open_osfhandle(r_h,os.O_RDONLY|os.O_BINARY)',
-  'w_fd=msvcrt.open_osfhandle(w_h,os.O_BINARY)',
+  'w_fd=msvcrt.open_osfhandle(w_h,os.O_WRONLY|os.O_BINARY)',
   'def p_in():',
   ' try:',
   '  while True:',
@@ -80,7 +80,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
       const fds=this._requireIpcFds();
       if(!fds.streams){
         if(process.platform==='win32'&&(fds.handleMode==='win32'||fds.handleMode==='win32_handle')){
-          const pyCmd=process.env.PYTHON||'python';
+          const pyCmd=process.env.PYTHON||process.env.PYTHON_BIN||'python';
           const bridge=spawn(pyCmd,['-u','-c',_WIN32_BRIDGE_PY,String(fds.readFd),String(fds.writeFd),String(process.pid)],{stdio:['pipe','pipe','inherit'],windowsHide:true});
           bridge.stdout.pause();
           const exitPromise=new Promise(resolve=>{bridge.once('exit',resolve);bridge.once('error',resolve);});

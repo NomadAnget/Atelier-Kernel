@@ -25,7 +25,7 @@ import os
 def run_domain_script(cmd, input_lines):
     k2d_r, k2d_w = os.pipe()
     d2k_r, d2k_w = os.pipe()
-    env = {**os.environ}
+    env = {**os.environ, "PYTHON": sys.executable, "PYTHON_BIN": sys.executable}
     kwargs = {
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,

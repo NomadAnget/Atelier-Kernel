@@ -29,7 +29,7 @@ def _claim_ipc_fds():
         if os.name=='nt' and mode in ('win32','win32_handle'):
             import msvcrt
             r_fd=msvcrt.open_osfhandle(r_val,os.O_RDONLY|getattr(os,'O_BINARY',0))
-            w_fd=msvcrt.open_osfhandle(w_val,getattr(os,'O_BINARY',0))
+            w_fd=msvcrt.open_osfhandle(w_val,os.O_WRONLY|getattr(os,'O_BINARY',0))
         else:r_fd,w_fd=r_val,w_val
         try:
             os.set_inheritable(r_fd,False)

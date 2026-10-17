@@ -55,7 +55,7 @@ for lang in ['python','node']:
         k2d_r,k2d_w=os.pipe()
         d2k_r,d2k_w=os.pipe()
         cmd=[sys.executable,str(WORK/'fixture.py'),mode] if lang=='python' else ['node',str(WORK/'fixture.cjs'),str(ROOT/'sdk/nodejs'),mode]
-        env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')}
+        env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python'),'PYTHON':sys.executable,'PYTHON_BIN':sys.executable}
         kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.PIPE,'text':True}
         if os.name=='nt':
             import msvcrt

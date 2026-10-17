@@ -67,7 +67,7 @@ def exercise(language):
     stderr=open(WORK/(language+'.stderr'),'w')
     k2d_r,k2d_w=os.pipe()
     d2k_r,d2k_w=os.pipe()
-    env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python')}
+    env={**os.environ,'PYTHONPATH':str(ROOT/'sdk/python'),'PYTHON':sys.executable,'PYTHON_BIN':sys.executable}
     kwargs={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':stderr,'text':True,'bufsize':1}
     if os.name=='nt':
         import msvcrt

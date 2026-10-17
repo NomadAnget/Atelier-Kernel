@@ -56,11 +56,16 @@ jobs:
       - name: Run Cross-Language SDK Consistency Test Suite
         shell: bash
         run: |
-          python3 tests/sdk_consistency_test.py || python tests/sdk_consistency_test.py
-          python3 tests/sdk_async_consistency_test.py || python tests/sdk_async_consistency_test.py
-          python3 tests/sdk_portable_features_test.py || python tests/sdk_portable_features_test.py
-          python3 tests/sdk_transport_bounds_test.py || python tests/sdk_transport_bounds_test.py
-          python3 tests/sdk_message_ids_test.py || python tests/sdk_message_ids_test.py
+          if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+            PY_BIN="python3"
+          else
+            PY_BIN="python"
+          fi
+          $PY_BIN tests/sdk_consistency_test.py
+          $PY_BIN tests/sdk_async_consistency_test.py
+          $PY_BIN tests/sdk_portable_features_test.py
+          $PY_BIN tests/sdk_transport_bounds_test.py
+          $PY_BIN tests/sdk_message_ids_test.py
 
   build-sdk-packages:
     name: Build Domain SDKs (Python Wheel & Node.js NPM)
@@ -157,19 +162,29 @@ jobs:
       - name: Assemble Kernel Runtime Bundle
         shell: bash
         run: |
+          if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+            PY_BIN="python3"
+          else
+            PY_BIN="python"
+          fi
           mkdir -p dist/kernel-runtime-${{ matrix.target_label }}
           cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
           cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
           cp VARIANT_GUIDE.md dist/kernel-runtime-${{ matrix.target_label }}/VARIANT_GUIDE.md
-          python3 sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
+          $PY_BIN sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
           (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
           tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}
 
       - name: End-to-End Variant Smoke Test (--init + --smoke-test)
         shell: bash
         run: |
+          if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
+            PY_BIN="python3"
+          else
+            PY_BIN="python"
+          fi
           wheels=(dist/kernel-runtime-${{ matrix.target_label }}/sdk/atelier_sdk-*.whl)
-          python3 -m pip install "${wheels[0]}"
+          $PY_BIN -m pip install "${wheels[0]}"
           export PYTHONPATH="$(pwd)/${wheels[0]}"
           ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --init ./ci-smoke-variant
           ./dist/kernel-runtime-${{ matrix.target_label }}/${{ matrix.bin_name }} --config ./ci-smoke-variant/kernel_boot.json --smoke-test

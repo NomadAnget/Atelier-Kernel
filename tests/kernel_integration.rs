@@ -7,6 +7,14 @@ use atelier_kernel::{
 };
 use serde_json::json;
 
+fn python_cmd() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
 const PY_IPC_PREAMBLE: &str = r#"
 import json, os, sys, time
 r_val = int(os.environ["ATELIER_IPC_READ_FD"])
@@ -14,7 +22,7 @@ w_val = int(os.environ["ATELIER_IPC_WRITE_FD"])
 if os.name == "nt" and os.environ.get("ATELIER_IPC_HANDLE_MODE") in ("win32", "win32_handle"):
     import msvcrt
     r_fd = msvcrt.open_osfhandle(r_val, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    w_fd = msvcrt.open_osfhandle(w_val, getattr(os, "O_BINARY", 0))
+    w_fd = msvcrt.open_osfhandle(w_val, os.O_WRONLY | getattr(os, "O_BINARY", 0))
 else:
     r_fd, w_fd = r_val, w_val
 ipc_in = os.fdopen(r_fd, "r", encoding="utf-8", buffering=1, closefd=False)
@@ -434,7 +442,7 @@ for line in ipc_in:
     let pid = kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "ext_sh".to_string(),
-            command: "python3".to_string(),
+            command: python_cmd().to_string(),
             args: vec!["-c".to_string(), script],
             working_dir: None,
             auto_restart: false,
@@ -445,7 +453,8 @@ for line in ipc_in:
 
     // Wait briefly for `ext_sh` child process to register its `echo` handler over stdout pipe
     let mut active = false;
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
         if kernel.router().domain_status("ext_sh") == Some(DomainStatus::Active) {
             active = true;
             break;
@@ -771,7 +780,7 @@ for line in ipc_in:
     let pid1 = kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "resilient_sh".to_string(),
-            command: "python3".to_string(),
+            command: python_cmd().to_string(),
             args: vec!["-c".to_string(), script],
             working_dir: None,
             auto_restart: true,
@@ -783,7 +792,8 @@ for line in ipc_in:
 
     // 1. Wait for resilient_sh to become Active
     let mut active = false;
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
         if kernel.router().domain_status("resilient_sh") == Some(DomainStatus::Active) {
             active = true;
             break;
@@ -802,9 +812,10 @@ for line in ipc_in:
         json!({"crash": false}),
     );
     let mut completed1 = false;
-    for _ in 0..4 {
+    let deadline1 = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline1 {
         if let Ok(KernelToDomainFrame::Receipt(r)) =
-            caller.recv_frame_timeout(Duration::from_secs(2))
+            caller.recv_frame_timeout(Duration::from_millis(100))
         {
             if r.message_id == msg1 && r.status == ContractStatus::Completed {
                 completed1 = true;
@@ -829,7 +840,8 @@ for line in ipc_in:
     // 4. Wait for Supervisor to auto-restart resilient_sh
     let mut restarted = false;
     let mut inst2 = inst1;
-    for _ in 0..50 {
+    let deadline_restart = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline_restart {
         if kernel.router().domain_status("resilient_sh") == Some(DomainStatus::Active) {
             if let Some(id) = kernel.router().domain_instance_id("resilient_sh") {
                 if id > inst1 {
@@ -852,6 +864,7 @@ for line in ipc_in:
     assert!(kernel.supervisor().restart_count("resilient_sh") >= 1);
 
     // 5. Send message to the new instance and verify it handles it cleanly
+    let _ = caller.drain_frames();
     let msg2 = caller.send_one(
         vec!["resilient_sh.ping".to_string()],
         "PingTest2",
@@ -859,9 +872,10 @@ for line in ipc_in:
         json!({"crash": false}),
     );
     let mut completed2 = false;
-    for _ in 0..4 {
+    let deadline2 = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline2 {
         if let Ok(KernelToDomainFrame::Receipt(r)) =
-            caller.recv_frame_timeout(Duration::from_secs(2))
+            caller.recv_frame_timeout(Duration::from_millis(100))
         {
             if r.message_id == msg2 && r.status == ContractStatus::Completed {
                 completed2 = true;
@@ -896,7 +910,7 @@ for _ in ipc_in:
     kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "stop_test".to_string(),
-            command: "python3".to_string(),
+            command: python_cmd().to_string(),
             args: vec!["-c".to_string(), script],
             working_dir: None,
             auto_restart: true,
@@ -905,7 +919,8 @@ for _ in ipc_in:
         })
         .expect("Spawn stop_test");
 
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
         if kernel.router().domain_status("stop_test") == Some(DomainStatus::Active) {
             break;
         }
@@ -941,7 +956,7 @@ fn test_auto_restart_respects_max_restarts_limit() {
     kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "doomed_domain".to_string(),
-            command: "python3".to_string(),
+            command: python_cmd().to_string(),
             args: vec!["-c".to_string(), "import sys; sys.exit(1)".to_string()],
             working_dir: None,
             auto_restart: true,
@@ -951,7 +966,15 @@ fn test_auto_restart_respects_max_restarts_limit() {
         .expect("Spawn doomed_domain");
 
     // Wait for retries to exhaust
-    std::thread::sleep(Duration::from_millis(200));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if kernel.supervisor().restart_count("doomed_domain") >= 2
+            && kernel.router().domain_status("doomed_domain") == Some(DomainStatus::Faulted)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     // Verify it attempted restarts up to limit and stopped
     let count = kernel.supervisor().restart_count("doomed_domain");
@@ -1361,7 +1384,7 @@ for raw in ipc_in:
     kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "blocked_domain".to_string(),
-            command: "python3".to_string(),
+            command: python_cmd().to_string(),
             args: vec!["-c".to_string(), blocked_script.to_string()],
             working_dir: None,
             auto_restart: false,
@@ -1373,7 +1396,7 @@ for raw in ipc_in:
     kernel
         .spawn_process_domain(DomainProcessSpec {
             domain_id: "healthy_domain".to_string(),
-            command: "python3".to_string(),
+            command: python_cmd().to_string(),
             args: vec!["-c".to_string(), healthy_script.to_string()],
             working_dir: None,
             auto_restart: false,
@@ -1383,7 +1406,8 @@ for raw in ipc_in:
         .expect("Spawn healthy_domain");
 
     // Wait for both domains to become Active
-    for _ in 0..50 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while std::time::Instant::now() < deadline {
         if kernel.router().domain_status("blocked_domain") == Some(DomainStatus::Active)
             && kernel.router().domain_status("healthy_domain") == Some(DomainStatus::Active)
         {
@@ -1642,7 +1666,7 @@ fn test_query_available_handlers_and_auto_comment_descriptions() {
     kernel
         .spawn_process_domain(DomainProcessSpec::new(
             "order",
-            "python3",
+            python_cmd(),
             vec!["./domains/order_domain.py".to_string()],
         ))
         .expect("Failed to spawn Python order domain");

@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ruff_python_ast::statement_visitor::{StatementVisitor, walk_stmt};
+use ruff_python_ast::{self as ast, Stmt};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -273,6 +275,119 @@ fn collect_domain_source_files(dir: &Path, out: &mut BTreeSet<PathBuf>) {
     }
 }
 
+fn find_domain_root(file_path: &Path) -> PathBuf {
+    for ancestor in file_path.ancestors() {
+        if let Some(parent) = ancestor.parent() {
+            if parent.file_name().and_then(|n| n.to_str()) == Some("domains") {
+                return ancestor.to_path_buf();
+            }
+        }
+    }
+    file_path.parent().unwrap_or(file_path).to_path_buf()
+}
+
+fn compute_directory_depth(file_path: &Path, domain_root: &Path) -> usize {
+    if domain_root.is_file() {
+        return 0;
+    }
+    let Some(file_dir) = file_path.parent() else {
+        return 0;
+    };
+    if let Ok(rel) = file_dir.strip_prefix(domain_root) {
+        rel.components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count()
+    } else {
+        0
+    }
+}
+
+struct PythonConstitutionVisitor<'a> {
+    file_path: &'a Path,
+    source: &'a str,
+    depth: usize,
+    report: &'a mut ConstitutionReport,
+}
+
+impl<'a> StatementVisitor<'a> for PythonConstitutionVisitor<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::Import(ast::StmtImport { names, range, .. }) => {
+                let offset = u32::from(range.start()) as usize;
+                let line_no = self.source[..offset.min(self.source.len())]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count()
+                    + 1;
+                let location = format!("{}:{}", self.file_path.display(), line_no);
+
+                for alias in names {
+                    let name = alias.name.as_str();
+                    if name == "sqlite3" || name.starts_with("sqlite3.") {
+                        self.report.violations.push(ConstitutionViolation {
+                            rule: "M4".to_string(),
+                            location: location.clone(),
+                            detail: "direct sqlite3 access in domain code is forbidden; use kernel.storage messages".to_string(),
+                        });
+                    }
+                }
+            }
+            Stmt::ImportFrom(ast::StmtImportFrom {
+                module,
+                names: _,
+                level,
+                range,
+                ..
+            }) => {
+                let offset = u32::from(range.start()) as usize;
+                let line_no = self.source[..offset.min(self.source.len())]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count()
+                    + 1;
+                let location = format!("{}:{}", self.file_path.display(), line_no);
+
+                let mod_str = module.as_ref().map(|m| m.as_str());
+                if mod_str == Some("sqlite3")
+                    || mod_str.map_or(false, |m| m.starts_with("sqlite3."))
+                {
+                    self.report.violations.push(ConstitutionViolation {
+                        rule: "M4".to_string(),
+                        location: location.clone(),
+                        detail: "direct sqlite3 access in domain code is forbidden; use kernel.storage messages".to_string(),
+                    });
+                }
+
+                let level_val = *level as usize;
+                if level_val > 0 {
+                    let levels_up = level_val - 1;
+                    if levels_up > self.depth {
+                        let is_sdk = mod_str == Some("atelier_sdk")
+                            || mod_str.map_or(false, |m| m.starts_with("atelier_sdk."));
+                        if !is_sdk {
+                            let dots = ".".repeat(level_val);
+                            let target_desc = match mod_str {
+                                Some(m) => format!("from {}{} import ...", dots, m),
+                                None => format!("from {} import ...", dots),
+                            };
+                            self.report.violations.push(ConstitutionViolation {
+                                rule: "M4".to_string(),
+                                location,
+                                detail: format!(
+                                    "cross-domain relative import '{}' is forbidden; domains must communicate via kernel messages",
+                                    target_desc
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        walk_stmt(self, stmt);
+    }
+}
+
 fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return;
@@ -285,15 +400,57 @@ fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
     };
     report.checked_files += 1;
 
+    let domain_root = find_domain_root(path);
+    let depth = compute_directory_depth(path, &domain_root);
+
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "py" => scan_python_source(path, &source, report),
-        "js" | "mjs" | "cjs" => scan_js_source(path, &source, report),
+        "py" => scan_python_source(path, &source, depth, report),
+        "js" | "mjs" | "cjs" => scan_js_source(path, &source, depth, report),
         _ => {}
     }
 }
 
-fn scan_python_source(path: &Path, source: &str, report: &mut ConstitutionReport) {
+fn scan_python_source(
+    path: &Path,
+    source: &str,
+    depth: usize,
+    report: &mut ConstitutionReport,
+) {
+    // 1. Industry-standard AST analysis via ruff_python_parser
+    if let Ok(parsed) = ruff_python_parser::parse_module(source) {
+        let mut visitor = PythonConstitutionVisitor {
+            file_path: path,
+            source,
+            depth,
+            report,
+        };
+        for stmt in parsed.syntax().body.iter() {
+            visitor.visit_stmt(stmt);
+        }
+    } else {
+        scan_python_fallback(path, source, depth, report);
+    }
+
+    // 2. M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code
+    for (idx, raw_line) in source.lines().enumerate() {
+        let line_no = idx + 1;
+        if raw_line.contains("ATELIER_IPC_READ_FD") || raw_line.contains("ATELIER_IPC_WRITE_FD") {
+            report.violations.push(ConstitutionViolation {
+                rule: "M5".to_string(),
+                location: format!("{}:{}", path.display(), line_no),
+                detail: "direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD in domain code is forbidden; use AtelierDomain SDK".to_string(),
+            });
+        }
+    }
+}
+
+fn scan_python_fallback(
+    path: &Path,
+    source: &str,
+    depth: usize,
+    report: &mut ConstitutionReport,
+) {
     let mut in_triple_double = false;
     let mut in_triple_single = false;
 
@@ -306,44 +463,45 @@ fn scan_python_source(path: &Path, source: &str, report: &mut ConstitutionReport
             continue;
         }
 
-        // M4: Forbid cross-domain parent relative imports (`from ..<other>`)
-        if trimmed.starts_with("from ..") && !trimmed.starts_with("from ..atelier_sdk") {
-            report.violations.push(ConstitutionViolation {
-                rule: "M4".to_string(),
-                location: location.clone(),
-                detail: format!(
-                    "cross-domain relative import '{}' is forbidden; domains must communicate via kernel messages",
-                    trimmed
-                ),
-            });
+        if trimmed.starts_with("from .") {
+            let dots = trimmed["from ".len()..]
+                .chars()
+                .take_while(|&c| c == '.')
+                .count();
+            if dots > 1 {
+                let levels_up = dots - 1;
+                if levels_up > depth && !trimmed.contains("atelier_sdk") {
+                    report.violations.push(ConstitutionViolation {
+                        rule: "M4".to_string(),
+                        location: location.clone(),
+                        detail: format!(
+                            "cross-domain relative import '{}' is forbidden; domains must communicate via kernel messages",
+                            trimmed
+                        ),
+                    });
+                }
+            }
         }
 
-        // M4: Forbid direct sqlite3 imports in business domains
         if trimmed == "import sqlite3"
             || trimmed.starts_with("import sqlite3 ")
             || trimmed.starts_with("from sqlite3 ")
         {
             report.violations.push(ConstitutionViolation {
                 rule: "M4".to_string(),
-                location: location.clone(),
-                detail:
-                    "direct sqlite3 access in domain code is forbidden; use kernel.storage messages"
-                        .to_string(),
-            });
-        }
-
-        // M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code
-        if raw_line.contains("ATELIER_IPC_READ_FD") || raw_line.contains("ATELIER_IPC_WRITE_FD") {
-            report.violations.push(ConstitutionViolation {
-                rule: "M5".to_string(),
                 location,
-                detail: "direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD in domain code is forbidden; use AtelierDomain SDK".to_string(),
+                detail: "direct sqlite3 access in domain code is forbidden; use kernel.storage messages".to_string(),
             });
         }
     }
 }
 
-fn scan_js_source(path: &Path, source: &str, report: &mut ConstitutionReport) {
+fn scan_js_source(
+    path: &Path,
+    source: &str,
+    depth: usize,
+    report: &mut ConstitutionReport,
+) {
     let mut in_block_comment = false;
 
     for (idx, raw_line) in source.lines().enumerate() {
@@ -356,31 +514,44 @@ fn scan_js_source(path: &Path, source: &str, report: &mut ConstitutionReport) {
         }
 
         // M4: Forbid cross-domain parent require/import (`../<other>`)
-        if (trimmed.contains("require(\"../")
-            || trimmed.contains("require('../")
-            || trimmed.contains("from \"../")
-            || trimmed.contains("from '../"))
-            && !trimmed.contains("atelier_sdk")
-            && !trimmed.contains("atelier-sdk")
-        {
-            report.violations.push(ConstitutionViolation {
-                rule: "M4".to_string(),
-                location: location.clone(),
-                detail: "cross-domain parent import/require is forbidden; domains must communicate via kernel messages".to_string(),
-            });
-        }
+        for needle in ["require(\"", "require('", "from \"", "from '"] {
+            if let Some(pos) = trimmed.find(needle) {
+                let after = &trimmed[pos + needle.len()..];
+                let quote = if needle.contains('\'') { '\'' } else { '"' };
+                if let Some(end_pos) = after.find(quote) {
+                    let import_path = &after[..end_pos];
 
-        // M4: Forbid direct SQLite package imports in business domain code
-        if trimmed.contains("require(\"sqlite3\")")
-            || trimmed.contains("require('sqlite3')")
-            || trimmed.contains("require(\"better-sqlite3\")")
-            || trimmed.contains("require('better-sqlite3')")
-        {
-            report.violations.push(ConstitutionViolation {
-                rule: "M4".to_string(),
-                location: location.clone(),
-                detail: "direct SQLite database access in domain code is forbidden; use kernel.storage messages".to_string(),
-            });
+                    if import_path == "sqlite3" || import_path == "better-sqlite3" {
+                        report.violations.push(ConstitutionViolation {
+                            rule: "M4".to_string(),
+                            location: location.clone(),
+                            detail: "direct SQLite database access in domain code is forbidden; use kernel.storage messages".to_string(),
+                        });
+                    }
+
+                    if import_path.starts_with("../") || import_path.starts_with("..\\") {
+                        let mut remainder = import_path;
+                        let mut levels_up = 0;
+                        while remainder.starts_with("../") || remainder.starts_with("..\\") {
+                            levels_up += 1;
+                            remainder = &remainder[3..];
+                        }
+                        if levels_up > depth
+                            && !import_path.contains("atelier_sdk")
+                            && !import_path.contains("atelier-sdk")
+                        {
+                            report.violations.push(ConstitutionViolation {
+                                rule: "M4".to_string(),
+                                location: location.clone(),
+                                detail: format!(
+                                    "cross-domain parent import/require '{}' is forbidden; domains must communicate via kernel messages",
+                                    import_path
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         // M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code

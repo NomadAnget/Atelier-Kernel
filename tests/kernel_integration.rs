@@ -1667,6 +1667,35 @@ const rawFd = process.env.ATELIER_IPC_READ_FD;
     assert!(!rep_m7.is_ok());
     assert!(rep_m7.violations.iter().any(|v| v.rule == "M7"));
 
+    // Verify that multi-level nested package intra-domain relative imports are NOT falsely flagged as M4 violations!
+    let nested_domain = domains_dir.join("reel_audio");
+    let nested_services = nested_domain.join("services");
+    let nested_sub = nested_services.join("sub");
+    std::fs::create_dir_all(&nested_sub).unwrap();
+
+    let stem_py = nested_sub.join("stem.py");
+    std::fs::write(
+        &stem_py,
+        r#"
+# This is a comment: from ..other_domain import leak
+"""
+Docstring mentioning from ..other_domain import leak
+"""
+# Valid intra-domain relative imports within reel_audio:
+from .. import helpers
+from ...utils import calc
+from .local import sibling
+"#,
+    )
+    .unwrap();
+
+    let rep_nested = check_constitution(&nested_domain);
+    assert!(
+        rep_nested.is_ok(),
+        "Expected intra-domain relative imports to pass cleanly, but got violations: {:?}",
+        rep_nested.violations
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

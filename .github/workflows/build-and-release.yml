@@ -51,6 +51,9 @@ jobs:
       - name: Run Kernel Unit & Integration Tests
         run: cargo test
 
+      - name: Build Kernel for Native SDK Regression
+        run: cargo build --locked
+
       - name: Run Cross-Language SDK Consistency Test Suite
         shell: bash
         run: |
@@ -64,6 +67,7 @@ jobs:
           $PY_BIN tests/sdk_portable_features_test.py
           $PY_BIN tests/sdk_transport_bounds_test.py
           $PY_BIN tests/sdk_message_ids_test.py
+          $PY_BIN tests/sdk_observer_memory_integration.py
 
   build-sdk-packages:
     name: Build Domain SDKs (Python Wheel & Node.js NPM)

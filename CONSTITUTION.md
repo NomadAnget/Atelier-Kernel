@@ -37,6 +37,9 @@
      - 仅有内核流（`LogEvent`、`TelemetryEvent`、`NotifyEvent`、`ObservationEvent`）由 SDK 原生方法监听，并强制采用 `DeliveryPolicy::Ephemeral` 瞬态直推（**零 Receipt 确认帧产生**，域断开或崩溃时内核自动解绑注销）。
 
 ### C3 · 四阶段回执与零盲发契约
+
+- **观察查询不得自包含放大**：`QueryObserver` 的完整结果只交付请求方；其自身生命周期事件的 details 只记录返回条数等有界元信息，不再次嵌入 events 快照。`kernel.observer/QueryObserver` 与 `kernel.runtime` 的只读查询按 Ephemeral 处理，保留在途四阶段回执，终态后不在投递账本保存查询结果；业务 Durable 消息的持久化与回执不变。此约束在内核实现，SDK 方法与完整返回结构保持一致。
+- **历史账本恢复按需取载荷**：启动时恢复 Durable 在途记录和历史身份索引，历史终态结果继续保留于 SQLite，按原 message_id/logical_id 查询时完整读取；不得为恢复服务而删除历史，也不得把全部历史结果 JSON 一次性展开到内存。跨重启回执查询、终态不可覆盖和消息身份保持不变。
 - **标准四阶段回执**：每条目标消息严格经历 `Sent`（已发出）$\rightarrow$ `Received`（已接收）$\rightarrow$ `Started`（开始执行）$\rightarrow$ `Completed`（执行完成），或进入异常终态 `TargetInvalid` / `ContractInvalid` / `ExecutionFailed`。
 - **发布顺序与账本一致**：独立双匿名管道的收发线程并行工作；初次投递、回执推进与故障终结在内核内串行完成状态推进和回执发布，保证发送端和观察器均不先看到后续阶段再看到 `Sent`。串行区不执行域业务，不等待子进程实际读写管道；SDK 不承担回执重排。
 - **零盲发前置拦截**：当目标 `<domain>.<handler>` 不存在或目标域未处于 `Active` 就绪态时，内核**绝不向管道盲发消息**，立即前置拦截并向发送端返回 `TargetInvalid`。

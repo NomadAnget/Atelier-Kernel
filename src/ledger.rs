@@ -76,7 +76,7 @@ pub enum ReceiptTransition {
 /// Kernel ID Generator and Three-Level Idempotency & State Ledger.
 ///
 /// Enforces tiered persistence policies based on `DeliveryPolicy`:
-/// - `Durable`: persisted to SQLite `kernel_ledger` table and retained in-memory.
+/// - `Durable`: persisted to SQLite `kernel_ledger`; restored terminal payloads are read lazily.
 /// - `Volatile`: retained in-memory only; never written to SQLite.
 /// - `Ephemeral`: tracked in-memory while in-flight and automatically evicted upon reaching a terminal state.
 pub struct KernelLedger {
@@ -149,7 +149,9 @@ impl KernelLedger {
 
         {
             let mut stmt = conn.prepare(&format!(
-                "SELECT message_id, logical_id, seq, source_domain, target, message_type, status, data, created_at, updated_at
+                "SELECT message_id, logical_id, seq, source_domain, target, message_type, status,
+                        CASE WHEN status IN ('completed','target_invalid','contract_invalid','execution_failed')
+                             THEN NULL ELSE data END AS data, created_at, updated_at
                  FROM {KERNEL_LEDGER_TABLE}
                  ORDER BY created_at ASC, message_id ASC"
             ))?;
@@ -161,7 +163,9 @@ impl KernelLedger {
                     .entry(record.logical_id.clone())
                     .or_default()
                     .push(record.message_id.clone());
-                deliveries_map.insert(record.message_id.clone(), record);
+                if !record.status.is_terminal() {
+                    deliveries_map.insert(record.message_id.clone(), record);
+                }
             }
         }
 
@@ -300,6 +304,9 @@ impl KernelLedger {
     ) -> (DeliveryRecord, bool) {
         let key = message_id.to_string();
         let policy = DeliveryPolicy::resolve(target, message_type);
+        if let Some(existing) = self.get_persisted_record(message_id) {
+            return (existing, false);
+        }
         let mut deliveries = self.deliveries.write();
         if let Some(existing) = deliveries.get(&key) {
             return (existing.clone(), false);
@@ -354,7 +361,12 @@ impl KernelLedger {
         let key = message_id.to_string();
         let mut deliveries = self.deliveries.write();
         let Some(record) = deliveries.get_mut(&key) else {
-            return ReceiptTransition::UnknownDelivery;
+            drop(deliveries);
+            return match self.get_persisted_record(message_id) {
+                Some(record) if record.target != target => ReceiptTransition::UnauthorizedTarget,
+                Some(record) if record.status.is_terminal() => ReceiptTransition::DuplicateOrStale,
+                _ => ReceiptTransition::UnknownDelivery,
+            };
         };
 
         if record.target != target {
@@ -400,26 +412,25 @@ impl KernelLedger {
             .get(logical_id)
             .cloned()
             .unwrap_or_default();
-        let records = self.deliveries.read();
         ids.iter()
-            .filter_map(|id| records.get(id).map(DeliveryRecord::to_receipt))
+            .filter_map(|id| self.record_for_message(id).map(|record| record.to_receipt()))
             .collect()
     }
 
     pub fn receipts_for_message(&self, message_id: &str) -> Vec<MessageReceipt> {
-        self.deliveries
-            .read()
-            .get(message_id)
+        self.record_for_message(message_id)
             .map(|r| vec![r.to_receipt()])
             .unwrap_or_default()
     }
 
     pub fn get_record(&self, message_id: &str, target: &str) -> Option<DeliveryRecord> {
-        self.deliveries
-            .read()
-            .get(message_id)
+        self.record_for_message(message_id)
             .filter(|r| r.target == target)
-            .cloned()
+    }
+
+    fn record_for_message(&self, message_id: &str) -> Option<DeliveryRecord> {
+        let resident = self.deliveries.read().get(message_id).cloned();
+        resident.or_else(|| self.get_persisted_record(message_id))
     }
 
     /// Queries the persistent SQLite `kernel_ledger` table for `message_id`.
@@ -501,5 +512,54 @@ impl KernelLedger {
         }
 
         notifications
+    }
+}
+
+#[cfg(test)]
+mod restoration_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_payloads_restore_lazily_without_losing_identity_receipts_or_pending_work() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tmp")
+            .join(format!("ledger-lazy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("kernel.db");
+        let payload = json!({"text":"x".repeat(128 * 1024), "nested":[{"value":42}]});
+        let (logical, ids) = {
+            let ledger = KernelLedger::open_with_db(Some(&path)).unwrap();
+            let (logical, ids, _) = ledger.allocate_submission("sender", 7, 3);
+            for id in &ids {
+                ledger.record_initial_target_state(id, 7, "sender", "worker.run", "Durable", ContractStatus::Sent, None);
+            }
+            for (index, status) in [ContractStatus::Completed, ContractStatus::ExecutionFailed].into_iter().enumerate() {
+                for stage in [ContractStatus::Received, ContractStatus::Started, status] {
+                    ledger.advance_status("worker", &ids[index], "worker.run", stage, Some(payload.clone()));
+                }
+            }
+            assert_eq!(ledger.persisted_count(), 3);
+            (logical, ids)
+        };
+        let ledger = KernelLedger::open_with_db(Some(&path)).unwrap();
+        assert_eq!(ledger.deliveries.read().len(), 1, "only unfinished work is resident after restore");
+        assert_eq!(ledger.logical_id_for_message(&ids[0]), logical);
+        let receipts = ledger.receipts_for_logical(&logical);
+        assert_eq!(receipts.iter().map(|receipt| receipt.message_id.clone()).collect::<Vec<_>>(), ids);
+        assert_eq!(receipts[0].status, ContractStatus::Completed);
+        assert_eq!(receipts[1].status, ContractStatus::ExecutionFailed);
+        assert_eq!(receipts[2].status, ContractStatus::Sent);
+        assert_eq!(receipts[0].data.as_ref(), Some(&payload));
+        assert_eq!(ledger.receipts_for_message(&ids[1])[0].data.as_ref(), Some(&payload));
+        assert_eq!(ledger.get_record(&ids[0], "worker.run").unwrap().data, Some(payload.clone()));
+        assert!(ledger.get_record(&ids[0], "other.run").is_none());
+        assert!(matches!(ledger.advance_status("worker", &ids[0], "worker.run", ContractStatus::Started, None), ReceiptTransition::DuplicateOrStale));
+        let (existing, created) = ledger.record_initial_target_state(&ids[0], 7, "sender", "worker.run", "Durable", ContractStatus::Sent, None);
+        assert!(!created);
+        assert_eq!(existing.status, ContractStatus::Completed);
+        assert_eq!(existing.data.as_ref(), Some(&payload));
+        assert_eq!(ledger.deliveries.read().len(), 1, "reading history must not populate a permanent result cache");
+        assert!(matches!(ledger.advance_status("worker", &ids[2], "worker.run", ContractStatus::Completed, Some(json!({"ok":true}))), ReceiptTransition::Advanced { .. }));
+        assert_eq!(ledger.persisted_count(), 3);
     }
 }

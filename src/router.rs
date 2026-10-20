@@ -1849,6 +1849,16 @@ impl KernelRouter {
             final_status,
             data.clone(),
         ) {
+            // An observer query must not observe its own snapshot payload recursively.
+            // The requester still receives the full result in its ordinary receipt.
+            let observed_data = if msg.target == KERNEL_OBSERVER_TARGET
+                && msg.message_type == MSG_QUERY_OBSERVER
+                && final_status == ContractStatus::Completed
+            {
+                data.as_ref().map(|value| json!({ "count": value.get("count").cloned().unwrap_or(json!(0)) }))
+            } else {
+                data
+            };
             self.observer.emit(
                 source_domain,
                 &msg.target,
@@ -1857,7 +1867,7 @@ impl KernelRouter {
                 receipt.seq,
                 &msg.message_type,
                 final_status,
-                data,
+                observed_data,
             );
             self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(receipt));
         }

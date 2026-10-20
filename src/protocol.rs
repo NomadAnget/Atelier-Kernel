@@ -102,6 +102,12 @@ pub enum DeliveryPolicy {
 impl DeliveryPolicy {
     /// Resolves the delivery persistence policy from `target` and `message_type`.
     pub fn resolve(target: &str, message_type: &str) -> Self {
+        if (target == KERNEL_OBSERVER_TARGET && message_type == MSG_QUERY_OBSERVER)
+            || (target == KERNEL_RUNTIME_TARGET
+                && matches!(message_type, MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY))
+        {
+            return Self::Ephemeral;
+        }
         if target == KERNEL_REGISTRY_TARGET
             || target == KERNEL_STORAGE_TARGET
             || target == KERNEL_LOGGER_TARGET

@@ -41,6 +41,7 @@
 - **观察查询不得自包含放大**：`QueryObserver` 的完整结果只交付请求方；其自身生命周期事件的 details 只记录返回条数等有界元信息，不再次嵌入 events 快照。`kernel.observer/QueryObserver` 与 `kernel.runtime` 的只读查询按 Ephemeral 处理，保留在途四阶段回执，终态后不在投递账本保存查询结果；业务 Durable 消息的持久化与回执不变。此约束在内核实现，SDK 方法与完整返回结构保持一致。
 - **历史账本恢复按需取载荷**：启动时恢复 Durable 在途记录和历史身份索引，历史终态结果继续保留于 SQLite，按原 message_id/logical_id 查询时完整读取；不得为恢复服务而删除历史，也不得把全部历史结果 JSON 一次性展开到内存。跨重启回执查询、终态不可覆盖和消息身份保持不变。
 - **只读基础设施结果不做重复常驻缓存**：registry/QueryHandlers、storage/StorageQuery、logger/QueryLogs/QueryProgress 与上述 runtime/observer 查询统一使用 Ephemeral 四阶段回执；完整查询结果交付请求方，其 Completed 观察事件仅携带有界条数元信息。存储写入、注册变更、业务消息的投递策略和数据本身不变。客户端需要重新读取时调用同一 SDK 查询方法，不依赖查询消息终态常驻。
+- **瞬态身份索引随在途生命周期回收**：Ephemeral 在途重复提交仍复用原 logical_id/message_id；每个子消息到达终态即清除该子消息的内存身份映射，全部子消息均为已结束的 Ephemeral 时，同时清除父提交与序号去重记录。完成后的 Ephemeral 不保证终态重放，同一序号再次提交是一次新瞬态投递；Durable/Volatile 及混合投递中的非瞬态子消息仍保留原去重与重放契约。已发出的回执/观察事件使用信封或回执自身的完整身份，不依赖已回收的内存索引。
 - **标准四阶段回执**：每条目标消息严格经历 `Sent`（已发出）$\rightarrow$ `Received`（已接收）$\rightarrow$ `Started`（开始执行）$\rightarrow$ `Completed`（执行完成），或进入异常终态 `TargetInvalid` / `ContractInvalid` / `ExecutionFailed`。
 - **发布顺序与账本一致**：独立双匿名管道的收发线程并行工作；初次投递、回执推进与故障终结在内核内串行完成状态推进和回执发布，保证发送端和观察器均不先看到后续阶段再看到 `Sent`。串行区不执行域业务，不等待子进程实际读写管道；SDK 不承担回执重排。
 - **零盲发前置拦截**：当目标 `<domain>.<handler>` 不存在或目标域未处于 `Active` 就绪态时，内核**绝不向管道盲发消息**，立即前置拦截并向发送端返回 `TargetInvalid`。

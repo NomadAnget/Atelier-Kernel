@@ -3,9 +3,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -59,6 +59,7 @@ pub struct WebFrontendDomain {
     kernel: Arc<AtelierKernel>,
     client: Arc<DomainPipeClient>,
     receipt_history: Arc<Mutex<Vec<MessageReceipt>>>,
+    receipt_changed: Arc<Condvar>,
 }
 
 impl WebFrontendDomain {
@@ -67,10 +68,12 @@ impl WebFrontendDomain {
     pub fn attach_with_config(kernel: Arc<AtelierKernel>, boot_config: &KernelBootConfig) -> Self {
         let client = Arc::new(kernel.attach_domain("test_runner"));
         let receipt_history = Arc::new(Mutex::new(Vec::new()));
+        let receipt_changed = Arc::new(Condvar::new());
 
         // Background pump to collect outbound receipts from manual dashboard actions
         let client_bg = Arc::clone(&client);
         let receipt_bg = Arc::clone(&receipt_history);
+        let changed_bg = Arc::clone(&receipt_changed);
         thread::Builder::new()
             .name("web-dashboard-test-pump".to_string())
             .spawn(move || {
@@ -81,6 +84,7 @@ impl WebFrontendDomain {
                         if recs.len() > 50 {
                             recs.truncate(50);
                         }
+                        changed_bg.notify_all();
                     }
                 }
             })
@@ -104,6 +108,20 @@ impl WebFrontendDomain {
             kernel,
             client,
             receipt_history,
+            receipt_changed,
+        }
+    }
+
+    fn submission_logical_id(&self, ids: &[String]) -> Option<String> {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut receipts = self.receipt_history.lock();
+        loop {
+            if let Some(receipt) = receipts.iter().find(|r| ids.contains(&r.message_id)) {
+                return Some(receipt.logical_id.clone());
+            }
+            if self.receipt_changed.wait_until(&mut receipts, deadline).timed_out() {
+                return None;
+            }
         }
     }
 
@@ -186,9 +204,7 @@ impl WebFrontendDomain {
                         self.client
                             .send(req.targets, req.message_type, params, req.data)
                     };
-                    let logical_id = msg_id
-                        .first()
-                        .map(|id| self.kernel.ledger().logical_id_for_message(id));
+                    let logical_id = self.submission_logical_id(&msg_id);
                     let resp =
                         json!({ "ok": true, "logical_id": logical_id, "message_ids": msg_id });
                     let bytes = serde_json::to_vec(&resp).unwrap_or_default();
@@ -467,5 +483,21 @@ impl WebFrontendDomain {
         stream.write_all(header.as_bytes())?;
         stream.write_all(body)?;
         stream.flush()
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn completed_transient_submission_keeps_its_identity_in_dashboard_response() {
+        let kernel = Arc::new(AtelierKernel::new_in_memory().unwrap());
+        let config: KernelBootConfig = serde_json::from_value(json!({"domains":[]})).unwrap();
+        let dashboard = WebFrontendDomain::attach_with_config(kernel.clone(), &config);
+        let ids = dashboard.client.send(vec!["kernel.runtime".into()], "QueryRuntime", json!({}), json!({}));
+        let logical = dashboard.submission_logical_id(&ids).unwrap();
+        assert_ne!(logical, ids[0]);
+        assert_eq!(kernel.observer().events_for_message(&ids[0]).last().unwrap().logical_id, logical);
+        assert!(kernel.ledger().get_record(&ids[0], "kernel.runtime").is_none());
     }
 }

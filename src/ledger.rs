@@ -288,6 +288,23 @@ impl KernelLedger {
         self.submissions.write().retain(|(d, _), _| d != domain);
     }
 
+    fn retire_ephemeral_identity(&self, record: &DeliveryRecord) {
+        // Match allocation's lock order; callers have already released deliveries.
+        let mut submissions = self.submissions.write();
+        let mut logical = self.logical_messages.write();
+        let mut parents = self.child_logical.write();
+        parents.remove(&record.message_id);
+        if logical.get(&record.logical_id)
+            .is_some_and(|ids| ids.iter().all(|id| !parents.contains_key(id)))
+        {
+            logical.remove(&record.logical_id);
+            let key = (record.source_domain.clone(), record.seq);
+            if submissions.get(&key).is_some_and(|(id, _)| id == &record.logical_id) {
+                submissions.remove(&key);
+            }
+        }
+    }
+
     /// Registers an initial per-target delivery state (`Sent`, `TargetInvalid`, or `ContractInvalid`)
     /// if `message_id` has not yet been recorded.
     ///
@@ -335,6 +352,10 @@ impl KernelLedger {
 
         if policy == DeliveryPolicy::Durable {
             self.persist_record(&record);
+        }
+
+        if policy == DeliveryPolicy::Ephemeral && initial_status.is_terminal() {
+            self.retire_ephemeral_identity(&record);
         }
 
         (record, true)
@@ -396,6 +417,10 @@ impl KernelLedger {
 
         if policy == DeliveryPolicy::Durable {
             self.persist_record(&updated_record);
+        }
+
+        if policy == DeliveryPolicy::Ephemeral && new_status.is_terminal() {
+            self.retire_ephemeral_identity(&updated_record);
         }
 
         ReceiptTransition::Advanced {
@@ -480,7 +505,7 @@ impl KernelLedger {
         let now = now_millis();
         let mut deliveries = self.deliveries.write();
 
-        for (key, record) in deliveries.iter_mut() {
+        for record in deliveries.values_mut() {
             if !record.status.is_terminal()
                 && let Some((target_domain, _)) = parse_target_address(&record.target)
                 && target_domain == crashed_domain
@@ -496,16 +521,20 @@ impl KernelLedger {
 
                 match DeliveryPolicy::resolve(&record.target, &record.message_type) {
                     DeliveryPolicy::Durable => durable_updates.push(record.clone()),
-                    DeliveryPolicy::Ephemeral => ephemeral_removals.push(key.clone()),
+                    DeliveryPolicy::Ephemeral => ephemeral_removals.push(record.clone()),
                     DeliveryPolicy::Volatile => {}
                 }
             }
         }
 
-        for key in ephemeral_removals {
-            deliveries.remove(&key);
+        for record in &ephemeral_removals {
+            deliveries.remove(&record.message_id);
         }
         drop(deliveries);
+
+        for record in ephemeral_removals {
+            self.retire_ephemeral_identity(&record);
+        }
 
         for rec in durable_updates {
             self.persist_record(&rec);
@@ -518,6 +547,65 @@ impl KernelLedger {
 #[cfg(test)]
 mod restoration_tests {
     use super::*;
+
+    #[test]
+    fn ephemeral_identity_indexes_live_only_while_children_are_inflight() {
+        let ledger = KernelLedger::new();
+        for seq in 1..=100 {
+            let (logical, ids, duplicate) = ledger.allocate_submission("sender", seq, 2);
+            assert!(!duplicate);
+            assert_eq!(ledger.allocate_submission("sender", seq, 2), (logical.clone(), ids.clone(), true));
+            for id in &ids {
+                ledger.record_initial_target_state(id, seq, "sender", "worker.run", "Ephemeral", ContractStatus::Sent, None);
+            }
+            for (index, id) in ids.iter().enumerate() {
+                let ReceiptTransition::Advanced {receipt, ..} = ledger.advance_status("worker", id, "worker.run", ContractStatus::Completed, Some(json!({"ok":true}))) else {panic!("completion rejected")};
+                assert_eq!(receipt.logical_id, logical);
+                assert_eq!(receipt.message_id, *id);
+                if index == 0 {
+                    assert_eq!(ledger.allocate_submission("sender", seq, 2), (logical.clone(), ids.clone(), true),
+                        "a completed sibling must not retire an in-flight submission");
+                }
+            }
+            assert_eq!(ledger.deliveries.read().len(), 0);
+            assert_eq!(ledger.submissions.read().len(), 0, "terminal Ephemeral submissions leaked dedup metadata");
+            assert_eq!(ledger.child_logical.read().len(), 0);
+            assert_eq!(ledger.logical_messages.read().len(), 0);
+        }
+        let (_, ids, duplicate) = ledger.allocate_submission("sender", 100, 1);
+        assert!(!duplicate, "completed Ephemeral sequence no longer reserves session dedup state");
+        ledger.record_initial_target_state(&ids[0], 100, "sender", "worker.missing", "Ephemeral", ContractStatus::TargetInvalid, None);
+        assert!(ledger.submissions.read().is_empty(), "invalid targets also retire transient identities");
+        let (logical, ids, _) = ledger.allocate_submission("sender", 101, 1);
+        ledger.record_initial_target_state(&ids[0], 101, "sender", "worker.run", "Ephemeral", ContractStatus::Sent, None);
+        let failures = ledger.fail_inflight_for_domain("worker", "crash");
+        assert_eq!(failures[0].1.logical_id, logical);
+        assert!(ledger.submissions.read().is_empty());
+        assert!(ledger.child_logical.read().is_empty());
+        assert!(ledger.logical_messages.read().is_empty());
+    }
+
+    #[test]
+    fn mixed_and_non_ephemeral_submissions_keep_original_identity_and_replay() {
+        let ledger = KernelLedger::new();
+        let (logical, ids, _) = ledger.allocate_submission("sender", 1, 2);
+        for (id, target) in ids.iter().zip(["kernel.storage", "worker.run"]) {
+            ledger.record_initial_target_state(id, 1, "sender", target, "StorageQuery", ContractStatus::Sent, None);
+        }
+        ledger.advance_status("kernel", &ids[0], "kernel.storage", ContractStatus::Completed, Some(json!({"items":[]})));
+        ledger.advance_status("worker", &ids[1], "worker.run", ContractStatus::Completed, Some(json!({"ok":true})));
+        assert_eq!(ledger.allocate_submission("sender", 1, 2), (logical.clone(), ids.clone(), true));
+        let replay = ledger.receipts_for_logical(&logical);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].message_id, ids[1]);
+        assert_eq!(replay[0].logical_id, logical);
+        assert_eq!(replay[0].data, Some(json!({"ok":true})));
+        let (logical, ids, _) = ledger.allocate_submission("sender", 2, 1);
+        ledger.record_initial_target_state(&ids[0], 2, "sender", "worker.run", "Volatile", ContractStatus::Sent, None);
+        ledger.advance_status("worker", &ids[0], "worker.run", ContractStatus::Completed, Some(json!({"ok":true})));
+        assert_eq!(ledger.allocate_submission("sender", 2, 1), (logical.clone(), ids.clone(), true));
+        assert_eq!(ledger.receipts_for_logical(&logical)[0].status, ContractStatus::Completed);
+    }
 
     #[test]
     fn terminal_payloads_restore_lazily_without_losing_identity_receipts_or_pending_work() {

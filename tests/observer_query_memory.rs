@@ -26,6 +26,8 @@ fn storage_read_results_are_returned_without_accumulating_query_payloads() {
             "completed infrastructure reads retain a second full result in the ledger");
         let event = kernel.observer().events_for_message(&ids[0]).pop().unwrap();
         assert_eq!(event.status, ContractStatus::Completed);
+        assert_eq!(event.logical_id, receipts.last().unwrap().logical_id);
+        assert_ne!(event.logical_id, event.message_id);
         assert!(serde_json::to_vec(&event.details).unwrap().len() < 1024,
             "query observation retained a full storage result instead of bounded metadata");
     }

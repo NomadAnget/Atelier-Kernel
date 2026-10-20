@@ -27,6 +27,7 @@ async def start():
         sizes.append(len(json.dumps(events).encode()))
         runtime=await d.runtime.query()
         assert isinstance(runtime,dict)
+        assert isinstance(runtime["ledger"]["submissions"],int)
     assert max(sizes)<32768
     payload={"text":"x"*8192}
     await d.storage_insert_async("large","memory_probe",payload)
@@ -51,6 +52,7 @@ d.runAsync({onStart:async()=>{
   sizes.push(Buffer.byteLength(JSON.stringify(events)));
   const runtime=await d.runtime.query();
   if(!runtime||typeof runtime!=='object')throw Error('invalid runtime response');
+  if(!Number.isInteger(runtime.ledger?.submissions))throw Error('missing native ledger diagnostics');
  }
  if(Math.max(...sizes)>=32768)throw Error('unbounded snapshot response');
  const payload={text:'x'.repeat(8192)};

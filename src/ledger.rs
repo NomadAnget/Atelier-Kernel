@@ -288,6 +288,29 @@ impl KernelLedger {
         self.submissions.write().retain(|(d, _), _| d != domain);
     }
 
+    /// Diagnostic collection counts only; never clones or serializes business payloads.
+    pub fn retention_counts(&self) -> Value {
+        let (resident, capacity, mut durable, mut volatile, mut ephemeral) = {
+            let records = self.deliveries.read();
+            (records.len(), records.capacity(), 0usize, 0usize, 0usize)
+        };
+        for record in self.deliveries.read().values() {
+            match DeliveryPolicy::resolve(&record.target, &record.message_type) {
+                DeliveryPolicy::Durable => durable += 1,
+                DeliveryPolicy::Volatile => volatile += 1,
+                DeliveryPolicy::Ephemeral => ephemeral += 1,
+            }
+        }
+        let submissions = self.submissions.read();
+        let logical = self.logical_messages.read();
+        let parents = self.child_logical.read();
+        json!({"resident_records":resident, "record_capacity":capacity,
+            "durable_records":durable, "volatile_records":volatile, "ephemeral_inflight":ephemeral,
+            "submissions":submissions.len(), "submission_capacity":submissions.capacity(),
+            "logical_groups":logical.len(), "logical_capacity":logical.capacity(),
+            "child_links":parents.len(), "child_capacity":parents.capacity()})
+    }
+
     fn retire_ephemeral_identity(&self, record: &DeliveryRecord) {
         // Match allocation's lock order; callers have already released deliveries.
         let mut submissions = self.submissions.write();

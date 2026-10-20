@@ -1476,6 +1476,7 @@ impl KernelRouter {
             "count": domain_list.len(),
             "domains": domain_list,
             "domain": single_domain,
+            "ledger": self.ledger.retention_counts(),
         });
 
         self.complete_kernel_internal_target(

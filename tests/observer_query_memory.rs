@@ -143,6 +143,10 @@ fn read_only_runtime_and_observer_queries_are_transient_without_changing_busines
             KernelToDomainFrame::Receipt(receipt) if receipt.message_id==ids[0] && receipt.status==ContractStatus::Completed)));
     }
     assert_eq!(kernel.ledger().persisted_count(), 0);
+    let counts = kernel.ledger().retention_counts();
+    assert_eq!(counts["ephemeral_inflight"], 0);
+    assert_eq!(counts["submissions"], 0);
+    assert_eq!(counts["child_links"], 0);
     client.send(
         vec!["billing.charge".to_string()],
         "ChargeOrder",

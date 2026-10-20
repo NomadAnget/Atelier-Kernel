@@ -5,6 +5,33 @@ use atelier_kernel::{
 use serde_json::{json, Value};
 
 #[test]
+fn storage_read_results_are_returned_without_accumulating_query_payloads() {
+    use atelier_kernel::{KERNEL_STORAGE_TARGET, MSG_STORAGE_QUERY};
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    kernel.logger().set_console_enabled(false);
+    let client = kernel.attach_domain("storage_memory_probe");
+    let payload = json!({"text":"x".repeat(256 * 1024)});
+    client.storage_insert(json!({"record_id":"large", "category":"probe"}), payload.clone());
+    client.drain_frames();
+    for _ in 0..16 {
+        let ids = client.send(vec![KERNEL_STORAGE_TARGET.into()], MSG_STORAGE_QUERY,
+            json!({"record_id":"large"}), json!({}));
+        let receipts: Vec<_> = client.drain_frames().into_iter().filter_map(|f| match f {
+            KernelToDomainFrame::Receipt(r) if r.message_id == ids[0] => Some(r), _ => None,
+        }).collect();
+        assert_eq!(receipts.iter().map(|r|r.status).collect::<Vec<_>>(), vec![
+            ContractStatus::Sent, ContractStatus::Received, ContractStatus::Started, ContractStatus::Completed]);
+        assert_eq!(receipts.last().unwrap().data.as_ref().unwrap()["items"][0]["data"], payload);
+        assert!(kernel.ledger().get_record(&ids[0], KERNEL_STORAGE_TARGET).is_none(),
+            "completed infrastructure reads retain a second full result in the ledger");
+        let event = kernel.observer().events_for_message(&ids[0]).pop().unwrap();
+        assert_eq!(event.status, ContractStatus::Completed);
+        assert!(serde_json::to_vec(&event.details).unwrap().len() < 1024,
+            "query observation retained a full storage result instead of bounded metadata");
+    }
+}
+
+#[test]
 fn observer_queries_do_not_recursively_capture_previous_snapshots() {
     let kernel = AtelierKernel::new_in_memory().unwrap();
     kernel.logger().set_console_enabled(false);
@@ -76,16 +103,23 @@ fn observer_queries_do_not_recursively_capture_previous_snapshots() {
 
 #[test]
 fn read_only_runtime_and_observer_queries_are_transient_without_changing_business_delivery() {
+    use atelier_kernel::{KERNEL_STORAGE_TARGET, KERNEL_REGISTRY_TARGET, KERNEL_LOGGER_TARGET,
+        MSG_STORAGE_QUERY, MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_PROGRESS, MSG_STORAGE_INSERT};
     for (target, kind) in [
         (KERNEL_OBSERVER_TARGET, MSG_QUERY_OBSERVER),
         (KERNEL_RUNTIME_TARGET, MSG_QUERY_RUNTIME),
         (KERNEL_RUNTIME_TARGET, MSG_QUERY_DOMAIN_ASSEMBLY),
+        (KERNEL_STORAGE_TARGET, MSG_STORAGE_QUERY),
+        (KERNEL_REGISTRY_TARGET, MSG_QUERY_HANDLERS),
+        (KERNEL_LOGGER_TARGET, MSG_QUERY_LOGS),
+        (KERNEL_LOGGER_TARGET, MSG_QUERY_PROGRESS),
     ] {
         assert_eq!(
             DeliveryPolicy::resolve(target, kind),
             DeliveryPolicy::Ephemeral
         );
     }
+    assert_eq!(DeliveryPolicy::resolve(KERNEL_STORAGE_TARGET, MSG_STORAGE_INSERT), DeliveryPolicy::Volatile);
     assert_eq!(
         DeliveryPolicy::resolve("billing.charge", "ChargeOrder"),
         DeliveryPolicy::Durable

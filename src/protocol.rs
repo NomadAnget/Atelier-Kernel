@@ -100,12 +100,20 @@ pub enum DeliveryPolicy {
 }
 
 impl DeliveryPolicy {
+    pub(crate) fn is_infrastructure_query(target: &str, message_type: &str) -> bool {
+        match target {
+            KERNEL_OBSERVER_TARGET => message_type == MSG_QUERY_OBSERVER,
+            KERNEL_RUNTIME_TARGET => matches!(message_type, MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY),
+            KERNEL_REGISTRY_TARGET => message_type == MSG_QUERY_HANDLERS,
+            KERNEL_STORAGE_TARGET => message_type == MSG_STORAGE_QUERY,
+            KERNEL_LOGGER_TARGET => matches!(message_type, MSG_QUERY_LOGS | MSG_QUERY_PROGRESS),
+            _ => false,
+        }
+    }
+
     /// Resolves the delivery persistence policy from `target` and `message_type`.
     pub fn resolve(target: &str, message_type: &str) -> Self {
-        if (target == KERNEL_OBSERVER_TARGET && message_type == MSG_QUERY_OBSERVER)
-            || (target == KERNEL_RUNTIME_TARGET
-                && matches!(message_type, MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY))
-        {
+        if Self::is_infrastructure_query(target, message_type) {
             return Self::Ephemeral;
         }
         if target == KERNEL_REGISTRY_TARGET

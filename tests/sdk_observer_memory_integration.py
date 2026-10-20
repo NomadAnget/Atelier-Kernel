@@ -28,7 +28,14 @@ async def start():
         runtime=await d.runtime.query()
         assert isinstance(runtime,dict)
     assert max(sizes)<32768
-    Path(sys.argv[1]).write_text(json.dumps({"success":True,"queries":128,"maximum_response_bytes":max(sizes),"sizes":sizes}))
+    payload={"text":"x"*8192}
+    await d.storage_insert_async("large","memory_probe",payload)
+    for _ in range(128):
+        stored=await d.storage_query_async(record_id="large")
+        assert stored["items"][0]["data"]==payload
+    events=await d.observer.query(limit=32)
+    assert all(e.get("target")!="kernel.storage" or "items" not in (e.get("details") or {}) for e in events)
+    Path(sys.argv[1]).write_text(json.dumps({"success":True,"queries":128,"storage_queries":128,"maximum_response_bytes":max(sizes),"sizes":sizes}))
 asyncio.run(d.run_async(on_start=start))
 '''
 JS='''const fs=require('node:fs');
@@ -46,7 +53,15 @@ d.runAsync({onStart:async()=>{
   if(!runtime||typeof runtime!=='object')throw Error('invalid runtime response');
  }
  if(Math.max(...sizes)>=32768)throw Error('unbounded snapshot response');
- fs.writeFileSync(process.argv[3],JSON.stringify({success:true,queries:128,maximum_response_bytes:Math.max(...sizes),sizes}));
+ const payload={text:'x'.repeat(8192)};
+ await d.storageInsertAsync('large','memory_probe',payload);
+ for(let i=0;i<128;i++){
+  const stored=await d.storageQueryAsync({recordId:'large'});
+  if(stored.items[0].data.text!==payload.text)throw Error('storage payload changed');
+ }
+ const observed=await d.observer.query({limit:32});
+ if(observed.some(e=>e.target==='kernel.storage'&&Array.isArray(e.details?.items)))throw Error('storage results retained in observations');
+ fs.writeFileSync(process.argv[3],JSON.stringify({success:true,queries:128,storage_queries:128,maximum_response_bytes:Math.max(...sizes),sizes}));
 }});
 '''
 py=WORK/'probe.py';py.write_text(PY)

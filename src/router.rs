@@ -1849,13 +1849,18 @@ impl KernelRouter {
             final_status,
             data.clone(),
         ) {
-            // An observer query must not observe its own snapshot payload recursively.
-            // The requester still receives the full result in its ordinary receipt.
-            let observed_data = if msg.target == KERNEL_OBSERVER_TARGET
-                && msg.message_type == MSG_QUERY_OBSERVER
+            // Query payloads belong to the requester, not a second full result cache.
+            let observed_data = if crate::protocol::DeliveryPolicy::is_infrastructure_query(&msg.target, &msg.message_type)
                 && final_status == ContractStatus::Completed
             {
-                data.as_ref().map(|value| json!({ "count": value.get("count").cloned().unwrap_or(json!(0)) }))
+                data.as_ref().map(|value| {
+                    let count = value.get("count").and_then(Value::as_u64).unwrap_or_else(|| {
+                        ["items", "events", "domains", "handlers", "logs", "progress"]
+                            .iter().find_map(|key| value.get(key).and_then(Value::as_array))
+                            .map_or(0, |items| items.len() as u64)
+                    });
+                    json!({ "count": count })
+                })
             } else {
                 data
             };

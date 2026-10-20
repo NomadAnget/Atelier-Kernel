@@ -1464,6 +1464,9 @@ impl KernelRouter {
                 "process": process_info,
             }));
         }
+        // Receipt publication reads domains again. A queued registration writer
+        // makes a recursive read block forever while this snapshot owns the lock.
+        drop(domains_guard);
         domain_list.sort_by(|a, b| a["domain_id"].as_str().cmp(&b["domain_id"].as_str()));
 
         let single_domain = if domain_list.len() == 1 && target_domain.is_some() {

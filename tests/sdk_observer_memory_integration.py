@@ -89,6 +89,9 @@ with (WORK/'kernel.log').open('w') as log:
         assert all(result['success'] for result in results.values())
         (WORK/'report.json').write_text(json.dumps({'success':True,'real_kernel':str(BINARY),'results':results},indent=2))
         print(json.dumps({'success':True,'work':str(WORK),'responses':{name:item['maximum_response_bytes'] for name,item in results.items()}}))
+    except Exception:
+        print((WORK/'kernel.log').read_text(errors='replace')[-20000:], file=sys.stderr)
+        raise
     finally:
         process.terminate()
         try:process.wait(timeout=15)

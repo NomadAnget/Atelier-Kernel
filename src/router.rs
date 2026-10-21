@@ -133,8 +133,6 @@ struct DomainEntry {
 pub struct KernelRouter {
     /// Serialize delivery transitions and publication to caller/observer together.
     /// Dedicated pipe I/O runs outside this gate on supervisor pump threads.
-    receipt_publication: Mutex<()>,
-    output_failures: Mutex<HashMap<String,(u64,String)>>,
     next_instance_id: AtomicU64,
     /// Per-domain serialization gate that closes the TOCTOU window between checking `instance_id`
     /// and processing an inbound frame or replacing a domain generation via `attach_domain_pipe`.
@@ -156,7 +154,6 @@ pub struct KernelRouter {
     notify_subscribers: Arc<RwLock<HashSet<String>>>,
     /// Active domain subscriptions for kernel observation events.
     observer_subscribers: Arc<RwLock<HashSet<String>>>,
-    observer_pending: Arc<Mutex<HashMap<String, (u64, usize)>>>,
     /// Shutdown signal for the background log fanout thread.
     stop_log_pump: Arc<AtomicBool>,
     /// Handle to the background log fanout worker thread.
@@ -181,7 +178,6 @@ impl KernelRouter {
         let telemetry_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let notify_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let observer_subscribers = Arc::new(RwLock::new(HashSet::<String>::new()));
-        let observer_pending = Arc::new(Mutex::new(HashMap::<String, (u64, usize)>::new()));
         let stop_log_pump = Arc::new(AtomicBool::new(false));
 
         let rx = logger.subscribe();
@@ -245,7 +241,6 @@ impl KernelRouter {
         let obs_subs_worker = Arc::clone(&observer_subscribers);
         let obs_domains_worker = Arc::clone(&domains);
         let obs_stop_flag = Arc::clone(&stop_log_pump);
-        let obs_pending = Arc::clone(&observer_pending);
 
         let observer_pump_handle = thread::Builder::new()
             .name("kernel-observer-fanout".to_string())
@@ -278,14 +273,7 @@ impl KernelRouter {
                                                 data: data.clone(),
                                             };
                                             let frame = KernelToDomainFrame::Deliver(msg);
-                                            let size = Self::observation_frame_size(&frame);
-                                            let mut pending = obs_pending.lock();
-                                            let budget = pending.entry(domain_id.clone()).or_insert((entry.instance_id, 0));
-                                            if budget.0 != entry.instance_id { *budget = (entry.instance_id, 0); }
-                                            if size > 0 && size <= 262_144 && budget.1 <= 262_144 - size {
-                                                budget.1 += size;
-                                                if tx.send(frame).is_err() { budget.1 -= size; }
-                                            }
+                                            let _=tx.send(frame);
                                         }
                                     }
                                 }
@@ -299,8 +287,6 @@ impl KernelRouter {
             .ok();
 
         Self {
-            receipt_publication: Mutex::new(()),
-            output_failures: Mutex::new(HashMap::new()),
             next_instance_id: AtomicU64::new(1),
             domain_gates: RwLock::new(HashMap::new()),
             domains,
@@ -314,7 +300,6 @@ impl KernelRouter {
             telemetry_subscribers,
             notify_subscribers,
             observer_subscribers,
-            observer_pending,
             stop_log_pump,
             log_pump_handle: Mutex::new(pump_handle),
             observer_pump_handle: Mutex::new(observer_pump_handle),
@@ -326,22 +311,6 @@ impl KernelRouter {
 
     pub fn set_supervisor(&self, supervisor: Weak<crate::supervisor::DomainSupervisor>) {
         *self.supervisor.write() = Some(supervisor);
-    }
-
-    fn observation_frame_size(frame: &KernelToDomainFrame) -> usize {
-        match frame {
-            KernelToDomainFrame::Deliver(msg) if msg.message_type == MSG_SYSTEM_OBSERVER_EVENT =>
-                serde_json::to_vec(frame).map_or(0, |value| value.len()),
-            _ => 0,
-        }
-    }
-
-    pub(crate) fn observation_frame_consumed(&self, domain: &str, instance: u64, frame: &KernelToDomainFrame) {
-        let size = Self::observation_frame_size(frame);
-        if size == 0 { return; }
-        if let Some((generation, pending)) = self.observer_pending.lock().get_mut(domain) {
-            if *generation == instance { *pending = pending.saturating_sub(size); }
-        }
     }
 
     pub fn supervisor(&self) -> Option<Arc<crate::supervisor::DomainSupervisor>> {
@@ -452,7 +421,6 @@ impl KernelRouter {
         self.telemetry_subscribers.write().remove(domain_id);
         self.notify_subscribers.write().remove(domain_id);
         self.observer_subscribers.write().remove(domain_id);
-        self.observer_pending.lock().remove(domain_id);
 
         instance_id
     }
@@ -812,18 +780,32 @@ impl KernelRouter {
                 .cloned()
                 .collect()
         };
-        let (logical_id, ids, duplicate) =
-            self.ledger
-                .allocate_submission(authenticated_domain, outbound.seq, targets.len());
+        let durable=targets.iter().all(|t|crate::protocol::DeliveryPolicy::resolve(t,&outbound.message_type)==crate::protocol::DeliveryPolicy::Durable);
+        let (logical_id,ids,duplicate)=match self.ledger.try_allocate_submission(authenticated_domain,outbound.seq,targets.len(),durable) {
+            Ok(value)=>value,
+            Err(error)=>{
+                let logical=self.ledger.generate_message_id();
+                let ids:Vec<_>=targets.iter().map(|_|self.ledger.generate_message_id()).collect();
+                for (target,id) in targets.iter().zip(&ids) {
+                    self.send_to_domain_pipe(authenticated_domain,KernelToDomainFrame::Receipt(MessageReceipt {
+                        logical_id:logical.clone(),message_id:id.clone(),seq:outbound.seq,target:target.clone(),message_type:outbound.message_type.clone(),
+                        status:ContractStatus::ExecutionFailed,data:Some(json!({"error":"kernel_admission_failed","reason":error.to_string(),"persisted":false})),timestamp:now_millis(),
+                    }));
+                }
+                return ids;
+            }
+        };
         if duplicate {
             // Snapshot and replay under the publication gate too: otherwise a
             // stale replay can arrive after a newer live receipt.
-            let _publication = self.receipt_publication.lock();
-            for receipt in self.ledger.receipts_for_logical(&logical_id) {
+            for id in &ids {
+                let gate=self.ledger.message_gate(id);let _guard=gate.lock();
+                for receipt in self.ledger.receipts_for_message(id) {
                 self.send_to_domain_pipe(
                     authenticated_domain,
                     KernelToDomainFrame::Receipt(receipt),
                 );
+            }
             }
             return ids;
         }
@@ -1990,7 +1972,7 @@ impl KernelRouter {
     /// Validates and routes a message targeting a business domain handler (`"<domain>.<handler>"`).
     /// If the target does not exist or is not Active, does NOT send the message and immediately returns `TargetInvalid`.
     fn dispatch_domain_target(&self, source_domain: &str, seq: u64, msg: KernelMessage) {
-        let publication = self.receipt_publication.lock();
+        let gate=self.ledger.message_gate(&msg.message_id);let publication=gate.lock();
         let target = msg.target.clone();
 
         // Check route table and target domain active pipe along with its generation `instance_id`.
@@ -2042,33 +2024,19 @@ impl KernelRouter {
             return;
         };
 
-        // Level 2 Idempotency: Record `Sent` in ledger before writing to pipe.
-        let (sent_rec, created) = self.ledger.record_initial_target_state(
-            &msg.message_id,
-            seq,
-            source_domain,
-            &target,
-            &msg.message_type,
-            ContractStatus::Sent,
-            None,
-        );
-        if !created {
-            self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(sent_rec.to_receipt()));
-            return;
-        }
-
-        // Write `Deliver(KernelMessage)` to target domain pipe.
-        if let Err(error) = target_pipe.send(KernelToDomainFrame::Deliver(msg.clone())) {
-            // Target pipe broke right as we tried to send; only fault if `target_instance_id` is still current.
-            // Fault publication takes the same gate, so release it before delegating.
-            drop(publication);
-            if let Some((target_domain, _)) = parse_target_address(&target) {
-                self.mark_domain_faulted_for_instance(
-                    target_domain,
-                    Some(target_instance_id),
-                    &format!("domain output rejected: {}", error.0),
-                );
+        // Reliable admission commits the record and complete envelope in the same transaction.
+        let (sent_rec,created)=match target_pipe.accept(&self.ledger,&msg,seq) {
+            Ok(result)=>result,
+            Err(error)=>{
+                drop(publication);
+                if let Some((domain,_))=parse_target_address(&target) {
+                    self.mark_domain_faulted_for_instance(domain,Some(target_instance_id),&format!("domain output rejected: {}",error.0));
+                }
+                return;
             }
+        };
+        if !created {
+            self.send_to_domain_pipe(source_domain,KernelToDomainFrame::Receipt(sent_rec.to_receipt()));
             return;
         }
 
@@ -2095,7 +2063,7 @@ impl KernelRouter {
             return;
         }
 
-        let _publication = self.receipt_publication.lock();
+        let gate=self.ledger.message_gate(&inbound.message_id);let _publication=gate.lock();
 
         match self.ledger.advance_status(
             reporting_domain,
@@ -2143,7 +2111,6 @@ impl KernelRouter {
         expected_instance_id: Option<u64>,
         reason: &str,
     ) -> bool {
-        let _publication = self.receipt_publication.lock();
         let old_pipe;
         {
             let mut domains = self.domains.write();
@@ -2159,9 +2126,7 @@ impl KernelRouter {
             }
             entry.status = DomainStatus::Faulted;
             old_pipe = entry.pipe_tx.take();
-            if let Some(reason)=old_pipe.as_ref().and_then(|tx|tx.failure()) {
-                self.output_failures.lock().insert(domain_id.into(),(entry.instance_id,reason));
-            }
+
             for h in entry.handlers.keys() {
                 routes.remove(&format!("{domain_id}.{h}"));
             }
@@ -2175,7 +2140,6 @@ impl KernelRouter {
 
         let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
         if let Some(tx)=old_pipe { tx.close(); }
-        self.observer_pending.lock().remove(domain_id);
         for (source_domain, receipt) in failed_deliveries {
             self.observer.emit(
                 &source_domain,
@@ -2193,13 +2157,7 @@ impl KernelRouter {
     }
 
     pub(crate) fn failed_output_queues(&self) -> Vec<(String,u64,String)> {
-        let mut failures=std::mem::take(&mut *self.output_failures.lock());
-        for (id,d) in self.domains.read().iter() {
-            if let Some(reason)=d.pipe_tx.as_ref().and_then(|tx|tx.failure()) {
-                failures.insert(id.clone(),(d.instance_id,reason));
-            }
-        }
-        failures.into_iter().map(|(id,(generation,reason))|(id,generation,reason)).collect()
+        self.domains.read().iter().filter_map(|(id,entry)|entry.pipe_tx.as_ref().and_then(|tx|tx.failure()).map(|reason|(id.clone(),entry.instance_id,reason))).collect()
     }
 
     fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {

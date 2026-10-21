@@ -23,14 +23,13 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), crate::storage::Storag
     )?;
     crate::storage::verify_sqlite_table_columns(conn, "kernel_outbox", OUTBOX_COLUMNS)?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_kernel_outbox_channel ON kernel_outbox(channel,priority,id);")?;
-    // A dead process generation cannot acknowledge execution. Do not replay its pending sends.
-    conn.execute_batch("BEGIN IMMEDIATE;
-        UPDATE kernel_ledger SET status='execution_failed',
-          data='{\"error\":\"kernel_restarted_with_pending_output\",\"reason\":\"old process generation is disconnected; execution outcome is unconfirmed; no automatic replay\"}'
-        WHERE status NOT IN ('completed','execution_failed','target_invalid','contract_invalid')
-          AND message_id IN (SELECT delivery_id FROM kernel_outbox WHERE delivery_id IS NOT NULL);
-        DELETE FROM kernel_outbox;
-        COMMIT;")?;
+    Ok(())
+}
+
+pub(crate) fn insert_frame(db:&Connection,channel:&str,frame:&KernelToDomainFrame)->Result<(),crate::storage::StorageError> {
+    let (_,lane)=classify(frame);
+    let id=match frame {KernelToDomainFrame::Deliver(m)=>Some(m.message_id.as_str()),_=>None};
+    db.execute("INSERT INTO kernel_outbox(channel,delivery_id,priority,frame) VALUES(?1,?2,?3,?4)",params![channel,id,lane as i64,serde_json::to_string(frame)?])?;
     Ok(())
 }
 
@@ -50,6 +49,7 @@ struct State {
     bytes: [usize; 3],
     counts: [usize; 3],
     pending: usize,
+    sent: [i64;2],
     pending_receipts: usize,
     turn: usize,
     lease: Option<Lease>,
@@ -88,6 +88,7 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
             bytes: [0; 3],
             counts: [0; 3],
             pending: 0,
+            sent: [0;2],
             pending_receipts: 0,
             turn: 0,
             lease: None,
@@ -133,6 +134,18 @@ fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
     }
 }
 impl PipeSender {
+    pub(crate) fn accept(&self,ledger:&crate::ledger::KernelLedger,msg:&crate::protocol::KernelMessage,seq:u64)->Result<(crate::ledger::DeliveryRecord,bool),QueueError> {
+        if DeliveryPolicy::resolve(&msg.target,&msg.message_type)!=DeliveryPolicy::Durable {
+            let (record,created)=ledger.record_delivery(msg,seq,&self.0.channel);
+            if created {self.send(KernelToDomainFrame::Deliver(msg.clone()))?;}
+            return Ok((record,created));
+        }
+        let mut state=self.0.state.lock();
+        if state.closed{return Err(QueueError("domain output disconnected".into()));}
+        let (record,created)=ledger.record_delivery(msg,seq,&self.0.channel);
+        if created {state.pending+=1;self.0.wake.notify_one();}
+        Ok((record,created))
+    }
     pub fn send(&self, frame: KernelToDomainFrame) -> Result<(), QueueError> {
         let (mut durable, lane) = classify(&frame);
         let encoded = serde_json::to_string(&frame).map_err(|e| QueueError(e.to_string()))?;
@@ -156,12 +169,7 @@ impl PipeSender {
             durable = false;
         }
         if durable {
-            let delivery = match &frame {
-                KernelToDomainFrame::Deliver(m) => Some(m.message_id.as_str()),
-                _ => None,
-            };
-            let result=self.0.db.lock().execute("INSERT INTO kernel_outbox(channel,delivery_id,priority,frame) VALUES (?1,?2,?3,?4)",
-                params![self.0.channel,delivery,lane as i64,encoded]);
+            let result=insert_frame(&self.0.db.lock(),&self.0.channel,&frame);
             if let Err(e) = result {
                 let error = format!("kernel_outbox_persistence_failed: {e}");
                 s.failure = Some(error.clone());
@@ -245,8 +253,8 @@ impl PipeReceiver {
             }
             if s.pending > 0 {
                 let row: rusqlite::Result<Option<(i64,String,i64)>>=self.0.db.lock().query_row(
-                    "SELECT id,frame,priority FROM kernel_outbox WHERE channel=?1 ORDER BY priority,id LIMIT 1",
-                    [&self.0.channel],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional();
+                    "SELECT id,frame,priority FROM kernel_outbox WHERE channel=?1 AND ((priority=0 AND id>?2) OR (priority=1 AND id>?3)) ORDER BY priority,id LIMIT 1",
+                    params![self.0.channel,s.sent[0],s.sent[1]],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional();
                 match row {
                     Ok(Some((id, text, priority))) => match serde_json::from_str(&text) {
                         Ok(frame) => {
@@ -308,7 +316,7 @@ impl PipeReceiver {
         match s.lease.take() {
             Some(Lease::Disk(id, receipt)) => {
                 if let Err(e) = self.0.db.lock().execute(
-                    "DELETE FROM kernel_outbox WHERE id=?1 AND channel=?2",
+                    "DELETE FROM kernel_outbox WHERE id=?1 AND channel=?2 AND (delivery_id IS NULL OR NOT EXISTS(SELECT 1 FROM kernel_ledger WHERE message_id=delivery_id))",
                     params![id, self.0.channel],
                 ) {
                     let error = format!("outbox acknowledgement failed: {e}");
@@ -316,6 +324,7 @@ impl PipeReceiver {
                     s.closed = true;
                     return Err(QueueError(error));
                 }
+                s.sent[if receipt {0}else{1}]=id;
                 s.pending -= 1;
                 if receipt {
                     s.pending_receipts -= 1;
@@ -339,7 +348,7 @@ fn close(inner: &Inner) {
     s.lease = None;
     // Lifecycle ledger failure is recorded by the router before discarding this generation's queue.
     if let Err(e) = inner.db.lock().execute(
-        "DELETE FROM kernel_outbox WHERE channel=?1",
+        "DELETE FROM kernel_outbox WHERE channel=?1 AND (delivery_id IS NULL OR EXISTS(SELECT 1 FROM kernel_ledger WHERE message_id=delivery_id AND status IN ('completed','execution_failed','contract_invalid','target_invalid')))",
         [&inner.channel],
     ) {
         s.failure = Some(format!("outbox cleanup failed: {e}"));

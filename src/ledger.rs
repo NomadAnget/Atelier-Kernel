@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -74,525 +74,217 @@ pub enum ReceiptTransition {
     UnauthorizedTarget,
 }
 
-/// Kernel ID Generator and Three-Level Idempotency & State Ledger.
-///
-/// Enforces tiered persistence policies based on `DeliveryPolicy`:
-/// - `Durable`: persisted to SQLite `kernel_ledger`; restored terminal payloads are read lazily.
-/// - `Volatile`: retained in-memory only; never written to SQLite.
-/// - `Ephemeral`: tracked in-memory while in-flight and automatically evicted upon reaching a terminal state.
+/// The ledger is the sole owner of message facts. Durable records and session indexes
+/// live in SQLite; a private in-memory database owns nonpersistent records and live aliases.
+/// No historical result or child index is restored into Rust collections.
 pub struct KernelLedger {
     next_id_seq: AtomicU64,
     instance_id: String,
-    /// Session-scoped submission deduplication, preserving ordered split identities.
-    submissions: RwLock<HashMap<(String, u64), (String, Vec<String>)>>,
-    deliveries: RwLock<HashMap<String, DeliveryRecord>>,
-    logical_messages: RwLock<HashMap<String, Vec<String>>>,
-    child_logical: RwLock<HashMap<String, String>>,
+    memory: Mutex<Connection>,
     pub(crate) db_conn: Option<Arc<Mutex<Connection>>>,
+    gates: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
 }
-
-impl Default for KernelLedger {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+const MAX_LIVE: i64 = 65_536;
+const MAX_TRANSIENT_BYTES: i64 = 64*1024*1024;
+const SELECT_RECORD: &str = "SELECT message_id,logical_id,seq,source_domain,target,message_type,status,data,created_at,updated_at FROM kernel_ledger";
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kernel_ledger(
+ message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,source_domain TEXT NOT NULL,
+ target TEXT NOT NULL,message_type TEXT NOT NULL,status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS idx_kernel_ledger_logical ON kernel_ledger(logical_id);
+ CREATE INDEX IF NOT EXISTS idx_kernel_ledger_status ON kernel_ledger(status);
+ CREATE TABLE IF NOT EXISTS kernel_sessions(source TEXT NOT NULL,seq INTEGER NOT NULL,logical_id TEXT NOT NULL,children TEXT NOT NULL,PRIMARY KEY(source,seq));";
+impl Default for KernelLedger {fn default()->Self{Self::new()}}
 impl KernelLedger {
-    pub fn new() -> Self {
-        Self::open_with_db(None).unwrap_or_else(|_| Self {
-            next_id_seq: AtomicU64::new(1),
-            instance_id: uuid::Uuid::new_v4().simple().to_string(),
-            submissions: RwLock::new(HashMap::new()),
-            deliveries: RwLock::new(HashMap::new()),
-            logical_messages: RwLock::new(HashMap::new()),
-            child_logical: RwLock::new(HashMap::new()),
-            db_conn: None,
-        })
+    pub fn new()->Self {Self::open_with_db(None).expect("cannot initialize kernel ledger")}
+    pub fn open_with_db(path:Option<&Path>)->Result<Self,StorageError>{
+        let mut db=match path {Some(p)=>{if let Some(parent)=p.parent().filter(|p|!p.as_os_str().is_empty()){std::fs::create_dir_all(parent)?;}Connection::open(p)?},None=>Connection::open_in_memory()?};
+        db.execute_batch("PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5000;")?;
+        db.execute_batch(SCHEMA)?;
+        verify_sqlite_table_columns(&db,KERNEL_LEDGER_TABLE,KERNEL_LEDGER_COLUMNS)?;
+        verify_sqlite_table_columns(&db,"kernel_sessions",&["source","seq","logical_id","children"])?;
+        let bad:Option<String>=db.query_row("SELECT message_id FROM kernel_ledger WHERE (data IS NOT NULL AND NOT json_valid(data)) OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",[],|r|r.get(0)).optional()?;
+        if let Some(id)=bad{return Err(StorageError::CorruptLedgerRecord(id));}
+        crate::outbox::initialize(&db)?;
+        // Every old process generation is disconnected. Recover facts, never blindly repeat effects.
+        let tx=db.transaction()?;
+        tx.execute("UPDATE kernel_ledger SET status='execution_failed',data=?1,updated_at=?2 WHERE status IN ('sent','received','started')",
+            params![json!({"error":"kernel_restarted_with_inflight_delivery","execution_outcome":"unknown","reason":"previous process generation disconnected; no automatic replay"}).to_string(),now_millis()])?;
+        tx.execute("DELETE FROM kernel_outbox",[])?;
+        tx.execute("DELETE FROM kernel_sessions",[])?;
+        tx.commit()?;
+        let memory=Connection::open_in_memory()?;memory.execute_batch(SCHEMA)?;
+        memory.execute_batch("CREATE TABLE identities(message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,source TEXT NOT NULL,seq INTEGER NOT NULL);
+            CREATE INDEX identities_logical ON identities(logical_id);
+            CREATE TABLE highwater(source TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
+        Ok(Self{next_id_seq:AtomicU64::new(1),instance_id:uuid::Uuid::new_v4().simple().to_string(),memory:Mutex::new(memory),db_conn:Some(Arc::new(Mutex::new(db))),gates:Mutex::new(HashMap::new())})
     }
-
-    /// Initializes the Kernel Ledger backed by an optional SQLite file path (or in-memory SQLite when `None`).
-    pub fn open_with_db(db_path: Option<&Path>) -> Result<Self, StorageError> {
-        let conn = match db_path {
-            Some(path) => {
-                if let Some(parent) = path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                Connection::open(path)?
-            }
-            None => Connection::open_in_memory()?,
+    pub(crate) fn message_gate(&self,id:&str)->Arc<Mutex<()>>{
+        let mut gates=self.gates.lock();
+        if let Some(gate)=gates.get(id).and_then(|w|w.upgrade()){return gate;}
+        if gates.len()>=1024{gates.retain(|_,w|w.strong_count()>0);}
+        let gate=Arc::new(Mutex::new(()));gates.insert(id.into(),Arc::downgrade(&gate));gate
+    }
+    fn row_to_record(row:&rusqlite::Row<'_>)->rusqlite::Result<DeliveryRecord>{
+        let status:String=row.get(6)?;let raw:Option<String>=row.get(7)?;
+        let error=|e:serde_json::Error|rusqlite::Error::FromSqlConversionFailure(6,rusqlite::types::Type::Text,Box::new(e));
+        Ok(DeliveryRecord{message_id:row.get(0)?,logical_id:row.get(1)?,seq:row.get::<_,i64>(2)? as u64,source_domain:row.get(3)?,target:row.get(4)?,message_type:row.get(5)?,
+            status:serde_json::from_value(Value::String(status)).map_err(error)?,data:raw.map(|s|serde_json::from_str(&s).map_err(error)).transpose()?,created_at:row.get(8)?,updated_at:row.get(9)?})
+    }
+    fn read(db:&Connection,id:&str)->rusqlite::Result<Option<DeliveryRecord>>{
+        db.query_row(&format!("{SELECT_RECORD} WHERE message_id=?1"),[id],Self::row_to_record).optional()
+    }
+    fn write(db:&Connection,r:&DeliveryRecord)->Result<(),StorageError>{
+        db.execute("INSERT INTO kernel_ledger(message_id,logical_id,seq,source_domain,target,message_type,status,data,created_at,updated_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,data=excluded.data,updated_at=excluded.updated_at",
+            params![r.message_id,r.logical_id,r.seq as i64,r.source_domain,r.target,r.message_type,serde_json::to_value(r.status)?.as_str(),r.data.as_ref().map(serde_json::to_string).transpose()?,r.created_at,r.updated_at])?;Ok(())
+    }
+    fn failure(r:&DeliveryRecord,error:impl ToString)->DeliveryRecord{
+        let mut failed=r.clone();failed.status=ContractStatus::ExecutionFailed;failed.updated_at=now_millis();
+        failed.data=Some(json!({"error":"kernel_persistence_failed","reason":error.to_string(),"persisted":false,"previous_status":r.status}));failed
+    }
+    fn remember_failure(&self,r:&DeliveryRecord){
+        // Failure feedback never depends on the disk which failed. Space is reserved at ingress.
+        if let Err(e)=Self::write(&self.memory.lock(),r){eprintln!("kernel fatal: cannot retain failure {}: {e}",r.message_id);}
+    }
+    pub fn generate_message_id(&self)->String{format!("msg_{}_{}_{:020}",now_millis(),self.instance_id,self.next_id_seq.fetch_add(1,Ordering::Relaxed))}
+    pub fn allocate_submission(&self,source:&str,seq:u64,count:usize)->(String,Vec<String>,bool){
+        self.try_allocate_submission(source,seq,count,false).expect("kernel submission resources exhausted")
+    }
+    pub(crate) fn try_allocate_submission(&self,source:&str,seq:u64,count:usize,durable:bool)->Result<(String,Vec<String>,bool),StorageError>{
+        let older={let mem=self.memory.lock();
+            if seq>0 {if let Some(found)=Self::submission(&mem,source,seq)? {return Ok((found.0,found.1,true));}}
+            let high:i64=mem.query_row("SELECT coalesce((SELECT seq FROM highwater WHERE source=?1),0)",[source],|r|r.get(0))?;
+            seq>0 && seq<=high as u64
         };
-        conn.execute_batch(&format!(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             PRAGMA busy_timeout = 5000;
-             CREATE TABLE IF NOT EXISTS {KERNEL_LEDGER_TABLE} (
-                 message_id    TEXT PRIMARY KEY,
-                 logical_id    TEXT NOT NULL,
-                 seq           INTEGER NOT NULL,
-                 source_domain TEXT NOT NULL,
-                 target        TEXT NOT NULL,
-                 message_type  TEXT NOT NULL,
-                 status        TEXT NOT NULL,
-                 data          TEXT,
-                 created_at    INTEGER NOT NULL,
-                 updated_at    INTEGER NOT NULL
-             );
-             CREATE INDEX IF NOT EXISTS idx_{KERNEL_LEDGER_TABLE}_logical ON {KERNEL_LEDGER_TABLE}(logical_id);
-             CREATE INDEX IF NOT EXISTS idx_{KERNEL_LEDGER_TABLE}_status ON {KERNEL_LEDGER_TABLE}(status);"
-        ))?;
-        verify_sqlite_table_columns(&conn, KERNEL_LEDGER_TABLE, KERNEL_LEDGER_COLUMNS)?;
-        // Validate even lazily restored terminal payloads without expanding them in memory.
-        let corrupt: Option<String> = conn.query_row(
-            &format!("SELECT message_id FROM {KERNEL_LEDGER_TABLE} WHERE (data IS NOT NULL AND NOT json_valid(data)) OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1"),
-            [], |row| row.get(0)).optional()?;
-        if let Some(id) = corrupt { return Err(StorageError::CorruptLedgerRecord(id)); }
-
-        crate::outbox::initialize(&conn)?;
-        let mut deliveries_map = HashMap::new();
-        let mut logical_map: HashMap<String, Vec<String>> = HashMap::new();
-        let mut child_map = HashMap::new();
-
+        if older {if let Some(found)=Self::submission(&self.db_conn.as_ref().unwrap().lock(),source,seq)?{return Ok((found.0,found.1,true));}}
+        let logical=self.generate_message_id().replacen("msg_","logical_",1);
+        let ids:Vec<_>=(0..count).map(|_|self.generate_message_id()).collect();
         {
-            let mut stmt = conn.prepare(&format!(
-                "SELECT message_id, logical_id, seq, source_domain, target, message_type, status,
-                        CASE WHEN status IN ('completed','target_invalid','contract_invalid','execution_failed')
-                             THEN NULL ELSE data END AS data, created_at, updated_at
-                 FROM {KERNEL_LEDGER_TABLE}
-                 ORDER BY created_at ASC, message_id ASC"
-            ))?;
-            let rows = stmt.query_map([], Self::row_to_record)?;
-            for item in rows {
-                let record = item?;
-                child_map.insert(record.message_id.clone(), record.logical_id.clone());
-                logical_map
-                    .entry(record.logical_id.clone())
-                    .or_default()
-                    .push(record.message_id.clone());
-                if !record.status.is_terminal() {
-                    deliveries_map.insert(record.message_id.clone(), record);
-                }
+            let mut mem=self.memory.lock();
+            let used:i64=mem.query_row("SELECT count(*) FROM identities",[],|r|r.get(0))?;
+            if count>1024 || used+count as i64>MAX_LIVE{return Err(StorageError::ResourceExhausted("live message identities".into()));}
+            let tx=mem.transaction()?;
+            if !durable && seq>0{tx.execute("INSERT INTO kernel_sessions VALUES(?1,?2,?3,?4)",params![source,seq as i64,logical,serde_json::to_string(&ids)?])?;}
+            for id in &ids{tx.execute("INSERT INTO identities VALUES(?1,?2,?3,?4)",params![id,logical,source,seq as i64])?;}
+            tx.execute("INSERT INTO highwater VALUES(?1,?2) ON CONFLICT(source) DO UPDATE SET seq=max(seq,excluded.seq)",params![source,seq as i64])?;tx.commit()?;
+        }
+        if durable && seq>0 {
+            let result=self.db_conn.as_ref().unwrap().lock().execute("INSERT INTO kernel_sessions VALUES(?1,?2,?3,?4)",params![source,seq as i64,logical,serde_json::to_string(&ids)?]);
+            if let Err(e)=result {self.retire_logical(&logical);return Err(e.into());}
+        }
+        Ok((logical,ids,false))
+    }
+    fn submission(db:&Connection,source:&str,seq:u64)->Result<Option<(String,Vec<String>)>,StorageError>{
+        let row:Option<(String,String)>=db.query_row("SELECT logical_id,children FROM kernel_sessions WHERE source=?1 AND seq=?2",params![source,seq as i64],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        row.map(|(id,text)|Ok((id,serde_json::from_str(&text)?))).transpose()
+    }
+    pub fn logical_id_for_message(&self,id:&str)->String{
+        let found:Option<String>=self.memory.lock().query_row("SELECT logical_id FROM identities WHERE message_id=?1",[id],|r|r.get(0)).optional().expect("memory identity query failed");
+        found.or_else(||self.get_persisted_record(id).map(|r|r.logical_id)).unwrap_or_else(||id.into())
+    }
+    fn retire_logical(&self,logical:&str){let mem=self.memory.lock();let _=mem.execute("DELETE FROM identities WHERE logical_id=?1",[logical]);let _=mem.execute("DELETE FROM kernel_sessions WHERE logical_id=?1",[logical]);}
+    fn retire(&self,r:&DeliveryRecord,policy:DeliveryPolicy){
+        let mem=self.memory.lock();
+        if policy==DeliveryPolicy::Durable || (policy==DeliveryPolicy::Ephemeral && r.status.is_terminal()) {
+            let _=mem.execute("DELETE FROM identities WHERE message_id=?1",[&r.message_id]);
+        }
+        if policy==DeliveryPolicy::Ephemeral && r.status.is_terminal(){
+            let _=mem.execute("DELETE FROM kernel_sessions WHERE logical_id=?1 AND NOT EXISTS(SELECT 1 FROM identities WHERE logical_id=?1)",[&r.logical_id]);
+        }
+    }
+    pub fn clear_session_dedup_for_domain(&self,source:&str){
+        {let mem=self.memory.lock();let _=mem.execute("DELETE FROM kernel_sessions WHERE source=?1",[source]);let _=mem.execute("DELETE FROM highwater WHERE source=?1",[source]);}
+        if let Err(e)=self.db_conn.as_ref().unwrap().lock().execute("DELETE FROM kernel_sessions WHERE source=?1",[source]){eprintln!("kernel session cleanup failed: {e}");}
+    }
+    pub fn retention_counts(&self)->Value{
+        let mem=self.memory.lock();let count=|sql:&str|mem.query_row(sql,[],|r|r.get::<_,i64>(0)).unwrap_or(0);
+        let records=count("SELECT count(*) FROM kernel_ledger");let ids=count("SELECT count(*) FROM identities");
+        json!({"resident_records":records,"record_capacity":records,"durable_records":0,"volatile_records":count("SELECT count(*) FROM kernel_ledger WHERE message_type='Volatile'"),"ephemeral_inflight":count("SELECT count(*) FROM kernel_ledger WHERE message_type='Ephemeral'"),
+            "submissions":count("SELECT count(*) FROM kernel_sessions"),"submission_capacity":MAX_LIVE,"logical_groups":count("SELECT count(DISTINCT logical_id) FROM identities"),"logical_capacity":ids,"child_links":ids,"child_capacity":ids})
+    }
+    pub fn record_initial_target_state(&self,id:&str,seq:u64,source:&str,target:&str,kind:&str,status:ContractStatus,data:Option<Value>)->(DeliveryRecord,bool){
+        let now=now_millis();let r=DeliveryRecord{logical_id:self.logical_id_for_message(id),message_id:id.into(),seq,source_domain:source.into(),target:target.into(),message_type:kind.into(),status,data,created_at:now,updated_at:now};
+        self.record_initial(r,None)
+    }
+    pub(crate) fn record_delivery(&self,msg:&crate::protocol::KernelMessage,seq:u64,channel:&str)->(DeliveryRecord,bool){
+        let now=now_millis();let r=DeliveryRecord{logical_id:msg.logical_id.clone(),message_id:msg.message_id.clone(),seq,source_domain:msg.source_domain.clone(),target:msg.target.clone(),message_type:msg.message_type.clone(),status:ContractStatus::Sent,data:None,created_at:now,updated_at:now};
+        self.record_initial(r,Some((channel,msg)))
+    }
+    fn record_initial(&self,r:DeliveryRecord,out:Option<(&str,&crate::protocol::KernelMessage)>)->(DeliveryRecord,bool){
+        let policy=DeliveryPolicy::resolve(&r.target,&r.message_type);
+        if let Some(existing)=Self::read(&self.memory.lock(),&r.message_id).expect("memory ledger query"){return(existing,false);}
+        if policy==DeliveryPolicy::Durable {
+            let result=(||->Result<Option<DeliveryRecord>,StorageError>{
+                let mut db=self.db_conn.as_ref().unwrap().lock();let tx=db.transaction()?;
+                if let Some(existing)=Self::read(&tx,&r.message_id)?{return Ok(Some(existing));}
+                Self::write(&tx,&r)?;
+                if let Some((channel,msg))=out {crate::outbox::insert_frame(&tx,channel,&crate::protocol::KernelToDomainFrame::Deliver(msg.clone()))?;}
+                tx.commit()?;Ok(None)
+            })();
+            match result {Ok(Some(old))=>return(old,false),Err(e)=>{let failed=Self::failure(&r,e);self.remember_failure(&failed);return(failed,false);},Ok(None)=>{}}
+        } else if !(policy==DeliveryPolicy::Ephemeral && r.status.is_terminal()) {
+            let mem=self.memory.lock();
+            let bytes:i64=mem.query_row("SELECT coalesce(sum(length(data)),0) FROM kernel_ledger",[],|r|r.get(0)).expect("memory quota query");
+            if bytes+r.data.as_ref().map_or(0,|v|v.to_string().len() as i64)>MAX_TRANSIENT_BYTES {
+                let failed=Self::failure(&r,"nonpersistent ledger capacity exhausted");drop(mem);self.remember_failure(&failed);return(failed,false);
             }
+            Self::write(&mem,&r).expect("cannot write in-memory ledger");
         }
-
-        Ok(Self {
-            next_id_seq: AtomicU64::new(1),
-            instance_id: uuid::Uuid::new_v4().simple().to_string(),
-            submissions: RwLock::new(HashMap::new()),
-            deliveries: RwLock::new(deliveries_map),
-            logical_messages: RwLock::new(logical_map),
-            child_logical: RwLock::new(child_map),
-            db_conn: Some(Arc::new(Mutex::new(conn))),
-        })
+        self.retire(&r,policy);(r,true)
     }
-
-    fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
-        let status_raw: String = row.get(6)?;
-        let status: ContractStatus = serde_json::from_value(Value::String(status_raw))
-            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error)))?;
-        let data_raw: Option<String> = row.get(7)?;
-        let data = data_raw.map(|s| serde_json::from_str(&s)
-            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))))
-            .transpose()?;
-        Ok(DeliveryRecord {
-            message_id: row.get(0)?,
-            logical_id: row.get(1)?,
-            seq: row.get::<_, i64>(2)? as u64,
-            source_domain: row.get(3)?,
-            target: row.get(4)?,
-            message_type: row.get(5)?,
-            status,
-            data,
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
-        })
+    pub fn advance_status(&self,domain:&str,id:&str,target:&str,status:ContractStatus,data:Option<Value>)->ReceiptTransition {
+        if parse_target_address(target).is_none_or(|(owner,_)|owner!=domain){return ReceiptTransition::UnauthorizedTarget;}
+        let Some(old)=self.record_for_message(id) else{return ReceiptTransition::UnknownDelivery;};
+        if old.target!=target{return ReceiptTransition::UnauthorizedTarget;}
+        if old.status.is_terminal() || status.stage_rank()<=old.status.stage_rank(){return ReceiptTransition::DuplicateOrStale;}
+        let mut r=old.clone();r.status=status;r.updated_at=now_millis();if data.is_some(){r.data=data;}
+        self.commit_transition(&mut r,&old);
+        ReceiptTransition::Advanced{source_domain:r.source_domain.clone(),receipt:r.to_receipt()}
     }
-
-    fn persist_record(&self, record: &DeliveryRecord) -> Result<(), StorageError> {
-        let Some(ref conn_mutex) = self.db_conn else {
-            return Ok(());
-        };
-        let status_str = serde_json::to_value(record.status)
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-            .unwrap_or_else(|| "sent".to_string());
-        let data_str = record
-            .data
-            .as_ref()
-            .and_then(|d| serde_json::to_string(d).ok());
-        let conn = conn_mutex.lock();
-        conn.execute(
-            &format!(
-                "INSERT INTO {KERNEL_LEDGER_TABLE}
-                 (message_id, logical_id, seq, source_domain, target, message_type, status, data, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                 ON CONFLICT(message_id) DO UPDATE SET
-                     status = excluded.status,
-                     data = excluded.data,
-                     updated_at = excluded.updated_at"
-            ),
-            params![
-                record.message_id,
-                record.logical_id,
-                record.seq as i64,
-                record.source_domain,
-                record.target,
-                record.message_type,
-                status_str,
-                data_str,
-                record.created_at,
-                record.updated_at,
-            ],
-        )?;
-        Ok(())
+    fn commit_transition(&self,r:&mut DeliveryRecord,old:&DeliveryRecord){
+        let policy=DeliveryPolicy::resolve(&r.target,&r.message_type);
+        if policy==DeliveryPolicy::Durable {
+            let result=(||->Result<(),StorageError>{let mut db=self.db_conn.as_ref().unwrap().lock();let tx=db.transaction()?;Self::write(&tx,r)?;
+                if r.status.is_terminal(){tx.execute("DELETE FROM kernel_outbox WHERE delivery_id=?1",[&r.message_id])?;}tx.commit()?;Ok(())})();
+            if let Err(e)=result{*r=Self::failure(old,e);self.remember_failure(r);}
+        }else{
+            let mem=self.memory.lock();if policy==DeliveryPolicy::Ephemeral && r.status.is_terminal(){let _=mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1",[&r.message_id]);}
+            else{Self::write(&mem,r).expect("memory transition");}
+        }
+        self.retire(r,policy);
     }
-
-    fn persistence_failure(record: &DeliveryRecord, error: StorageError) -> DeliveryRecord {
-        let mut failed = record.clone();
-        failed.status = ContractStatus::ExecutionFailed;
-        failed.updated_at = now_millis();
-        failed.data = Some(json!({"error":"kernel_persistence_failed", "reason":error.to_string(),
-            "persisted":false, "previous_status":record.status}));
-        failed
+    fn record_for_message(&self,id:&str)->Option<DeliveryRecord>{
+        let resident={Self::read(&self.memory.lock(),id).expect("memory ledger query")};
+        resident.or_else(||self.get_persisted_record(id))
     }
-
-    /// Atomically allocates the logical identity and all ordered child IDs.
-    /// Router serializes each authenticated source session across allocation and dispatch.
-    pub fn allocate_submission(
-        &self,
-        source: &str,
-        seq: u64,
-        count: usize,
-    ) -> (String, Vec<String>, bool) {
-        let mut submissions = self.submissions.write();
-        let key = (source.to_string(), seq);
-        if seq > 0 {
-            if let Some((logical, children)) = submissions.get(&key) {
-                return (logical.clone(), children.clone(), true);
-            }
-        }
-        let logical = self.generate_message_id().replacen("msg_", "logical_", 1);
-        let children: Vec<_> = (0..count).map(|_| self.generate_message_id()).collect();
-        self.logical_messages
-            .write()
-            .insert(logical.clone(), children.clone());
-        let mut parents = self.child_logical.write();
-        for child in &children {
-            parents.insert(child.clone(), logical.clone());
-        }
-        if seq > 0 {
-            submissions.insert(key, (logical.clone(), children.clone()));
-        }
-        (logical, children, false)
+    pub fn get_record(&self,id:&str,target:&str)->Option<DeliveryRecord>{self.record_for_message(id).filter(|r|r.target==target)}
+    pub fn get_persisted_record(&self,id:&str)->Option<DeliveryRecord>{Self::read(&self.db_conn.as_ref().unwrap().lock(),id).unwrap_or_else(|e|{eprintln!("kernel persistent record query failed for {id}: {e}");None})}
+    pub fn persisted_count(&self)->usize{self.db_conn.as_ref().unwrap().lock().query_row("SELECT count(*) FROM kernel_ledger",[],|r|r.get::<_,i64>(0)).expect("cannot count persistent ledger") as usize}
+    pub fn receipts_for_message(&self,id:&str)->Vec<MessageReceipt>{self.record_for_message(id).map(|r|vec![r.to_receipt()]).unwrap_or_default()}
+    pub fn receipts_for_logical(&self,logical:&str)->Vec<MessageReceipt>{
+        let ids:Vec<String>={let mem=self.memory.lock();let mut stmt=mem.prepare("SELECT message_id FROM identities WHERE logical_id=?1 ORDER BY rowid").expect("identity lookup");stmt.query_map([logical],|r|r.get(0)).expect("identity query").collect::<Result<_,_>>().expect("identity decode")};
+        let mut records:Vec<_>=ids.iter().filter_map(|id|self.record_for_message(id)).collect();
+        let db=self.db_conn.as_ref().unwrap().lock();let mut stmt=db.prepare(&format!("{SELECT_RECORD} WHERE logical_id=?1 ORDER BY rowid")).expect("logical lookup");
+        for item in stmt.query_map([logical],Self::row_to_record).expect("logical query"){let r=item.expect("logical decode");if !records.iter().any(|old|old.message_id==r.message_id){records.push(r);}}
+        records.into_iter().map(|r|r.to_receipt()).collect()
     }
-
-    pub fn logical_id_for_message(&self, message_id: &str) -> String {
-        self.child_logical
-            .read()
-            .get(message_id)
-            .cloned()
-            .unwrap_or_else(|| message_id.to_string())
-    }
-
-    /// Generates a globally unique kernel message ID (instance UUID plus local sequence).
-    pub fn generate_message_id(&self) -> String {
-        let seq = self.next_id_seq.fetch_add(1, Ordering::Relaxed);
-        let ts = now_millis();
-        format!("msg_{ts}_{}_{seq:06}", self.instance_id)
-    }
-
-    /// Clears `(source_domain, seq)` session deduplication entries when a domain process restarts.
-    pub fn clear_session_dedup_for_domain(&self, domain: &str) {
-        self.submissions.write().retain(|(d, _), _| d != domain);
-    }
-
-    /// Diagnostic collection counts only; never clones or serializes business payloads.
-    pub fn retention_counts(&self) -> Value {
-        let (resident, capacity, mut durable, mut volatile, mut ephemeral) = {
-            let records = self.deliveries.read();
-            (records.len(), records.capacity(), 0usize, 0usize, 0usize)
-        };
-        for record in self.deliveries.read().values() {
-            match DeliveryPolicy::resolve(&record.target, &record.message_type) {
-                DeliveryPolicy::Durable => durable += 1,
-                DeliveryPolicy::Volatile => volatile += 1,
-                DeliveryPolicy::Ephemeral => ephemeral += 1,
-            }
+    pub fn fail_inflight_for_domain(&self,domain:&str,reason:&str)->Vec<(String,MessageReceipt)>{
+        let mut pending=Vec::new();
+        for db in [&self.memory,&**self.db_conn.as_ref().unwrap()] {
+            let db=db.lock();let mut stmt=db.prepare(&format!("{SELECT_RECORD} WHERE status IN ('sent','received','started') AND substr(target,1,length(?1)+1)=?1||'.'")).expect("inflight lookup");
+            pending.extend(stmt.query_map([domain],Self::row_to_record).expect("inflight query").collect::<Result<Vec<_>,_>>().expect("inflight decode"));
         }
-        let submissions = self.submissions.read();
-        let logical = self.logical_messages.read();
-        let parents = self.child_logical.read();
-        json!({"resident_records":resident, "record_capacity":capacity,
-            "durable_records":durable, "volatile_records":volatile, "ephemeral_inflight":ephemeral,
-            "submissions":submissions.len(), "submission_capacity":submissions.capacity(),
-            "logical_groups":logical.len(), "logical_capacity":logical.capacity(),
-            "child_links":parents.len(), "child_capacity":parents.capacity()})
-    }
-
-    fn retire_ephemeral_identity(&self, record: &DeliveryRecord) {
-        // Match allocation's lock order; callers have already released deliveries.
-        let mut submissions = self.submissions.write();
-        let mut logical = self.logical_messages.write();
-        let mut parents = self.child_logical.write();
-        parents.remove(&record.message_id);
-        if logical.get(&record.logical_id)
-            .is_some_and(|ids| ids.iter().all(|id| !parents.contains_key(id)))
-        {
-            logical.remove(&record.logical_id);
-            let key = (record.source_domain.clone(), record.seq);
-            if submissions.get(&key).is_some_and(|(id, _)| id == &record.logical_id) {
-                submissions.remove(&key);
-            }
+        let mut notifications=Vec::new();
+        for candidate in pending {
+            let gate=self.message_gate(&candidate.message_id);let _guard=gate.lock();
+            if let Some(old)=self.record_for_message(&candidate.message_id){if !old.status.is_terminal(){
+                let mut failed=old.clone();failed.status=ContractStatus::ExecutionFailed;failed.updated_at=now_millis();failed.data=Some(json!({"error":"target_domain_faulted","domain":domain,"reason":reason,"execution_outcome":"unknown"}));
+                self.commit_transition(&mut failed,&old);notifications.push((failed.source_domain.clone(),failed.to_receipt()));
+            }}
         }
-    }
-
-    /// Registers an initial per-target delivery state (`Sent`, `TargetInvalid`, or `ContractInvalid`)
-    /// if `message_id` has not yet been recorded.
-    ///
-    /// Returns `(DeliveryRecord, is_newly_created)`.
-    pub fn record_initial_target_state(
-        &self,
-        message_id: &str,
-        seq: u64,
-        source_domain: &str,
-        target: &str,
-        message_type: &str,
-        initial_status: ContractStatus,
-        data: Option<Value>,
-    ) -> (DeliveryRecord, bool) {
-        let key = message_id.to_string();
-        let policy = DeliveryPolicy::resolve(target, message_type);
-        if let Some(existing) = self.get_persisted_record(message_id) {
-            return (existing, false);
-        }
-        let mut deliveries = self.deliveries.write();
-        if let Some(existing) = deliveries.get(&key) {
-            return (existing.clone(), false);
-        }
-
-        let now = now_millis();
-        let record = DeliveryRecord {
-            logical_id: self.logical_id_for_message(message_id),
-            message_id: message_id.to_string(),
-            seq,
-            source_domain: source_domain.to_string(),
-            target: target.to_string(),
-            message_type: message_type.to_string(),
-            status: initial_status,
-            data,
-            created_at: now,
-            updated_at: now,
-        };
-
-        // Commit Durable ingress before making it visible to dispatch or replay.
-        if policy == DeliveryPolicy::Durable {
-            if let Err(error) = self.persist_record(&record) {
-                let failed = Self::persistence_failure(&record, error);
-                deliveries.insert(key, failed.clone());
-                return (failed, false);
-            }
-        }
-
-        // Ephemeral messages that are already terminal on ingress (e.g. TargetInvalid / ContractInvalid)
-        // do not stay in the in-memory ledger.
-        if !(policy == DeliveryPolicy::Ephemeral && initial_status.is_terminal()) {
-            deliveries.insert(key, record.clone());
-        }
-        drop(deliveries);
-
-        if policy == DeliveryPolicy::Ephemeral && initial_status.is_terminal() {
-            self.retire_ephemeral_identity(&record);
-        }
-
-        (record, true)
-    }
-
-    /// Advances the state of `message_id` monotonically, verifying that `reporting_domain`
-    /// owns `target`.
-    pub fn advance_status(
-        &self,
-        reporting_domain: &str,
-        message_id: &str,
-        target: &str,
-        new_status: ContractStatus,
-        data: Option<Value>,
-    ) -> ReceiptTransition {
-        // Verify that the reporting pipe's domain matches the `<domain>.<handler>` prefix.
-        let Some((target_domain, _)) = parse_target_address(target) else {
-            return ReceiptTransition::UnauthorizedTarget;
-        };
-        if target_domain != reporting_domain && !(reporting_domain == "kernel" && target_domain == "web_ui") {
-            return ReceiptTransition::UnauthorizedTarget;
-        }
-
-        let key = message_id.to_string();
-        let mut deliveries = self.deliveries.write();
-        let Some(record) = deliveries.get_mut(&key) else {
-            drop(deliveries);
-            return match self.get_persisted_record(message_id) {
-                Some(record) if record.target != target => ReceiptTransition::UnauthorizedTarget,
-                Some(record) if record.status.is_terminal() => ReceiptTransition::DuplicateOrStale,
-                _ => ReceiptTransition::UnknownDelivery,
-            };
-        };
-
-        if record.target != target {
-            return ReceiptTransition::UnauthorizedTarget;
-        }
-
-        // Terminal states cannot be overwritten, and stage rank must strictly increase.
-        if record.status.is_terminal() || new_status.stage_rank() <= record.status.stage_rank() {
-            return ReceiptTransition::DuplicateOrStale;
-        }
-
-        let previous_record = record.clone();
-        record.status = new_status;
-        if data.is_some() {
-            record.data = data;
-        }
-        record.updated_at = now_millis();
-
-        let policy = DeliveryPolicy::resolve(&record.target, &record.message_type);
-        if policy == DeliveryPolicy::Durable {
-            if let Err(error) = self.persist_record(record) {
-                *record = Self::persistence_failure(&previous_record, error);
-            }
-        }
-        let updated_record = record.clone();
-        let source_domain = record.source_domain.clone();
-        let receipt = record.to_receipt();
-
-        if policy == DeliveryPolicy::Ephemeral && new_status.is_terminal() {
-            deliveries.remove(&key);
-        }
-        drop(deliveries);
-
-        if policy == DeliveryPolicy::Ephemeral && new_status.is_terminal() {
-            self.retire_ephemeral_identity(&updated_record);
-        }
-
-        ReceiptTransition::Advanced {
-            source_domain,
-            receipt,
-        }
-    }
-
-    /// Replay all child receipts in original submission order.
-    pub fn receipts_for_logical(&self, logical_id: &str) -> Vec<MessageReceipt> {
-        let ids = self
-            .logical_messages
-            .read()
-            .get(logical_id)
-            .cloned()
-            .unwrap_or_default();
-        ids.iter()
-            .filter_map(|id| self.record_for_message(id).map(|record| record.to_receipt()))
-            .collect()
-    }
-
-    pub fn receipts_for_message(&self, message_id: &str) -> Vec<MessageReceipt> {
-        self.record_for_message(message_id)
-            .map(|r| vec![r.to_receipt()])
-            .unwrap_or_default()
-    }
-
-    pub fn get_record(&self, message_id: &str, target: &str) -> Option<DeliveryRecord> {
-        self.record_for_message(message_id)
-            .filter(|r| r.target == target)
-    }
-
-    fn record_for_message(&self, message_id: &str) -> Option<DeliveryRecord> {
-        let resident = self.deliveries.read().get(message_id).cloned();
-        resident.or_else(|| self.get_persisted_record(message_id))
-    }
-
-    /// Queries the persistent SQLite `kernel_ledger` table for `message_id`.
-    /// Returns `Some(DeliveryRecord)` only for `Durable` deliveries.
-    pub fn get_persisted_record(&self, message_id: &str) -> Option<DeliveryRecord> {
-        let conn_mutex = self.db_conn.as_ref()?;
-        let conn = conn_mutex.lock();
-        conn.query_row(
-            &format!(
-                "SELECT message_id, logical_id, seq, source_domain, target, message_type, status, data, created_at, updated_at
-                 FROM {KERNEL_LEDGER_TABLE}
-                 WHERE message_id = ?1"
-            ),
-            params![message_id],
-            Self::row_to_record,
-        )
-        .optional()
-        .ok()
-        .flatten()
-    }
-
-    /// Returns the number of persisted delivery records in the SQLite `kernel_ledger` table.
-    pub fn persisted_count(&self) -> usize {
-        let Some(ref conn_mutex) = self.db_conn else {
-            return 0;
-        };
-        let conn = conn_mutex.lock();
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM {KERNEL_LEDGER_TABLE}"),
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map(|n| n as usize)
-        .unwrap_or(0)
-    }
-
-    /// Marks all non-terminal deliveries targeting `crashed_domain` as `ExecutionFailed`.
-    /// Returns a list of `(source_domain, MessageReceipt)` to notify waiting senders.
-    pub fn fail_inflight_for_domain(
-        &self,
-        crashed_domain: &str,
-        reason: &str,
-    ) -> Vec<(String, MessageReceipt)> {
-        let mut notifications = Vec::new();
-        let mut ephemeral_removals = Vec::new();
-        let now = now_millis();
-        let mut deliveries = self.deliveries.write();
-
-        for record in deliveries.values_mut() {
-            if !record.status.is_terminal()
-                && let Some((target_domain, _)) = parse_target_address(&record.target)
-                && target_domain == crashed_domain
-            {
-                let previous_record = record.clone();
-                record.status = ContractStatus::ExecutionFailed;
-                record.data = Some(json!({
-                    "error": "target_domain_faulted",
-                    "domain": crashed_domain,
-                    "reason": reason,
-                }));
-                record.updated_at = now;
-                match DeliveryPolicy::resolve(&record.target, &record.message_type) {
-                    DeliveryPolicy::Durable => {
-                        if let Err(error) = self.persist_record(record) {
-                            *record = Self::persistence_failure(&previous_record, error);
-                        }
-                    }
-                    DeliveryPolicy::Ephemeral => ephemeral_removals.push(record.clone()),
-                    DeliveryPolicy::Volatile => {}
-                }
-                notifications.push((record.source_domain.clone(), record.to_receipt()));
-            }
-        }
-
-        for record in &ephemeral_removals {
-            deliveries.remove(&record.message_id);
-        }
-        drop(deliveries);
-
-        for record in ephemeral_removals {
-            self.retire_ephemeral_identity(&record);
-        }
-
         notifications
     }
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod restoration_tests {
     use super::*;
 

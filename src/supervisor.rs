@@ -295,13 +295,69 @@ fn cancel_worker(handle: &thread::JoinHandle<()>) {
         CancelSynchronousIo(handle.as_raw_handle());
     }
 }
+// IPC reads must be interruptible on every supported OS. Unlike diagnostic readers,
+// this endpoint drains bytes already in the pipe before transport failure is published.
+#[cfg(not(windows))]
+fn ipc_reader(input: std::io::PipeReader) -> impl std::io::Read {
+    input
+}
+#[cfg(windows)]
+fn ipc_reader(input: std::io::PipeReader) -> impl std::io::Read {
+    struct Reader(std::io::PipeReader);
+    impl std::io::Read for Reader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            use std::os::windows::io::AsRawHandle;
+            #[link(name = "kernel32")]
+            unsafe extern "system" {
+                fn PeekNamedPipe(
+                    handle: *mut std::ffi::c_void,
+                    buffer: *mut std::ffi::c_void,
+                    size: u32,
+                    read: *mut u32,
+                    available: *mut u32,
+                    left: *mut u32,
+                ) -> i32;
+            }
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let mut available = 0;
+            let ok = unsafe {
+                PeekNamedPipe(
+                    self.0.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = std::io::Error::last_os_error();
+                return if matches!(error.raw_os_error(), Some(109 | 232)) {
+                    Ok(0)
+                } else {
+                    Err(error)
+                };
+            }
+            if available == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = buf.len().min(available as usize);
+            self.0.read(&mut buf[..count])
+        }
+    }
+    Reader(input)
+}
 fn pump_lines<R: std::io::Read>(
     mut input: R,
     stop: &AtomicBool,
+    drain: Option<&AtomicBool>,
     mut line: impl FnMut(&str),
 ) -> std::io::Result<()> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut drained = 0usize;
     while !stop.load(Ordering::Acquire) {
         match input.read(&mut chunk) {
             Ok(0) => {
@@ -313,6 +369,12 @@ fn pump_lines<R: std::io::Read>(
                 return Ok(());
             }
             Ok(n) => {
+                if drain.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    drained += n;
+                    if drained > MAX_IPC_FRAME {
+                        return Err(std::io::Error::other("IPC failure drain exceeds limit"));
+                    }
+                }
                 for part in chunk[..n].split_inclusive(|b| *b == b'\n') {
                     if bytes.len() + part.len() > MAX_IPC_FRAME {
                         return Err(std::io::Error::new(
@@ -330,6 +392,11 @@ fn pump_lines<R: std::io::Read>(
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if drain.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return Err(std::io::Error::other(
+                        "domain transport ended after draining buffered frames",
+                    ));
+                }
                 thread::sleep(Duration::from_millis(5))
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -382,24 +449,26 @@ struct ManagedProcess {
     pid: u32,
     child: Option<Child>,
     stop: Arc<AtomicBool>,
+    drain: Arc<AtomicBool>,
     output: crate::outbox::PipeSender,
     workers: Vec<thread::JoinHandle<()>>,
 }
 impl ManagedProcess {
     fn exited(&mut self) -> bool {
-        // IPC worker panic or early return is also a failed process connection.
-        if self
-            .workers
-            .iter()
-            .take(2)
-            .any(|worker| worker.is_finished())
+        // Process exit and writer failure are not proof that the receive pipe is empty.
+        // Let its sole reader consume buffered frames before revoking this generation.
+        if self.workers.first().is_some_and(|w| w.is_finished())
+            || self.output.failure().is_some()
+            || self
+                .child
+                .as_mut()
+                .is_none_or(|c| c.try_wait().map_or(true, |s| s.is_some()))
         {
-            return true;
+            self.drain.store(true, Ordering::Release);
         }
-        self.child
-            .as_mut()
-            .is_none_or(|c| c.try_wait().map_or(true, |s| s.is_some()))
+        self.workers.get(1).is_some_and(|w| w.is_finished())
     }
+
     fn terminate(&mut self) {
         self.stop.store(true, Ordering::Release);
         self.output.close();
@@ -631,6 +700,7 @@ impl DomainSupervisorInner {
             pid,
             child: Some(child),
             stop: Arc::new(AtomicBool::new(false)),
+            drain: Arc::new(AtomicBool::new(false)),
             output: sender,
             workers: Vec::new(),
         };
@@ -646,9 +716,8 @@ impl DomainSupervisorInner {
                     nonblocking(io)?;
                 }
             }
-            let weak = Arc::downgrade(&self.router);
             let stop = process.stop.clone();
-            let domain = id.clone();
+            let drain = process.drain.clone();
             process.workers.push(
                 thread::Builder::new()
                     .name(format!("kernel-tx-{id}-{generation}"))
@@ -667,24 +736,19 @@ impl DomainSupervisorInner {
                             }
                         }
                         if !stop.load(Ordering::Acquire) {
-                            if let Some(router) = weak.upgrade() {
-                                router.mark_domain_faulted_for_instance(
-                                    &domain,
-                                    Some(generation),
-                                    "domain writer failed",
-                                );
-                            }
+                            drain.store(true, Ordering::Release);
                         }
                     })?,
             );
             let weak = Arc::downgrade(&self.router);
             let stop = process.stop.clone();
             let domain = id.clone();
+            let drain = process.drain.clone();
             process.workers.push(
                 thread::Builder::new()
                     .name(format!("kernel-rx-{id}-{generation}"))
                     .spawn(move || {
-                        let result = pump_lines(rx, &stop, |line| {
+                        let result = pump_lines(ipc_reader(rx), &stop, Some(&drain), |line| {
                             if let Some(router) = weak.upgrade() {
                                 router.handle_raw_pipe_line_for_instance(&domain, generation, line);
                             }
@@ -718,7 +782,7 @@ impl DomainSupervisorInner {
                         thread::Builder::new()
                             .name(format!("kernel-{label}-{id}-{generation}"))
                             .spawn(move || {
-                                let result = pump_lines(input, &stop, |text| {
+                                let result = pump_lines(input, &stop, None, |text| {
                                     if let Some(router) = weak.upgrade() {
                                         router.logger().reinject(LogRecord {
                                             source_domain: Some(domain.clone()),
@@ -770,8 +834,25 @@ impl DomainSupervisorInner {
     }
     fn monitor(&self) {
         for (id, generation, reason) in self.router.failed_output_queues() {
-            self.router
-                .mark_domain_faulted_for_instance(&id, Some(generation), &reason);
+            // A managed receiver owns the drain-before-fault boundary. In-process domains
+            // have no reader worker, so their output failures still converge here directly.
+            let managed = self.control(&id).is_some_and(|control| {
+                // Launch/update owns workers before installing them in DomainState.
+                // Do not race that owner while its lifecycle operation is in progress.
+                let Some(_operation) = control.operation.try_lock() else {
+                    return true;
+                };
+                control
+                    .state
+                    .lock()
+                    .process
+                    .as_ref()
+                    .is_some_and(|p| p.instance_id == generation)
+            });
+            if !managed {
+                self.router
+                    .mark_domain_faulted_for_instance(&id, Some(generation), &reason);
+            }
         }
         let domains: Vec<_> = self
             .domains
@@ -1020,6 +1101,7 @@ impl DomainSupervisor {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline
             && !candidate.exited()
+            && !candidate.drain.load(Ordering::Acquire)
             && !self.inner.shutdown.load(Ordering::Acquire)
         {
             if self.inner.router.is_candidate_ready(id, generation) {
@@ -1028,6 +1110,7 @@ impl DomainSupervisor {
             thread::sleep(Duration::from_millis(10));
         }
         if candidate.exited()
+            || candidate.drain.load(Ordering::Acquire)
             || !self.inner.router.is_candidate_ready(id, generation)
             || !self.inner.router.commit_candidate(id, generation)
         {
@@ -1317,5 +1400,83 @@ mod domain_resource_acceptance {
                 .is_ok()
         );
         assert_eq!(k.supervisor().list_specs().len(), 1024);
+    }
+}
+
+#[cfg(test)]
+mod exit_drain_regression {
+    use super::*;
+    #[test]
+    fn exited_child_must_not_cancel_its_buffered_receipts() {
+        let k = crate::AtelierKernel::new_in_memory().unwrap();
+        let mut child = Command::new(if cfg!(windows) { "python" } else { "python3" })
+            .args(["-c", "print('received\\nstarted\\ncompleted')"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let input = child.stdout.take().unwrap();
+        let pid = child.id();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release, paused) = mpsc::channel();
+        let (lines, records) = mpsc::channel();
+        let flag = stop.clone();
+        let rx = thread::spawn(move || {
+            paused.recv().unwrap();
+            pump_lines(input, &flag, None, |line| {
+                lines.send(line.trim().to_owned()).unwrap();
+            })
+            .unwrap();
+        });
+        child.wait().unwrap(); // OS exit is certain, while all receipts remain unread.
+        let (output, _inbox) = outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
+        let mut process = ManagedProcess {
+            instance_id: 1,
+            pid,
+            child: Some(child),
+            stop,
+            drain: Arc::new(AtomicBool::new(false)),
+            output,
+            workers: vec![thread::spawn(|| {}), rx],
+        };
+        let premature = process.exited();
+        release.send(()).unwrap(); // Always release before assertion, including on the old code.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !process.workers[1].is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !premature,
+            "OS exit or a finished writer must not cancel unread inbound frames"
+        );
+        assert_eq!(
+            records.try_iter().collect::<Vec<_>>(),
+            ["received", "started", "completed"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_transport_drain_test {
+    use super::*;
+    #[test]
+    fn failed_transport_drains_available_frames_without_waiting_for_inherited_writer() {
+        use std::io::Write;
+        let (input, mut inherited_writer) = std::io::pipe().unwrap();
+        #[cfg(unix)]
+        nonblocking(&input).unwrap();
+        inherited_writer
+            .write_all(b"received\nstarted\ncompleted\n")
+            .unwrap();
+        let mut lines = Vec::new();
+        let result = pump_lines(
+            ipc_reader(input),
+            &AtomicBool::new(false),
+            Some(&AtomicBool::new(true)),
+            |line| lines.push(line.trim().to_owned()),
+        );
+        assert!(result.is_err());
+        assert_eq!(lines, ["received", "started", "completed"]);
+        // The writer is intentionally still alive: no timeout or EOF was needed to finish.
+        drop(inherited_writer);
     }
 }

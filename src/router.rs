@@ -288,6 +288,9 @@ impl KernelRouter {
                                         data: data.clone(),
                                     };
                                     let frame = KernelToDomainFrame::Deliver(msg);
+                                    // Enqueue failures close this generation's outbox and retain its failure reason.
+                                    // The supervisor converges it outside publication/domain locks; do not fault
+                                    // synchronously here (that would recursively publish under the same locks).
                                     let _ = tx.send(frame);
                                 }
                             }
@@ -2556,6 +2559,9 @@ impl KernelRouter {
                 .and_then(|e| e.pipe_tx.clone()),
         };
         if let Some(tx) = pipe {
+            // Enqueue failures close this generation's outbox and retain its failure reason.
+            // The supervisor converges it outside publication/domain locks; do not fault
+            // synchronously here (that would recursively publish under the same locks).
             let _ = tx.send(frame);
         }
     }
@@ -2570,6 +2576,9 @@ impl KernelRouter {
         };
         self.send_to_instance(domain_id, origin, frame);
         if let Some(receipt) = terminal {
+            // Publication retires live routing identity, not the committed Durable result.
+            // Failed persistence keeps its live failure identity while the source is alive.
+            // A failed/missing old pipe must never turn into mail for a new generation.
             self.ledger.finish_publication(&receipt);
         }
     }
@@ -2753,5 +2762,122 @@ mod generation_acceptance_tests {
             Some(DomainStatus::Active)
         );
         assert_eq!(k.router().active_routes(), vec!["worker.old"]);
+    }
+}
+
+#[cfg(test)]
+mod receipt_publication_failure_tests {
+    use super::*;
+    #[test]
+    fn failed_terminal_send_keeps_durable_results_by_both_ids_after_restart() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tmp/core-reliability");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("receipt-publication-{}.db", uuid::Uuid::new_v4()));
+        let mut saved = Vec::new();
+        {
+            let k = crate::AtelierKernel::open_with_db(&path).unwrap();
+            let sender = k.attach_domain("sender");
+            let worker = k.attach_domain("worker");
+            worker.register_handlers(&["run"]);
+            worker.drain_frames();
+            for (seq, status) in [
+                (71, ContractStatus::Completed),
+                (72, ContractStatus::ExecutionFailed),
+            ] {
+                let id = sender.send_with_seq(
+                    seq,
+                    vec!["worker.run".into()],
+                    "Durable",
+                    json!({}),
+                    json!({}),
+                )[0]
+                .clone();
+                worker.drain_frames();
+                sender.drain_frames();
+                // Use an obsolete generation with no pipe, without killing the live source session.
+                // This deterministically fails send_to_instance, including before the monitor runs.
+                k.ledger().bind_origin(&[id.clone()], u64::MAX / 2);
+                let logical = k.ledger().logical_id_for_message(&id);
+                let data = json!({"result":"must survive failed receipt publication", "seq":seq});
+                worker.report_receipt(&id, "worker.run", status, Some(data.clone()));
+                assert!(sender.drain_frames().is_empty());
+                assert!(
+                    k.ledger().source_instance(&id).is_none(),
+                    "terminal identity should be reclaimed"
+                );
+                let record = k.ledger().get_persisted_record(&id).unwrap();
+                assert_eq!(record.status, status);
+                assert_eq!(record.data, Some(data.clone()));
+                let by_logical = k.ledger().receipts_for_logical(&logical);
+                assert_eq!(by_logical.len(), 1);
+                assert_eq!(by_logical[0].message_id, id);
+                assert_eq!(by_logical[0].data, Some(data.clone()));
+                // Explicit same-session replay is allowed; it must not execute work again.
+                assert_eq!(
+                    sender.send_with_seq(
+                        seq,
+                        vec!["worker.run".into()],
+                        "Durable",
+                        json!({}),
+                        json!({})
+                    ),
+                    [id.clone()]
+                );
+                assert!(worker.drain_frames().is_empty());
+                assert!(sender.drain_frames().iter().any(|f| matches!(f, KernelToDomainFrame::Receipt(r) if r.message_id==id && r.status==status)));
+                saved.push((id, logical, status, data));
+            }
+            let replacement = k.attach_domain("sender");
+            assert!(
+                replacement.drain_frames().is_empty(),
+                "old results are not unsolicited mail to a new process"
+            );
+        }
+        let k = crate::AtelierKernel::open_with_db(&path).unwrap();
+        for (id, logical, status, data) in saved {
+            assert_eq!(k.ledger().logical_id_for_message(&id), logical);
+            let by_id = k.ledger().receipts_for_message(&id);
+            let by_logical = k.ledger().receipts_for_logical(&logical);
+            assert_eq!(by_id.len(), 1);
+            assert_eq!(by_logical.len(), 1);
+            for r in [by_id[0].clone(), by_logical[0].clone()] {
+                assert_eq!(r.message_id, id);
+                assert_eq!(r.status, status);
+                assert_eq!(r.data, Some(data.clone()));
+            }
+        }
+    }
+    #[test]
+    fn failed_unpersisted_terminal_send_retains_live_failure_identity() {
+        let k = crate::AtelierKernel::new_in_memory().unwrap();
+        let sender = k.attach_domain("sender");
+        let worker = k.attach_domain("worker");
+        worker.register_handlers(&["run"]);
+        worker.drain_frames();
+        let id = sender.send_one(vec!["worker.run".into()], "Durable", json!({}), json!({}));
+        worker.drain_frames();
+        sender.drain_frames();
+        k.ledger().bind_origin(&[id.clone()], u64::MAX / 2);
+        k.ledger().db_conn.as_ref().unwrap().lock().execute_batch(
+            "CREATE TRIGGER reject_terminal BEFORE UPDATE ON kernel_ledger BEGIN SELECT RAISE(FAIL,'injected terminal write failure'); END;"
+        ).unwrap();
+        worker.report_receipt(
+            &id,
+            "worker.run",
+            ContractStatus::Completed,
+            Some(json!({"not_committed":true})),
+        );
+        assert!(sender.drain_frames().is_empty());
+        assert!(
+            k.ledger().source_instance(&id).is_some(),
+            "unpersisted failure needs live identity for replay"
+        );
+        let receipt = k.ledger().receipts_for_message(&id).pop().unwrap();
+        assert_eq!(receipt.status, ContractStatus::ExecutionFailed);
+        assert_eq!(receipt.data.unwrap()["persisted"], false);
+        assert_eq!(
+            k.ledger().get_persisted_record(&id).unwrap().status,
+            ContractStatus::Sent
+        );
     }
 }

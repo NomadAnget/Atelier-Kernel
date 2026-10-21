@@ -74,3 +74,12 @@
 提交 `facf653` 的 GitHub Actions 暴露了本机 WSL 验收未覆盖的两处遗漏：Windows 线程句柄 trait 导入错误，以及并发更新测试先观察到空 PID 文件的发布竞态。已改用 `AsRawHandle`；夹具先完整关闭临时 PID 文件再原子发布，候选退出通过测试握手控制，保留全局查询延迟和双进程回收断言。
 
 修正后，本机 Windows GNU 目标所有 target 的 `cargo check --locked`、Linux 全量 79 个 Rust 测试及该并发用例连续 10 次复验通过。云端各平台运行结果以修正提交对应 Actions 为准，不把交叉编译当作 Windows 原生运行验证。证据：`tmp/core-final-acceptance/ci-fix-windows-check.log`、`ci-fix-rust.log`、`ci-fix-repeats/`。
+
+## 子进程退出回执与终态发送失败复核（2026-10-21）
+
+- macOS CI 暴露的真实竞态已用确定性夹具复现：OS 子进程退出并不代表接收线程已读完其管道。原 `ManagedProcess::exited` 提前触发故障清理会打断最后的 Received/Started/Completed。
+- 修复后接收线程拥有故障前的输入排空边界；OS 退出、发送线程失败或出口故障只请求排空，接收处理结束后才撤销该代际。主动停止/重启仍立即取消。排空遇 EOF/当前无数据即结束，并有内部 16 MiB 总量限制，避免继承写端或持续坏输入无限占用；Windows IPC 使用 PeekNamedPipe 实现同一可中断读取行为。
+- 截图“发现 B”补测结论：未证实持久终态因 `finish_publication()` 丢失。成功及失败终态均先提交账本；即使原代际不存在而无法投递回执，清理后的 `message_id`、`logical_id` 仍可通过现有 Rust 账本方法读出完整终态，重新打开内核后仍成立。同一源会话的显式重复提交可重放终态，不能重复执行目标。
+- 注入终态持久化失败并同时使回执不可达：保留存活会话的失败身份，返回状态为 ExecutionFailed/persisted=false，不伪装为成功或持久终态。
+- 边界：上述查询验证针对 Rust KernelLedger 现有 API；现有跨进程 SDK 没有按旧 ID 查询账本/重启后自动取回旧回执的协议。新源进程不接收旧代际的主动补发；观察历史查询也不是完整持久结果接口。这里没有新增查询、重连或业务补偿接口。
+- 证据：`tmp/core-final-acceptance/exit-drain-before.log`（修复前确定性失败）、`exit-drain-all.log`、`exit-drain-windows-check.log`、`receipt-publication-check.log`。

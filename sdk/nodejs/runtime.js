@@ -260,8 +260,19 @@ function enhance(Base,RequestError,ExecutionFailed) {
     }
     _dispatchSystemObserver(frame){
       const event=frame.data||{};
+      const busy=this._observationBusy||(this._observationBusy=new Set());
       for(const callback of (this._observationListeners||[])){
-        this._invokeEventListener(callback,event);
+        if(busy.has(callback))continue;
+        try{
+          const result=callback(event);
+          if(result&&typeof result.then==='function'){
+            busy.add(callback);
+            const task=Promise.resolve(result);
+            this._callbacks.add(task);
+            task.catch(error=>this._diagnostic(`SDK observation listener error: ${error}`))
+              .finally(()=>{busy.delete(callback);this._callbacks.delete(task);});
+          }
+        }catch(error){this._diagnostic(`SDK observation listener error: ${error}`);}
       }
     }
     _invokeEventListener(callback,payload){

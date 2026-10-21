@@ -5,7 +5,7 @@ Official zero-dependency Python SDK for building **Atelier Kernel** domains.
 ## Installation
 
 ```bash
-pip install atelier_sdk-0.1.8-py3-none-any.whl
+pip install atelier_sdk-0.1.9-py3-none-any.whl
 ```
 
 ---
@@ -193,6 +193,10 @@ For each facility below, both the **Sending / Invocations (How to Send)** and th
 ---
 
 ### 7. Message Lifecycle Observation (`domain.observer` & `@domain.on_observation`)
+
+观察事件为允许丢失的瞬态流，不提供完整投递、持久化或跨重启重放保证。内核内部隔离慢订阅者并回收资源；SDK 对每个尚未完成的异步观察回调跳过后续观察事件，避免积压任务，完成后自动继续接收。其他回调与业务消息无需等待该回调。调用方式不变，无队列/背压管理参数；历史查询只能补查仍保留的窗口，不保证补齐缺口。Python/Node.js 行为一致。同步回调应及时返回，SDK 不会强行中断用户函数。
+
+Durable 持久化故障通过现有 ExecutionFailed/SDK 标准异常反馈，业务域无需检查 SQLite 或管理补写；生命周期控制与账本恢复的内部故障由内核处理。
 
 - **发送 / 快照检索与订阅控制 (How to Send / Query & Control)**:
   ```python

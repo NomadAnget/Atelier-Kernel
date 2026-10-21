@@ -13,6 +13,8 @@ use crate::protocol::{
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("corrupt kernel ledger record '{0}': invalid JSON payload")]
+    CorruptLedgerRecord(String),
     #[error("invalid domain identifier for table creation: {0}")]
     InvalidDomainName(String),
     #[error("sqlite error: {0}")]

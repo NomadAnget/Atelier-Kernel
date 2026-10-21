@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +26,18 @@ use crate::protocol::{
     now_millis, parse_target_address,
 };
 use crate::storage::DomainStorageEngine;
+
+struct ControlPermit {
+    count: Arc<AtomicUsize>,
+    origins: Arc<Mutex<HashMap<String, u64>>>,
+    message_id: String,
+}
+impl Drop for ControlPermit {
+    fn drop(&mut self) {
+        self.origins.lock().remove(&self.message_id);
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Filter options registered by a domain subscribing to kernel log events.
 #[derive(Debug, Clone)]
@@ -143,6 +155,7 @@ pub struct KernelRouter {
     notify_subscribers: Arc<RwLock<HashSet<String>>>,
     /// Active domain subscriptions for kernel observation events.
     observer_subscribers: Arc<RwLock<HashSet<String>>>,
+    observer_pending: Arc<Mutex<HashMap<String, (u64, usize)>>>,
     /// Shutdown signal for the background log fanout thread.
     stop_log_pump: Arc<AtomicBool>,
     /// Handle to the background log fanout worker thread.
@@ -151,6 +164,8 @@ pub struct KernelRouter {
     observer_pump_handle: Mutex<Option<thread::JoinHandle<()>>>,
     /// Optional back-reference to domain supervisor for runtime queries and domain control.
     supervisor: RwLock<Option<Weak<crate::supervisor::DomainSupervisor>>>,
+    control_inflight: Arc<AtomicUsize>,
+    control_origins: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl KernelRouter {
@@ -164,7 +179,8 @@ impl KernelRouter {
         let log_subscribers = Arc::new(RwLock::new(HashMap::<String, LogSubscriptionFilter>::new()));
         let telemetry_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let notify_subscribers = Arc::new(RwLock::new(HashSet::new()));
-        let observer_subscribers = Arc::new(RwLock::new(HashSet::new()));
+        let observer_subscribers = Arc::new(RwLock::new(HashSet::<String>::new()));
+        let observer_pending = Arc::new(Mutex::new(HashMap::<String, (u64, usize)>::new()));
         let stop_log_pump = Arc::new(AtomicBool::new(false));
 
         let rx = logger.subscribe();
@@ -228,6 +244,7 @@ impl KernelRouter {
         let obs_subs_worker = Arc::clone(&observer_subscribers);
         let obs_domains_worker = Arc::clone(&domains);
         let obs_stop_flag = Arc::clone(&stop_log_pump);
+        let obs_pending = Arc::clone(&observer_pending);
 
         let observer_pump_handle = thread::Builder::new()
             .name("kernel-observer-fanout".to_string())
@@ -259,7 +276,15 @@ impl KernelRouter {
                                                 timestamp: event.timestamp,
                                                 data: data.clone(),
                                             };
-                                            let _ = tx.send(KernelToDomainFrame::Deliver(msg));
+                                            let frame = KernelToDomainFrame::Deliver(msg);
+                                            let size = Self::observation_frame_size(&frame);
+                                            let mut pending = obs_pending.lock();
+                                            let budget = pending.entry(domain_id.clone()).or_insert((entry.instance_id, 0));
+                                            if budget.0 != entry.instance_id { *budget = (entry.instance_id, 0); }
+                                            if size > 0 && size <= 262_144 && budget.1 <= 262_144 - size {
+                                                budget.1 += size;
+                                                if tx.send(frame).is_err() { budget.1 -= size; }
+                                            }
                                         }
                                     }
                                 }
@@ -287,15 +312,34 @@ impl KernelRouter {
             telemetry_subscribers,
             notify_subscribers,
             observer_subscribers,
+            observer_pending,
             stop_log_pump,
             log_pump_handle: Mutex::new(pump_handle),
             observer_pump_handle: Mutex::new(observer_pump_handle),
             supervisor: RwLock::new(None),
+            control_inflight: Arc::new(AtomicUsize::new(0)),
+            control_origins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn set_supervisor(&self, supervisor: Weak<crate::supervisor::DomainSupervisor>) {
         *self.supervisor.write() = Some(supervisor);
+    }
+
+    fn observation_frame_size(frame: &KernelToDomainFrame) -> usize {
+        match frame {
+            KernelToDomainFrame::Deliver(msg) if msg.message_type == MSG_SYSTEM_OBSERVER_EVENT =>
+                serde_json::to_vec(frame).map_or(0, |value| value.len()),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn observation_frame_consumed(&self, domain: &str, instance: u64, frame: &KernelToDomainFrame) {
+        let size = Self::observation_frame_size(frame);
+        if size == 0 { return; }
+        if let Some((generation, pending)) = self.observer_pending.lock().get_mut(domain) {
+            if *generation == instance { *pending = pending.saturating_sub(size); }
+        }
     }
 
     pub fn supervisor(&self) -> Option<Arc<crate::supervisor::DomainSupervisor>> {
@@ -402,6 +446,7 @@ impl KernelRouter {
         self.telemetry_subscribers.write().remove(domain_id);
         self.notify_subscribers.write().remove(domain_id);
         self.observer_subscribers.write().remove(domain_id);
+        self.observer_pending.lock().remove(domain_id);
 
         instance_id
     }
@@ -809,8 +854,8 @@ impl KernelRouter {
                     &logical_id,
                     outbound.seq,
                     &outbound.message_type,
-                    ContractStatus::ContractInvalid,
-                    data,
+                    record.status,
+                    record.data.clone(),
                 );
                 self.send_to_domain_pipe(
                     authenticated_domain,
@@ -827,7 +872,38 @@ impl KernelRouter {
             } else if target == KERNEL_OBSERVER_TARGET {
                 self.dispatch_kernel_observer(authenticated_domain, outbound.seq, &kernel_msg);
             } else if target == KERNEL_SUPERVISOR_TARGET {
-                self.dispatch_kernel_supervisor(authenticated_domain, outbound.seq, &kernel_msg);
+                // The request has been authenticated and its identities allocated under
+                // the source gate. Lifecycle work may replace that very source domain;
+                // execute it outside the gate, without weakening pipe identity checks.
+                if let Some(supervisor) = self.supervisor() {
+                    if self.control_inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+                        |count| (count < 32).then_some(count + 1)).is_err() {
+                        if self.emit_kernel_internal_stages(authenticated_domain, outbound.seq, &kernel_msg) {
+                            self.complete_kernel_internal_target(authenticated_domain, &kernel_msg, ContractStatus::ExecutionFailed,
+                                Some(json!({"error":"supervisor_busy","reason":"Lifecycle control capacity reached"})));
+                        }
+                        continue;
+                    }
+                    let generation = self.domain_instance_id(authenticated_domain).unwrap_or(0);
+                    self.control_origins.lock().insert(message_id.clone(), generation);
+                    let permit = ControlPermit { count: Arc::clone(&self.control_inflight),
+                        origins: Arc::clone(&self.control_origins), message_id: message_id.clone() };
+                    let router = Arc::clone(supervisor.router());
+                    let source = authenticated_domain.to_string();
+                    let seq = outbound.seq;
+                    let request = kernel_msg.clone();
+                    if let Err(error) = thread::Builder::new().name("kernel-lifecycle-control".into()).spawn(move || {
+                        let _permit = permit;
+                        router.dispatch_kernel_supervisor(&source, seq, &request);
+                    }) {
+                        if self.emit_kernel_internal_stages(authenticated_domain, seq, &kernel_msg) {
+                            self.complete_kernel_internal_target(authenticated_domain, &kernel_msg, ContractStatus::ExecutionFailed,
+                                Some(json!({"error":"supervisor_worker_failed","reason":error.to_string()})));
+                        }
+                    }
+                } else {
+                    self.dispatch_kernel_supervisor(authenticated_domain, outbound.seq, &kernel_msg);
+                }
             } else if target == KERNEL_TELEMETRY_TARGET
                 || target == "web_ui.metric_tick"
                 || (target.starts_with("web_ui")
@@ -852,7 +928,9 @@ impl KernelRouter {
     /// Dispatches a message targeting `kernel.registry` (`RegisterHandlers` / `UnregisterHandlers` / `QueryHandlers`).
     fn dispatch_kernel_registry(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         // Emit Stage 1 (Sent), Stage 2 (Received), Stage 3 (Started)
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match msg.message_type.as_str() {
             MSG_REGISTER_HANDLERS => {
@@ -1090,7 +1168,9 @@ impl KernelRouter {
     /// Dispatches a CRUD message targeting `kernel.storage` ("Storage as Messaging").
     fn dispatch_kernel_storage(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
         // Emit Stage 1 (Sent), Stage 2 (Received), Stage 3 (Started)
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match self.storage.execute_message(msg) {
             Ok(result_data) => {
@@ -1117,7 +1197,9 @@ impl KernelRouter {
 
     /// Dispatches a log or progress query message targeting `kernel.logger`.
     fn dispatch_kernel_logger(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_LOGS => {
@@ -1227,7 +1309,9 @@ impl KernelRouter {
 
     /// Dispatches a high-frequency metric/telemetry stream targeting `kernel.telemetry`.
     fn dispatch_kernel_telemetry(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_TELEMETRY => {
@@ -1309,7 +1393,9 @@ impl KernelRouter {
 
     /// Dispatches an asynchronous system notification or alert targeting `kernel.notify`.
     fn dispatch_kernel_notify(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_NOTIFY => {
@@ -1405,7 +1491,9 @@ impl KernelRouter {
 
     /// Dispatches a domain assembly query message targeting `kernel.runtime`.
     fn dispatch_kernel_runtime(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match msg.message_type.as_str() {
             MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY | _ => {}
@@ -1492,7 +1580,9 @@ impl KernelRouter {
 
     /// Dispatches a message lifecycle observation message targeting `kernel.observer`.
     fn dispatch_kernel_observer(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_OBSERVER => {
@@ -1564,7 +1654,9 @@ impl KernelRouter {
 
     /// Dispatches a process lifecycle management message targeting `kernel.supervisor`.
     fn dispatch_kernel_supervisor(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
-        self.emit_kernel_internal_stages(source_domain, seq, msg);
+        if !self.emit_kernel_internal_stages(source_domain, seq, msg) {
+            return;
+        }
 
         let sup = match self.supervisor() {
             Some(s) => s,
@@ -1791,7 +1883,7 @@ impl KernelRouter {
     }
 
     /// Emits `Sent -> Received -> Started` receipts for kernel built-in targets (`kernel.registry`, `kernel.storage`, `kernel.logger`, etc.).
-    fn emit_kernel_internal_stages(&self, source_domain: &str, seq: u64, msg: &KernelMessage) {
+    fn emit_kernel_internal_stages(&self, source_domain: &str, seq: u64, msg: &KernelMessage) -> bool {
         let (sent_rec, created) = self.ledger.record_initial_target_state(
             &msg.message_id,
             seq,
@@ -1802,7 +1894,8 @@ impl KernelRouter {
             None,
         );
         if !created {
-            return;
+            self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(sent_rec.to_receipt()));
+            return false;
         }
         self.observer.emit(
             source_domain,
@@ -1831,12 +1924,17 @@ impl KernelRouter {
                     &msg.logical_id,
                     seq,
                     &msg.message_type,
-                    stage,
-                    None,
+                    receipt.status,
+                    receipt.data.clone(),
                 );
+                let succeeded = receipt.status == stage;
                 self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(receipt));
+                if !succeeded {
+                    return false;
+                }
             }
         }
+        true
     }
 
     fn complete_kernel_internal_target(
@@ -1875,8 +1973,8 @@ impl KernelRouter {
                 &msg.logical_id,
                 receipt.seq,
                 &msg.message_type,
-                final_status,
-                observed_data,
+                receipt.status,
+                if receipt.status == final_status && receipt.data.as_ref().and_then(|v| v.get("error")).and_then(Value::as_str) != Some("kernel_persistence_failed") { observed_data } else { receipt.data.clone() },
             );
             self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(receipt));
         }
@@ -1918,7 +2016,7 @@ impl KernelRouter {
                 ContractStatus::TargetInvalid,
                 err_data.clone(),
             );
-            if created {
+            if created || rec.status == ContractStatus::ExecutionFailed {
                 self.observer.emit(
                     source_domain,
                     &target,
@@ -1926,8 +2024,8 @@ impl KernelRouter {
                     &msg.logical_id,
                     seq,
                     &msg.message_type,
-                    ContractStatus::TargetInvalid,
-                    err_data,
+                    rec.status,
+                    rec.data.clone(),
                 );
                 self.send_to_domain_pipe(
                     source_domain,
@@ -1948,6 +2046,7 @@ impl KernelRouter {
             None,
         );
         if !created {
+            self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(sent_rec.to_receipt()));
             return;
         }
 
@@ -2067,6 +2166,7 @@ impl KernelRouter {
         self.observer_subscribers.write().remove(domain_id);
 
         let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
+        self.observer_pending.lock().remove(domain_id);
         for (source_domain, receipt) in failed_deliveries {
             self.observer.emit(
                 &source_domain,
@@ -2084,11 +2184,18 @@ impl KernelRouter {
     }
 
     fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {
+        let expected_generation = match &frame {
+            KernelToDomainFrame::Receipt(receipt) => self.control_origins.lock().get(&receipt.message_id).copied(),
+            _ => None,
+        };
         let pipe_opt = self
             .domains
             .read()
             .get(domain_id)
-            .and_then(|d| d.pipe_tx.clone());
+            .and_then(|d| {
+                if expected_generation.is_some_and(|generation| generation != d.instance_id) { None }
+                else { d.pipe_tx.clone() }
+            });
         if let Some(tx) = pipe_opt {
             let _ = tx.send(frame);
         }
@@ -2104,5 +2211,29 @@ impl Drop for KernelRouter {
         if let Some(handle) = self.observer_pump_handle.lock().take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod control_generation_tests {
+    use super::*;
+
+    #[test]
+    fn old_control_completion_cannot_enter_replacement_pipe() {
+        let kernel = crate::AtelierKernel::new_in_memory().unwrap();
+        let old = kernel.attach_domain("controller");
+        kernel.router().control_origins.lock().insert("old-control".into(), old.instance_id());
+        let replacement = kernel.attach_domain("controller");
+        let receipt = MessageReceipt {
+            logical_id: "logical-old".into(), message_id: "old-control".into(), seq: 2,
+            target: KERNEL_SUPERVISOR_TARGET.into(), message_type: MSG_RESTART_DOMAIN.into(),
+            status: ContractStatus::Completed, data: Some(json!({"status":"restarted"})), timestamp: now_millis(),
+        };
+        kernel.router().send_to_domain_pipe("controller", KernelToDomainFrame::Receipt(receipt.clone()));
+        assert!(replacement.drain_frames().is_empty());
+        let mut current = receipt;
+        current.message_id = "current-control".into();
+        kernel.router().send_to_domain_pipe("controller", KernelToDomainFrame::Receipt(current));
+        assert_eq!(replacement.drain_frames().len(), 1);
     }
 }

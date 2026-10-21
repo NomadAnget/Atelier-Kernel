@@ -338,8 +338,27 @@ class AsyncRuntime(MessageClient):
 
     def _dispatch_system_observer(self, frame):
         event = frame.get('data') or {}
+        busy = getattr(self, '_observation_busy', None)
+        if busy is None:
+            busy = self._observation_busy = set()
         for listener in getattr(self, '_observation_listeners', []):
-            self._invoke_event_listener(listener, event)
+            key = id(listener)
+            if key in busy:
+                continue  # Lossy observation: never accumulate slow callback tasks.
+            try:
+                result = listener(event)
+                if inspect.isawaitable(result):
+                    busy.add(key)
+                    task = asyncio.ensure_future(result)
+                    self._callbacks.add(task)
+                    def finished(done, key=key):
+                        busy.discard(key)
+                        self._callbacks.discard(done)
+                        if not done.cancelled() and done.exception() is not None:
+                            self._diagnostic('SDK observation listener error: %s', done.exception())
+                    task.add_done_callback(finished)
+            except Exception as error:
+                self._diagnostic('SDK observation listener error: %s', error)
 
     def _invoke_event_listener(self, listener, payload):
         try:

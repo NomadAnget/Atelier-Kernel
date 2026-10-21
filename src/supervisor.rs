@@ -507,13 +507,16 @@ impl DomainSupervisorInner {
 
         // Writer thread: Kernel -> Domain dedicated pipe A (k2d_tx, JSON-Lines)
         let writer_domain = domain_id.clone();
+        let writer_router = Arc::clone(&self.router);
         thread::Builder::new()
             .name(format!("kernel-pipe-tx-{writer_domain}-{instance_id}"))
             .spawn(move || {
                 let mut pipe_tx = k2d_tx;
                 while let Ok(frame) = rx.recv() {
                     if let Ok(line) = serde_json::to_string(&frame) {
-                        if writeln!(pipe_tx, "{line}").is_err() || pipe_tx.flush().is_err() {
+                        let written = writeln!(pipe_tx, "{line}").and_then(|_| pipe_tx.flush());
+                        writer_router.observation_frame_consumed(&writer_domain, instance_id, &frame);
+                        if written.is_err() {
                             break;
                         }
                     }
@@ -1033,13 +1036,16 @@ impl DomainSupervisor {
 
         // Candidate writer thread
         let writer_domain = domain_id.to_string();
+        let writer_router = Arc::clone(&self.inner.router);
         thread::Builder::new()
             .name(format!("kernel-cand-tx-{writer_domain}-{candidate_instance_id}"))
             .spawn(move || {
                 let mut pipe_tx = k2d_tx;
                 while let Ok(frame) = cand_rx.recv() {
                     if let Ok(line) = serde_json::to_string(&frame) {
-                        if writeln!(pipe_tx, "{line}").is_err() || pipe_tx.flush().is_err() {
+                        let written = writeln!(pipe_tx, "{line}").and_then(|_| pipe_tx.flush());
+                        writer_router.observation_frame_consumed(&writer_domain, candidate_instance_id, &frame);
+                        if written.is_err() {
                             break;
                         }
                     }
@@ -1340,7 +1346,9 @@ impl DomainPipeClient {
 
     /// Receives the next frame (`Deliver(KernelMessage)` or `Receipt(MessageReceipt)`) from the Kernel pipe.
     pub fn recv_frame(&self) -> Result<KernelToDomainFrame, mpsc::RecvError> {
-        self.inbox.lock().recv()
+        let frame = self.inbox.lock().recv()?;
+        self.router.observation_frame_consumed(&self.domain_id, self.instance_id, &frame);
+        Ok(frame)
     }
 
     /// Receives the next frame with a timeout.
@@ -1348,7 +1356,9 @@ impl DomainPipeClient {
         &self,
         timeout: std::time::Duration,
     ) -> Result<KernelToDomainFrame, mpsc::RecvTimeoutError> {
-        self.inbox.lock().recv_timeout(timeout)
+        let frame = self.inbox.lock().recv_timeout(timeout)?;
+        self.router.observation_frame_consumed(&self.domain_id, self.instance_id, &frame);
+        Ok(frame)
     }
 
     /// Drains all currently queued frames from this domain's pipe without blocking.
@@ -1356,6 +1366,7 @@ impl DomainPipeClient {
         let mut out = Vec::new();
         let inbox = self.inbox.lock();
         while let Ok(frame) = inbox.try_recv() {
+            self.router.observation_frame_consumed(&self.domain_id, self.instance_id, &frame);
             out.push(frame);
         }
         out

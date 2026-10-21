@@ -142,6 +142,11 @@ impl KernelLedger {
              CREATE INDEX IF NOT EXISTS idx_{KERNEL_LEDGER_TABLE}_status ON {KERNEL_LEDGER_TABLE}(status);"
         ))?;
         verify_sqlite_table_columns(&conn, KERNEL_LEDGER_TABLE, KERNEL_LEDGER_COLUMNS)?;
+        // Validate even lazily restored terminal payloads without expanding them in memory.
+        let corrupt: Option<String> = conn.query_row(
+            &format!("SELECT message_id FROM {KERNEL_LEDGER_TABLE} WHERE data IS NOT NULL AND NOT json_valid(data) LIMIT 1"),
+            [], |row| row.get(0)).optional()?;
+        if let Some(id) = corrupt { return Err(StorageError::CorruptLedgerRecord(id)); }
 
         let mut deliveries_map = HashMap::new();
         let mut logical_map: HashMap<String, Vec<String>> = HashMap::new();
@@ -182,10 +187,12 @@ impl KernelLedger {
 
     fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
         let status_raw: String = row.get(6)?;
-        let status: ContractStatus =
-            serde_json::from_value(Value::String(status_raw)).unwrap_or(ContractStatus::Sent);
+        let status: ContractStatus = serde_json::from_value(Value::String(status_raw))
+            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error)))?;
         let data_raw: Option<String> = row.get(7)?;
-        let data = data_raw.and_then(|s| serde_json::from_str(&s).ok());
+        let data = data_raw.map(|s| serde_json::from_str(&s)
+            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))))
+            .transpose()?;
         Ok(DeliveryRecord {
             message_id: row.get(0)?,
             logical_id: row.get(1)?,
@@ -200,9 +207,9 @@ impl KernelLedger {
         })
     }
 
-    fn persist_record(&self, record: &DeliveryRecord) {
+    fn persist_record(&self, record: &DeliveryRecord) -> Result<(), StorageError> {
         let Some(ref conn_mutex) = self.db_conn else {
-            return;
+            return Ok(());
         };
         let status_str = serde_json::to_value(record.status)
             .ok()
@@ -213,7 +220,7 @@ impl KernelLedger {
             .as_ref()
             .and_then(|d| serde_json::to_string(d).ok());
         let conn = conn_mutex.lock();
-        let _ = conn.execute(
+        conn.execute(
             &format!(
                 "INSERT INTO {KERNEL_LEDGER_TABLE}
                  (message_id, logical_id, seq, source_domain, target, message_type, status, data, created_at, updated_at)
@@ -235,7 +242,17 @@ impl KernelLedger {
                 record.created_at,
                 record.updated_at,
             ],
-        );
+        )?;
+        Ok(())
+    }
+
+    fn persistence_failure(record: &DeliveryRecord, error: StorageError) -> DeliveryRecord {
+        let mut failed = record.clone();
+        failed.status = ContractStatus::ExecutionFailed;
+        failed.updated_at = now_millis();
+        failed.data = Some(json!({"error":"kernel_persistence_failed", "reason":error.to_string(),
+            "persisted":false, "previous_status":record.status}));
+        failed
     }
 
     /// Atomically allocates the logical identity and all ordered child IDs.
@@ -366,16 +383,21 @@ impl KernelLedger {
             updated_at: now,
         };
 
+        // Commit Durable ingress before making it visible to dispatch or replay.
+        if policy == DeliveryPolicy::Durable {
+            if let Err(error) = self.persist_record(&record) {
+                let failed = Self::persistence_failure(&record, error);
+                deliveries.insert(key, failed.clone());
+                return (failed, false);
+            }
+        }
+
         // Ephemeral messages that are already terminal on ingress (e.g. TargetInvalid / ContractInvalid)
         // do not stay in the in-memory ledger.
         if !(policy == DeliveryPolicy::Ephemeral && initial_status.is_terminal()) {
             deliveries.insert(key, record.clone());
         }
         drop(deliveries);
-
-        if policy == DeliveryPolicy::Durable {
-            self.persist_record(&record);
-        }
 
         if policy == DeliveryPolicy::Ephemeral && initial_status.is_terminal() {
             self.retire_ephemeral_identity(&record);
@@ -422,6 +444,7 @@ impl KernelLedger {
             return ReceiptTransition::DuplicateOrStale;
         }
 
+        let previous_record = record.clone();
         record.status = new_status;
         if data.is_some() {
             record.data = data;
@@ -429,6 +452,11 @@ impl KernelLedger {
         record.updated_at = now_millis();
 
         let policy = DeliveryPolicy::resolve(&record.target, &record.message_type);
+        if policy == DeliveryPolicy::Durable {
+            if let Err(error) = self.persist_record(record) {
+                *record = Self::persistence_failure(&previous_record, error);
+            }
+        }
         let updated_record = record.clone();
         let source_domain = record.source_domain.clone();
         let receipt = record.to_receipt();
@@ -437,10 +465,6 @@ impl KernelLedger {
             deliveries.remove(&key);
         }
         drop(deliveries);
-
-        if policy == DeliveryPolicy::Durable {
-            self.persist_record(&updated_record);
-        }
 
         if policy == DeliveryPolicy::Ephemeral && new_status.is_terminal() {
             self.retire_ephemeral_identity(&updated_record);
@@ -523,7 +547,6 @@ impl KernelLedger {
         reason: &str,
     ) -> Vec<(String, MessageReceipt)> {
         let mut notifications = Vec::new();
-        let mut durable_updates = Vec::new();
         let mut ephemeral_removals = Vec::new();
         let now = now_millis();
         let mut deliveries = self.deliveries.write();
@@ -533,6 +556,7 @@ impl KernelLedger {
                 && let Some((target_domain, _)) = parse_target_address(&record.target)
                 && target_domain == crashed_domain
             {
+                let previous_record = record.clone();
                 record.status = ContractStatus::ExecutionFailed;
                 record.data = Some(json!({
                     "error": "target_domain_faulted",
@@ -540,13 +564,16 @@ impl KernelLedger {
                     "reason": reason,
                 }));
                 record.updated_at = now;
-                notifications.push((record.source_domain.clone(), record.to_receipt()));
-
                 match DeliveryPolicy::resolve(&record.target, &record.message_type) {
-                    DeliveryPolicy::Durable => durable_updates.push(record.clone()),
+                    DeliveryPolicy::Durable => {
+                        if let Err(error) = self.persist_record(record) {
+                            *record = Self::persistence_failure(&previous_record, error);
+                        }
+                    }
                     DeliveryPolicy::Ephemeral => ephemeral_removals.push(record.clone()),
                     DeliveryPolicy::Volatile => {}
                 }
+                notifications.push((record.source_domain.clone(), record.to_receipt()));
             }
         }
 
@@ -557,10 +584,6 @@ impl KernelLedger {
 
         for record in ephemeral_removals {
             self.retire_ephemeral_identity(&record);
-        }
-
-        for rec in durable_updates {
-            self.persist_record(&rec);
         }
 
         notifications

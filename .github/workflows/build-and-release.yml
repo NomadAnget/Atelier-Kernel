@@ -67,7 +67,9 @@ jobs:
           $PY_BIN tests/sdk_portable_features_test.py
           $PY_BIN tests/sdk_transport_bounds_test.py
           $PY_BIN tests/sdk_message_ids_test.py
+          $PY_BIN tests/sdk_observer_slow_test.py
           $PY_BIN tests/sdk_observer_memory_integration.py
+          $PY_BIN tests/sdk_self_restart_integration.py
 
   build-sdk-packages:
     name: Build Domain SDKs (Python Wheel & Node.js NPM)
@@ -105,6 +107,7 @@ jobs:
           python3 tests/sdk_portable_features_test.py
           python3 tests/sdk_transport_bounds_test.py
           python3 tests/sdk_message_ids_test.py
+          python3 tests/sdk_observer_slow_test.py
 
       - name: Upload SDK Packages Artifact
         uses: actions/upload-artifact@v7

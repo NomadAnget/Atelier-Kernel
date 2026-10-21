@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atelier-sdk"
-version = "0.1.8"
+version = "0.1.9"
 description = "Official Python Domain SDK for Atelier Kernel (Stdio JSON-Lines IPC, 4-stage receipts, and Storage-as-Messaging)"
 readme = "README.md"
 requires-python = ">=3.8"

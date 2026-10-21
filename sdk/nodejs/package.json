@@ -1,6 +1,6 @@
 {
   "name": "atelier-sdk",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Official Node.js / TypeScript Domain SDK for Atelier Kernel (Stdio JSON-Lines IPC, 4-stage receipts, and Storage-as-Messaging)",
   "main": "index.js",
   "types": "index.d.ts",

@@ -319,7 +319,7 @@ fn overlong_unterminated_ipc_frame_is_bounded_and_terminates_only_its_owner() {
 #[test]
 fn concurrent_stop_and_failed_update_reclaim_both_children_without_global_query_lock() {
     let k = Arc::new(AtelierKernel::new_in_memory().unwrap());
-    let old_spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"managed","command":"python3","args":["-c","import os,json,time; os.write(int(os.environ['ATELIER_IPC_WRITE_FD']),(json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['run']},'data':{}})+'\\n').encode()); time.sleep(5)"],"auto_restart":false})).unwrap();
+    let old_spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"managed","command":"python3","args":["-c","import os,json,time; os.write(int(os.environ['ATELIER_IPC_WRITE_FD']),(json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['run']},'data':{}})+'\\n').encode()); time.sleep(30)"],"auto_restart":false})).unwrap();
     let old_pid = k.spawn_process_domain(old_spec).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while k.router().domain_status("managed") != Some(DomainStatus::Active)
@@ -332,17 +332,17 @@ fn concurrent_stop_and_failed_update_reclaim_both_children_without_global_query_
         Some(DomainStatus::Active)
     );
     let marker = database("candidate-pid");
-    let candidate_spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"managed","command":"python3","args":["-c","import os,time,sys; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(5)",marker],"auto_restart":false})).unwrap();
+    let candidate_spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"managed","command":"python3","args":["-c","import os,time,sys; from pathlib import Path; p=Path(sys.argv[1]); temp=p.with_suffix('.ready'); temp.write_text(str(os.getpid())); temp.replace(p)\nwhile not p.with_suffix('.release').exists(): time.sleep(.005)",marker],"auto_restart":false})).unwrap();
     let updater = Arc::clone(&k);
     let update = std::thread::spawn(move || {
         updater.supervisor().update_process_domain(
             "managed",
             Some(candidate_spec),
             None,
-            Duration::from_millis(500),
+            Duration::from_secs(5),
         )
     });
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(3);
     while !marker.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -362,6 +362,7 @@ fn concurrent_stop_and_failed_update_reclaim_both_children_without_global_query_
     );
     assert!(at.elapsed() < Duration::from_millis(300));
     assert!(client.drain_frames().iter().any(|f|matches!(f,Frame::Receipt(r) if r.message_id==ids[0] && r.status==ContractStatus::Completed)));
+    std::fs::write(marker.with_extension("release"), b"finish candidate").unwrap();
     assert!(update.join().unwrap().is_err());
     assert!(stop.join().unwrap());
     assert!(k.supervisor().is_stopped("managed"));

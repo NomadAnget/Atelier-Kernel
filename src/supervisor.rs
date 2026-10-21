@@ -286,7 +286,7 @@ fn nonblocking<T: std::os::fd::AsRawFd>(io: &T) -> std::io::Result<()> {
 }
 #[cfg(windows)]
 fn cancel_worker(handle: &thread::JoinHandle<()>) {
-    use std::os::windows::thread::JoinHandleExt;
+    use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;

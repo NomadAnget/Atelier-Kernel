@@ -68,3 +68,9 @@
 - 本次实际运行验收环境为 Linux/WSL；没有声称 Windows 原生进程运行也已实测。
 
 汇总证据：`tmp/core-final-acceptance/summary.json`。未发现仍阻碍本次核心可靠性目标的已知问题；上述语义边界不是持久交付或安全更新的额外承诺。
+
+## 云端 CI 补验修正
+
+提交 `facf653` 的 GitHub Actions 暴露了本机 WSL 验收未覆盖的两处遗漏：Windows 线程句柄 trait 导入错误，以及并发更新测试先观察到空 PID 文件的发布竞态。已改用 `AsRawHandle`；夹具先完整关闭临时 PID 文件再原子发布，候选退出通过测试握手控制，保留全局查询延迟和双进程回收断言。
+
+修正后，本机 Windows GNU 目标所有 target 的 `cargo check --locked`、Linux 全量 79 个 Rust 测试及该并发用例连续 10 次复验通过。云端各平台运行结果以修正提交对应 Actions 为准，不把交叉编译当作 Windows 原生运行验证。证据：`tmp/core-final-acceptance/ci-fix-windows-check.log`、`ci-fix-rust.log`、`ci-fix-repeats/`。

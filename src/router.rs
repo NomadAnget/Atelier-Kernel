@@ -2299,6 +2299,7 @@ impl KernelRouter {
                             )
                         {
                             failed.status = receipt.status;
+                            failed.updated_at = receipt.timestamp;
                             failed.data = receipt.data;
                         }
                     }

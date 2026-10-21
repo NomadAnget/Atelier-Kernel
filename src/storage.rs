@@ -13,7 +13,11 @@ use crate::protocol::{
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    #[error("corrupt kernel ledger record '{0}': invalid JSON payload")]
+    #[error("log persistence failure: {0}")]
+    LogPersistence(String),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("corrupt kernel ledger record '{0}': invalid status or JSON payload")]
     CorruptLedgerRecord(String),
     #[error("invalid domain identifier for table creation: {0}")]
     InvalidDomainName(String),

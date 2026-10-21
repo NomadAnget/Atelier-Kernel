@@ -3,7 +3,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
+use crate::outbox::{self, PipeReceiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -479,7 +480,7 @@ impl DomainSupervisorInner {
         let child_stdout = child.stdout.take();
         let child_stderr = child.stderr.take();
 
-        let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
+        let (tx, rx) = outbox::channel(Arc::clone(self.router.ledger().db_conn.as_ref().expect("kernel queue database")));
         let instance_id = self.router.attach_domain_pipe(&domain_id, tx);
 
         let stopping = Arc::new(AtomicBool::new(false));
@@ -516,11 +517,10 @@ impl DomainSupervisorInner {
                     if let Ok(line) = serde_json::to_string(&frame) {
                         let written = writeln!(pipe_tx, "{line}").and_then(|_| pipe_tx.flush());
                         writer_router.observation_frame_consumed(&writer_domain, instance_id, &frame);
-                        if written.is_err() {
-                            break;
-                        }
-                    }
+                        if written.is_err() || rx.acknowledge().is_err() { break; }
+                    } else { break; }
                 }
+                writer_router.mark_domain_faulted_for_instance(&writer_domain,Some(instance_id),"domain pipe writer stopped");
             })
             .ok();
 
@@ -880,8 +880,24 @@ impl DomainSupervisor {
         thread::Builder::new()
             .name("kernel-supervisor-monitor".to_string())
             .spawn(move || {
-                while let Ok(req) = restart_rx.recv() {
-                    monitor_inner.handle_restart_request(req, &monitor_tx);
+                loop {
+                    match restart_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(req)=>monitor_inner.handle_restart_request(req, &monitor_tx),
+                        Err(mpsc::RecvTimeoutError::Timeout)=>{},
+                        Err(mpsc::RecvTimeoutError::Disconnected)=>break,
+                    }
+                    for (domain,generation,reason) in monitor_inner.router.failed_output_queues() {
+                        if monitor_inner.router.mark_domain_faulted_for_instance(&domain,Some(generation),&reason) {
+                            let managed={
+                                let mut processes=monitor_inner.processes.lock();
+                                if processes.get(&domain).is_some_and(|p|p.instance_id==generation) { processes.remove(&domain) } else { None }
+                            };
+                            if let Some(managed)=managed {
+                                managed.stopping.store(true,Ordering::SeqCst);
+                                let mut child=managed.child.lock();let _=child.kill();let _=child.wait();
+                            }
+                        }
+                    }
                 }
             })
             .ok();
@@ -970,7 +986,7 @@ impl DomainSupervisor {
     /// Just like OS child processes, the returned `DomainPipeClient` has its identity physically bound
     /// to `domain_id` by the Kernel.
     pub fn attach_in_process_domain(&self, domain_id: &str) -> DomainPipeClient {
-        let (tx, rx) = mpsc::channel::<KernelToDomainFrame>();
+        let (tx, rx) = outbox::channel(Arc::clone(self.inner.router.ledger().db_conn.as_ref().expect("kernel queue database")));
         let instance_id = self.inner.router.attach_domain_pipe(domain_id, tx);
         DomainPipeClient {
             domain_id: domain_id.to_string(),
@@ -1028,7 +1044,7 @@ impl DomainSupervisor {
         let (child, k2d_tx, d2k_rx) = self.inner.spawn_child_pipes(domain_id, &spec)?;
         let candidate_pid = child.id();
 
-        let (cand_tx, cand_rx) = mpsc::channel::<KernelToDomainFrame>();
+        let (cand_tx, cand_rx) = outbox::channel(Arc::clone(self.inner.router.ledger().db_conn.as_ref().expect("kernel queue database")));
         let candidate_instance_id = self.inner.router.attach_candidate_pipe(domain_id, cand_tx);
 
         let stopping = Arc::new(AtomicBool::new(false));
@@ -1045,11 +1061,10 @@ impl DomainSupervisor {
                     if let Ok(line) = serde_json::to_string(&frame) {
                         let written = writeln!(pipe_tx, "{line}").and_then(|_| pipe_tx.flush());
                         writer_router.observation_frame_consumed(&writer_domain, candidate_instance_id, &frame);
-                        if written.is_err() {
-                            break;
-                        }
-                    }
+                        if written.is_err() || cand_rx.acknowledge().is_err() { break; }
+                    } else { break; }
                 }
+                writer_router.mark_domain_faulted_for_instance(&writer_domain,Some(candidate_instance_id),"candidate pipe writer stopped");
             })
             .ok();
 
@@ -1184,7 +1199,7 @@ pub struct DomainPipeClient {
     domain_id: String,
     instance_id: u64,
     router: Arc<KernelRouter>,
-    inbox: Mutex<Receiver<KernelToDomainFrame>>,
+    inbox: Mutex<PipeReceiver>,
     next_seq: std::sync::atomic::AtomicU64,
 }
 
@@ -1346,7 +1361,9 @@ impl DomainPipeClient {
 
     /// Receives the next frame (`Deliver(KernelMessage)` or `Receipt(MessageReceipt)`) from the Kernel pipe.
     pub fn recv_frame(&self) -> Result<KernelToDomainFrame, mpsc::RecvError> {
-        let frame = self.inbox.lock().recv()?;
+        let inbox=self.inbox.lock();
+        let frame = inbox.recv()?;
+        inbox.acknowledge().map_err(|_|mpsc::RecvError)?;
         self.router.observation_frame_consumed(&self.domain_id, self.instance_id, &frame);
         Ok(frame)
     }
@@ -1356,7 +1373,9 @@ impl DomainPipeClient {
         &self,
         timeout: std::time::Duration,
     ) -> Result<KernelToDomainFrame, mpsc::RecvTimeoutError> {
-        let frame = self.inbox.lock().recv_timeout(timeout)?;
+        let inbox=self.inbox.lock();
+        let frame = inbox.recv_timeout(timeout)?;
+        inbox.acknowledge().map_err(|_|mpsc::RecvTimeoutError::Disconnected)?;
         self.router.observation_frame_consumed(&self.domain_id, self.instance_id, &frame);
         Ok(frame)
     }
@@ -1366,6 +1385,7 @@ impl DomainPipeClient {
         let mut out = Vec::new();
         let inbox = self.inbox.lock();
         while let Ok(frame) = inbox.try_recv() {
+            if inbox.acknowledge().is_err() { break; }
             self.router.observation_frame_consumed(&self.domain_id, self.instance_id, &frame);
             out.push(frame);
         }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
+use crate::outbox::PipeSender;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -103,7 +103,7 @@ impl LogSubscriptionFilter {
 #[derive(Clone)]
 pub struct CandidateEntry {
     pub instance_id: u64,
-    pub pipe_tx: Sender<KernelToDomainFrame>,
+    pub pipe_tx: PipeSender,
     pub handlers: HashMap<String, String>,
     pub ready: bool,
 }
@@ -111,7 +111,7 @@ pub struct CandidateEntry {
 #[derive(Clone)]
 pub struct DrainingEntry {
     pub instance_id: u64,
-    pub pipe_tx: Sender<KernelToDomainFrame>,
+    pub pipe_tx: PipeSender,
     pub started_at: Instant,
 }
 
@@ -120,7 +120,7 @@ struct DomainEntry {
     /// Monotonically increasing process/pipe instance generation ID.
     instance_id: u64,
     status: DomainStatus,
-    pipe_tx: Option<Sender<KernelToDomainFrame>>,
+    pipe_tx: Option<PipeSender>,
     /// Maps `handler_name -> description`.
     handlers: HashMap<String, String>,
     candidate: Option<CandidateEntry>,
@@ -134,6 +134,7 @@ pub struct KernelRouter {
     /// Serialize delivery transitions and publication to caller/observer together.
     /// Dedicated pipe I/O runs outside this gate on supervisor pump threads.
     receipt_publication: Mutex<()>,
+    output_failures: Mutex<HashMap<String,(u64,String)>>,
     next_instance_id: AtomicU64,
     /// Per-domain serialization gate that closes the TOCTOU window between checking `instance_id`
     /// and processing an inbound frame or replacing a domain generation via `attach_domain_pipe`.
@@ -299,6 +300,7 @@ impl KernelRouter {
 
         Self {
             receipt_publication: Mutex::new(()),
+            output_failures: Mutex::new(HashMap::new()),
             next_instance_id: AtomicU64::new(1),
             domain_gates: RwLock::new(HashMap::new()),
             domains,
@@ -410,10 +412,13 @@ impl KernelRouter {
     ///
     /// Acquires the per-domain serialization gate so a domain replacement can NEVER interleave
     /// mid-execution of an old instance's `handle_raw_pipe_line_for_instance`.
-    pub fn attach_domain_pipe(&self, domain_id: &str, pipe_tx: Sender<KernelToDomainFrame>) -> u64 {
+    pub fn attach_domain_pipe(&self, domain_id: &str, pipe_tx: PipeSender) -> u64 {
         let gate = self.domain_gate(domain_id);
         let _domain_guard = gate.lock();
 
+        if let Some(previous)=self.domain_instance_id(domain_id) {
+            self.mark_domain_faulted_for_instance(domain_id,Some(previous),"domain process generation replaced");
+        }
         let _ = self.storage.ensure_domain_table(domain_id);
         let mut domains = self.domains.write();
         let mut routes = self.routes.write();
@@ -436,6 +441,7 @@ impl KernelRouter {
             routes.remove(&format!("{domain_id}.{h}"));
         }
         entry.handlers.clear();
+        if let Some(tx)=&entry.pipe_tx { tx.close(); }
         entry.candidate = None;
         entry.draining.clear();
         entry.instance_id = instance_id;
@@ -452,7 +458,7 @@ impl KernelRouter {
     }
 
     /// Attaches a candidate pipe for a zero-downtime rolling update.
-    pub fn attach_candidate_pipe(&self, domain_id: &str, pipe_tx: Sender<KernelToDomainFrame>) -> u64 {
+    pub fn attach_candidate_pipe(&self, domain_id: &str, pipe_tx: PipeSender) -> u64 {
         let gate = self.domain_gate(domain_id);
         let _domain_guard = gate.lock();
 
@@ -1568,6 +1574,7 @@ impl KernelRouter {
             "domains": domain_list,
             "domain": single_domain,
             "ledger": self.ledger.retention_counts(),
+            "logging": {"persistence_error":self.logger.persistence_error()},
         });
 
         self.complete_kernel_internal_target(
@@ -2051,10 +2058,7 @@ impl KernelRouter {
         }
 
         // Write `Deliver(KernelMessage)` to target domain pipe.
-        if target_pipe
-            .send(KernelToDomainFrame::Deliver(msg.clone()))
-            .is_err()
-        {
+        if let Err(error) = target_pipe.send(KernelToDomainFrame::Deliver(msg.clone())) {
             // Target pipe broke right as we tried to send; only fault if `target_instance_id` is still current.
             // Fault publication takes the same gate, so release it before delegating.
             drop(publication);
@@ -2062,7 +2066,7 @@ impl KernelRouter {
                 self.mark_domain_faulted_for_instance(
                     target_domain,
                     Some(target_instance_id),
-                    "target stdio pipe broken on send",
+                    &format!("domain output rejected: {}", error.0),
                 );
             }
             return;
@@ -2140,6 +2144,7 @@ impl KernelRouter {
         reason: &str,
     ) -> bool {
         let _publication = self.receipt_publication.lock();
+        let old_pipe;
         {
             let mut domains = self.domains.write();
             let mut routes = self.routes.write();
@@ -2153,7 +2158,10 @@ impl KernelRouter {
                 return false;
             }
             entry.status = DomainStatus::Faulted;
-            entry.pipe_tx = None;
+            old_pipe = entry.pipe_tx.take();
+            if let Some(reason)=old_pipe.as_ref().and_then(|tx|tx.failure()) {
+                self.output_failures.lock().insert(domain_id.into(),(entry.instance_id,reason));
+            }
             for h in entry.handlers.keys() {
                 routes.remove(&format!("{domain_id}.{h}"));
             }
@@ -2166,6 +2174,7 @@ impl KernelRouter {
         self.observer_subscribers.write().remove(domain_id);
 
         let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
+        if let Some(tx)=old_pipe { tx.close(); }
         self.observer_pending.lock().remove(domain_id);
         for (source_domain, receipt) in failed_deliveries {
             self.observer.emit(
@@ -2181,6 +2190,16 @@ impl KernelRouter {
             self.send_to_domain_pipe(&source_domain, KernelToDomainFrame::Receipt(receipt));
         }
         true
+    }
+
+    pub(crate) fn failed_output_queues(&self) -> Vec<(String,u64,String)> {
+        let mut failures=std::mem::take(&mut *self.output_failures.lock());
+        for (id,d) in self.domains.read().iter() {
+            if let Some(reason)=d.pipe_tx.as_ref().and_then(|tx|tx.failure()) {
+                failures.insert(id.clone(),(d.instance_id,reason));
+            }
+        }
+        failures.into_iter().map(|(id,(generation,reason))|(id,generation,reason)).collect()
     }
 
     fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {

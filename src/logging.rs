@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::storage::StorageError;
@@ -122,17 +122,19 @@ impl LogFramePayload {
     }
 }
 
-/// Asynchronous, bounded batch persistence store for `hub_logs` SQLite table.
+/// Durable journal with asynchronous, bounded-batch import into `hub_logs`.
 ///
 /// Follows the black-box logging guarantee:
-/// - Write operations never block the calling domain or kernel router.
-/// - Saturated write queue drops records gracefully rather than stalling business processes.
-/// - Self-managed WAL connection isolated from domain storage transactions.
+/// - Acceptance waits for an independent journal commit, not the application's SQLite write lock.
+/// - Records remain journaled until hub_logs and its import cursor commit together.
+/// - Real-time subscriber drops never remove pending persistence records.
 pub struct LogStore {
-    tx: SyncSender<LogRecord>,
+    tx: SyncSender<()>,
+    spool: Arc<crate::log_spool::LogSpool>,
     stop: Arc<AtomicBool>,
     writer_handle: Option<thread::JoinHandle<()>>,
     query_conn: Mutex<Connection>,
+    query_gate: Option<Arc<Mutex<()>>>,
 }
 
 impl LogStore {
@@ -142,12 +144,12 @@ impl LogStore {
             Some(path) => {
                 if let Some(parent) = path.parent() {
                     if !parent.as_os_str().is_empty() {
-                        let _ = std::fs::create_dir_all(parent);
+                        std::fs::create_dir_all(parent)?;
                     }
                 }
                 let w = Connection::open(path)?;
                 let r = Connection::open(path)?;
-                w.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
+                w.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;")?;
                 r.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
                 (w, r)
             }
@@ -186,112 +188,47 @@ impl LogStore {
             names.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == "source_domain")
         };
         if !present {
-            let _ = conn_writer.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;");
+            conn_writer.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;")?;
         }
 
-        let (tx, rx) = mpsc::sync_channel::<LogRecord>(10_000);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stop_clone = Arc::clone(&stop);
-
-        let writer_handle = thread::Builder::new()
-            .name("hub-logstore-writer".to_string())
-            .spawn(move || {
-                Self::writer_loop(conn_writer, rx, stop_clone);
-            })
-            .ok();
-
-        Ok(Self {
-            tx,
-            stop,
-            writer_handle,
-            query_conn: Mutex::new(conn_reader),
-        })
+        let spool=crate::log_spool::LogSpool::open(db_path,&conn_writer)?;
+        let (tx,rx)=mpsc::sync_channel::<()>(1); // Wakeups only; never stores log payloads.
+        let stop=Arc::new(AtomicBool::new(false));
+        let worker_stop=stop.clone();let worker_spool=spool.clone();
+        // Shared-cache in-memory SQLite returns SQLITE_LOCKED rather than waiting on WAL.
+        let query_gate=db_path.is_none().then(||Arc::new(Mutex::new(())));
+        let worker_gate=query_gate.clone();
+        let writer_handle=thread::Builder::new().name("hub-logstore-writer".into())
+            .spawn(move||Self::writer_loop(conn_writer,rx,worker_stop,worker_spool,worker_gate))?;
+        Ok(Self {tx,spool,stop,writer_handle:Some(writer_handle),query_conn:Mutex::new(conn_reader),query_gate})
     }
 
-    /// Emits a record to the bounded SQLite persistence queue.
-    /// Non-blocking: returns immediately; drops records if queue capacity (10,000) is reached.
-    pub fn emit(&self, record: LogRecord) {
-        if record.console_only || record.ephemeral {
-            return;
-        }
-        let _ = self.tx.try_send(record);
+    /// Accept a persistent record only after committing it to the independent disk journal.
+    /// Ephemeral and console-only records preserve their original no-persistence contract.
+    pub fn emit(&self, record:LogRecord)->Result<(),StorageError> {
+        if record.console_only || record.ephemeral {return Ok(());}
+        if let Err(error)=self.spool.append(&record) {self.spool.append_failed(&error);return Err(error);}
+        let _=self.tx.try_send(());
+        Ok(())
     }
 
-    /// Flushes any pending log records and waits for persistence to finish.
-    pub fn flush(&self, timeout: Duration) {
-        let deadline = std::time::Instant::now() + timeout;
-        while std::time::Instant::now() < deadline {
-            // Check if queue has drained
-            thread::sleep(Duration::from_millis(20));
-        }
+    /// Confirm that all records accepted before this call reached hub_logs, or report failure.
+    pub fn flush(&self,timeout:Duration)->Result<(),StorageError> {
+        let _=self.tx.try_send(());self.spool.flush(timeout)
     }
 
-    fn writer_loop(
-        mut conn: Connection,
-        rx: Receiver<LogRecord>,
-        stop: Arc<AtomicBool>,
-    ) {
-        let batch_size = 200;
-        let flush_interval = Duration::from_millis(200);
-        let mut buffer: Vec<LogRecord> = Vec::with_capacity(batch_size);
-        let mut last_flush = std::time::Instant::now();
+    pub fn persistence_error(&self)->Option<String>{self.spool.error()}
 
+    fn writer_loop(mut conn:Connection,rx:Receiver<()>,stop:Arc<AtomicBool>,spool:Arc<crate::log_spool::LogSpool>,gate:Option<Arc<Mutex<()>>>) {
         loop {
-            let timeout = flush_interval
-                .checked_sub(last_flush.elapsed())
-                .unwrap_or(Duration::from_millis(10));
-
-            match rx.recv_timeout(timeout) {
-                Ok(rec) => {
-                    buffer.push(rec);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            let result={let _guard=gate.as_ref().map(|g|g.lock());spool.import_batch(&mut conn)};
+            match result {
+                Ok(true)=>continue,
+                Ok(false)=>{if stop.load(Ordering::Acquire){break;}},
+                Err(error)=>{spool.diagnostic(&error);if stop.load(Ordering::Acquire){break;}},
             }
-
-            let should_flush = buffer.len() >= batch_size
-                || last_flush.elapsed() >= flush_interval
-                || (stop.load(Ordering::SeqCst) && !buffer.is_empty());
-
-            if should_flush && !buffer.is_empty() {
-                if let Ok(tx) = conn.transaction() {
-                    let insert_res = {
-                        let stmt = tx.prepare_cached(
-                            &format!(
-                                "INSERT INTO {LOGS_TABLE} (ts, level, layer, component, message, phase, source_domain)
-                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-                            )
-                        );
-                        if let Ok(mut statement) = stmt {
-                            for rec in &buffer {
-                                let _ = statement.execute(params![
-                                    rec.ts,
-                                    rec.level,
-                                    rec.layer,
-                                    rec.component,
-                                    rec.message,
-                                    rec.phase,
-                                    rec.source_domain,
-                                ]);
-                            }
-                            Ok(())
-                        } else {
-                            Err(())
-                        }
-                    };
-                    if insert_res.is_ok() {
-                        let _ = tx.commit();
-                    } else {
-                        let _ = tx.rollback();
-                    }
-                }
-                buffer.clear();
-                last_flush = std::time::Instant::now();
-            }
-
-            if stop.load(Ordering::SeqCst) && rx.try_recv().is_err() && buffer.is_empty() {
-                break;
-            }
+            // A failed transaction keeps the entire journal batch intact for retry/restart.
+            let _=rx.recv_timeout(Duration::from_millis(200));
         }
     }
 
@@ -319,6 +256,7 @@ impl LogStore {
         since_ts: Option<f64>,
         source_domain: Option<&str>,
     ) -> Result<Vec<LogRecord>, StorageError> {
+        let _guard=self.query_gate.as_ref().map(|g|g.lock());
         let conn = self.query_conn.lock();
         let mut sql = format!(
             "SELECT id, ts, level, layer, component, message, phase, source_domain FROM {LOGS_TABLE} WHERE 1=1"
@@ -397,6 +335,7 @@ impl LogStore {
 impl Drop for LogStore {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        let _=self.tx.try_send(());
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
         }
@@ -412,7 +351,7 @@ impl Drop for LogStore {
 /// - **Persistence**: `hub_logs` batch store.
 pub struct KernelLogHub {
     store: Arc<LogStore>,
-    subscribers: Mutex<Vec<Sender<LogRecord>>>,
+    subscribers: Mutex<Vec<std::sync::mpsc::SyncSender<LogRecord>>>,
     recent_logs: Mutex<Vec<LogRecord>>,
     active_progress: Mutex<HashMap<String, LogRecord>>,
     console_enabled: AtomicBool,
@@ -437,7 +376,7 @@ impl KernelLogHub {
 
     /// Subscribes to the real-time stream of all log events (both structured logs and ephemeral progress).
     pub fn subscribe(&self) -> Receiver<LogRecord> {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(128);
         self.subscribers.lock().push(tx);
         rx
     }
@@ -477,7 +416,8 @@ impl KernelLogHub {
             return;
         }
 
-        // 3. Regular Structured Log: recent ring buffer + SSE broadcast + SQLite persistence
+        // 3. Accept into the durable journal before announcing a persistent live record.
+        if self.store.emit(record.clone()).is_err() { return; }
         {
             let mut recent = self.recent_logs.lock();
             if recent.len() >= 500 {
@@ -486,13 +426,16 @@ impl KernelLogHub {
             recent.push(record.clone());
         }
 
-        self.broadcast(record.clone());
-        self.store.emit(record);
+        self.broadcast(record);
     }
 
     fn broadcast(&self, record: LogRecord) {
+        if serde_json::to_vec(&record).map_or(true,|v|v.len()>65_536) { return; }
         let mut subs = self.subscribers.lock();
-        subs.retain(|tx| tx.send(record.clone()).is_ok());
+        subs.retain(|tx| match tx.try_send(record.clone()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(_))=>true,
+            Err(mpsc::TrySendError::Disconnected(_))=>false,
+        });
     }
 
     /// Returns a snapshot of currently active in-flight progress records.
@@ -504,6 +447,9 @@ impl KernelLogHub {
     pub fn recent_logs(&self) -> Vec<LogRecord> {
         self.recent_logs.lock().clone()
     }
+
+    /// Infrastructure health; an append failure remains visible until this host restarts.
+    pub fn persistence_error(&self)->Option<String>{self.store.persistence_error()}
 
     /// Queries persisted logs from SQLite `hub_logs`.
     pub fn query_logs(
@@ -712,5 +658,41 @@ impl KernelLogHub {
             record.level.to_uppercase(),
             record.message
         )
+    }
+}
+
+#[cfg(test)]
+mod subscriber_bounds_tests {
+    use super::*;
+    #[test]
+    fn slow_log_subscriber_is_bounded_and_recovers_after_drain() {
+        let hub=KernelLogHub::new(None).unwrap();let slow=hub.subscribe();let fast=hub.subscribe();
+        for i in 0..10_000 {
+            hub.broadcast(LogRecord { message:format!("event {i}"),..LogRecord::default() });
+            assert!(fast.try_recv().is_ok());
+        }
+        assert_eq!(slow.try_iter().count(),128);
+        hub.broadcast(LogRecord{message:"after-drain".into(),..LogRecord::default()});
+        assert_eq!(slow.try_recv().unwrap().message,"after-drain");
+        // Large records may still be persisted; they must not multiply unboundedly per observer.
+        hub.broadcast(LogRecord{message:"x".repeat(70_000),..LogRecord::default()});
+        assert!(slow.try_recv().is_err());
+    }
+}
+#[cfg(test)]
+mod persistence_independence_test {
+    use super::*;
+    #[test]
+    fn full_live_subscriber_does_not_remove_successfully_persisted_history() {
+        let hub=KernelLogHub::new(None).unwrap();let slow=hub.subscribe();
+        for _ in 0..128 {hub.broadcast(LogRecord::default());}
+        hub.reinject(LogRecord {message:"persisted-with-full-live-queue".into(),..LogRecord::default()});
+        let deadline=std::time::Instant::now()+Duration::from_secs(3);
+        loop {
+            let rows=hub.query_logs(20,None,None,None,None,None).unwrap();
+            if rows.iter().any(|r|r.message=="persisted-with-full-live-queue") {break;}
+            assert!(std::time::Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!slow.try_iter().any(|r|r.message=="persisted-with-full-live-queue"));
     }
 }

@@ -324,7 +324,7 @@ class AsyncRuntime(MessageClient):
                 continue
             if src_dom and not _domain_matches(record, src_dom):
                 continue
-            self._invoke_event_listener(listener, record)
+            self._invoke_lossy_event_listener(listener, record, "_log_busy")
 
     def _dispatch_system_telemetry(self, frame):
         metric = frame.get('data') or {}
@@ -337,28 +337,31 @@ class AsyncRuntime(MessageClient):
             self._invoke_event_listener(listener, alert)
 
     def _dispatch_system_observer(self, frame):
-        event = frame.get('data') or {}
-        busy = getattr(self, '_observation_busy', None)
-        if busy is None:
-            busy = self._observation_busy = set()
         for listener in getattr(self, '_observation_listeners', []):
-            key = id(listener)
-            if key in busy:
-                continue  # Lossy observation: never accumulate slow callback tasks.
-            try:
-                result = listener(event)
-                if inspect.isawaitable(result):
-                    busy.add(key)
-                    task = asyncio.ensure_future(result)
-                    self._callbacks.add(task)
-                    def finished(done, key=key):
-                        busy.discard(key)
-                        self._callbacks.discard(done)
-                        if not done.cancelled() and done.exception() is not None:
-                            self._diagnostic('SDK observation listener error: %s', done.exception())
-                    task.add_done_callback(finished)
-            except Exception as error:
-                self._diagnostic('SDK observation listener error: %s', error)
+            self._invoke_lossy_event_listener(listener, frame.get('data') or {}, '_observation_busy')
+
+    def _invoke_lossy_event_listener(self, listener, payload, busy_attribute):
+        busy = getattr(self, busy_attribute, None)
+        if busy is None:
+            busy = set()
+            setattr(self, busy_attribute, busy)
+        key = id(listener)
+        if key in busy:
+            return
+        try:
+            result = listener(payload)
+            if inspect.isawaitable(result):
+                busy.add(key)
+                task = asyncio.ensure_future(result)
+                self._callbacks.add(task)
+                def finished(done):
+                    busy.discard(key)
+                    self._callbacks.discard(done)
+                    if not done.cancelled() and done.exception() is not None:
+                        self._diagnostic('SDK lossy listener error: %s', done.exception())
+                task.add_done_callback(finished)
+        except Exception as error:
+            self._diagnostic('SDK lossy listener error: %s', error)
 
     def _invoke_event_listener(self, listener, payload):
         try:

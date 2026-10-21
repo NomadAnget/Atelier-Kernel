@@ -204,6 +204,20 @@ fn check_sqlite_schema_drift(
         return;
     };
 
+    if table_exists(&conn,"kernel_outbox") {
+        report.checked_tables+=1;
+        if let Err(err)=verify_sqlite_table_columns(&conn,"kernel_outbox",crate::outbox::OUTBOX_COLUMNS) {
+            report.violations.push(ConstitutionViolation {
+                rule:"M7".into(),location:format!("{}::kernel_outbox",db_path.display()),detail:err.to_string(),
+            });
+        }
+    }
+    if table_exists(&conn,"kernel_log_import") {
+        report.checked_tables+=1;
+        if let Err(err)=verify_sqlite_table_columns(&conn,"kernel_log_import",crate::log_spool::CURSOR_COLUMNS) {
+            report.violations.push(ConstitutionViolation {rule:"M7".into(),location:format!("{}::kernel_log_import",db_path.display()),detail:err.to_string()});
+        }
+    }
     // Check `kernel_ledger` if it exists
     if table_exists(&conn, KERNEL_LEDGER_TABLE) {
         report.checked_tables += 1;

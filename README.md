@@ -241,3 +241,7 @@ cargo run -- --auto
 # 6. 运行集成测试套件
 cargo test
 ```
+
+### 持久日志缓冲（待发布）
+
+文件数据库启动时会创建 `<db_path>.log-spool.sqlite`（及 SQLite WAL/SHM 文件），用于普通日志的可靠接收与批量入库。不要将它当临时缓存删除；迁移、备份和恢复需将主库与日志缓冲作为一组资产一致处理。主库写锁不会使已接收日志被容量策略丢弃；导入失败保留记录并重试，原子游标防止重复。`LogStore.flush(timeout)` 返回确认结果；运行健康的 `logging.persistence_error` 暴露接收/导入故障。接收等待本地 FULL 同步提交，非零等待；瞬态进度、console_only 及实时订阅维持原有语义。

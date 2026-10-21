@@ -243,7 +243,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
       for(const {callback,level,sourceDomain} of (this._logListeners||[])){
         if(level&&!_nodeLevelMatches(record.level,level))continue;
         if(sourceDomain&&!_nodeDomainMatches(record,sourceDomain))continue;
-        this._invokeEventListener(callback,record);
+        this._invokeLossyEventListener(callback,record,'_logBusy');
       }
     }
     _dispatchSystemTelemetry(frame){
@@ -259,21 +259,23 @@ function enhance(Base,RequestError,ExecutionFailed) {
       }
     }
     _dispatchSystemObserver(frame){
-      const event=frame.data||{};
-      const busy=this._observationBusy||(this._observationBusy=new Set());
       for(const callback of (this._observationListeners||[])){
-        if(busy.has(callback))continue;
-        try{
-          const result=callback(event);
-          if(result&&typeof result.then==='function'){
-            busy.add(callback);
-            const task=Promise.resolve(result);
-            this._callbacks.add(task);
-            task.catch(error=>this._diagnostic(`SDK observation listener error: ${error}`))
-              .finally(()=>{busy.delete(callback);this._callbacks.delete(task);});
-          }
-        }catch(error){this._diagnostic(`SDK observation listener error: ${error}`);}
+        this._invokeLossyEventListener(callback,frame.data||{},'_observationBusy');
       }
+    }
+    _invokeLossyEventListener(callback,payload,busyKey){
+      const busy=this[busyKey]||(this[busyKey]=new Set());
+      if(busy.has(callback))return;
+      try{
+        const result=callback(payload);
+        if(result&&typeof result.then==='function'){
+          busy.add(callback);
+          const task=Promise.resolve(result);
+          this._callbacks.add(task);
+          task.catch(error=>this._diagnostic(`SDK lossy listener error: ${error}`))
+            .finally(()=>{busy.delete(callback);this._callbacks.delete(task);});
+        }
+      }catch(error){this._diagnostic(`SDK lossy listener error: ${error}`);}
     }
     _invokeEventListener(callback,payload){
       try{

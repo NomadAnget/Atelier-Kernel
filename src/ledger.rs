@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -87,7 +88,7 @@ pub struct KernelLedger {
     deliveries: RwLock<HashMap<String, DeliveryRecord>>,
     logical_messages: RwLock<HashMap<String, Vec<String>>>,
     child_logical: RwLock<HashMap<String, String>>,
-    db_conn: Option<Mutex<Connection>>,
+    pub(crate) db_conn: Option<Arc<Mutex<Connection>>>,
 }
 
 impl Default for KernelLedger {
@@ -144,10 +145,11 @@ impl KernelLedger {
         verify_sqlite_table_columns(&conn, KERNEL_LEDGER_TABLE, KERNEL_LEDGER_COLUMNS)?;
         // Validate even lazily restored terminal payloads without expanding them in memory.
         let corrupt: Option<String> = conn.query_row(
-            &format!("SELECT message_id FROM {KERNEL_LEDGER_TABLE} WHERE data IS NOT NULL AND NOT json_valid(data) LIMIT 1"),
+            &format!("SELECT message_id FROM {KERNEL_LEDGER_TABLE} WHERE (data IS NOT NULL AND NOT json_valid(data)) OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1"),
             [], |row| row.get(0)).optional()?;
         if let Some(id) = corrupt { return Err(StorageError::CorruptLedgerRecord(id)); }
 
+        crate::outbox::initialize(&conn)?;
         let mut deliveries_map = HashMap::new();
         let mut logical_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut child_map = HashMap::new();
@@ -181,7 +183,7 @@ impl KernelLedger {
             deliveries: RwLock::new(deliveries_map),
             logical_messages: RwLock::new(logical_map),
             child_logical: RwLock::new(child_map),
-            db_conn: Some(Mutex::new(conn)),
+            db_conn: Some(Arc::new(Mutex::new(conn))),
         })
     }
 

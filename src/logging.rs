@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -185,50 +185,90 @@ impl LogStore {
         let present = {
             let mut stmt = conn_writer.prepare("PRAGMA table_info(hub_logs)")?;
             let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            names.collect::<Result<Vec<_>, _>>()?.iter().any(|n| n == "source_domain")
+            names
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .any(|n| n == "source_domain")
         };
         if !present {
             conn_writer.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;")?;
         }
 
-        let spool=crate::log_spool::LogSpool::open(db_path,&conn_writer)?;
-        let (tx,rx)=mpsc::sync_channel::<()>(1); // Wakeups only; never stores log payloads.
-        let stop=Arc::new(AtomicBool::new(false));
-        let worker_stop=stop.clone();let worker_spool=spool.clone();
+        let spool = crate::log_spool::LogSpool::open(db_path, &conn_writer)?;
+        let (tx, rx) = mpsc::sync_channel::<()>(1); // Wakeups only; never stores log payloads.
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_spool = spool.clone();
         // Shared-cache in-memory SQLite returns SQLITE_LOCKED rather than waiting on WAL.
-        let query_gate=db_path.is_none().then(||Arc::new(Mutex::new(())));
-        let worker_gate=query_gate.clone();
-        let writer_handle=thread::Builder::new().name("hub-logstore-writer".into())
-            .spawn(move||Self::writer_loop(conn_writer,rx,worker_stop,worker_spool,worker_gate))?;
-        Ok(Self {tx,spool,stop,writer_handle:Some(writer_handle),query_conn:Mutex::new(conn_reader),query_gate})
+        let query_gate = db_path.is_none().then(|| Arc::new(Mutex::new(())));
+        let worker_gate = query_gate.clone();
+        let writer_handle = thread::Builder::new()
+            .name("hub-logstore-writer".into())
+            .spawn(move || {
+                Self::writer_loop(conn_writer, rx, worker_stop, worker_spool, worker_gate)
+            })?;
+        Ok(Self {
+            tx,
+            spool,
+            stop,
+            writer_handle: Some(writer_handle),
+            query_conn: Mutex::new(conn_reader),
+            query_gate,
+        })
     }
 
     /// Accept a persistent record only after committing it to the independent disk journal.
     /// Ephemeral and console-only records preserve their original no-persistence contract.
-    pub fn emit(&self, record:LogRecord)->Result<(),StorageError> {
-        if record.console_only || record.ephemeral {return Ok(());}
-        if let Err(error)=self.spool.append(&record) {self.spool.append_failed(&error);return Err(error);}
-        let _=self.tx.try_send(());
+    pub fn emit(&self, record: LogRecord) -> Result<(), StorageError> {
+        if record.console_only || record.ephemeral {
+            return Ok(());
+        }
+        if let Err(error) = self.spool.append(&record) {
+            self.spool.append_failed(&error);
+            return Err(error);
+        }
+        let _ = self.tx.try_send(());
         Ok(())
     }
 
     /// Confirm that all records accepted before this call reached hub_logs, or report failure.
-    pub fn flush(&self,timeout:Duration)->Result<(),StorageError> {
-        let _=self.tx.try_send(());self.spool.flush(timeout)
+    pub fn flush(&self, timeout: Duration) -> Result<(), StorageError> {
+        let _ = self.tx.try_send(());
+        self.spool.flush(timeout)
     }
 
-    pub fn persistence_error(&self)->Option<String>{self.spool.error()}
+    pub fn persistence_error(&self) -> Option<String> {
+        self.spool.error()
+    }
 
-    fn writer_loop(mut conn:Connection,rx:Receiver<()>,stop:Arc<AtomicBool>,spool:Arc<crate::log_spool::LogSpool>,gate:Option<Arc<Mutex<()>>>) {
+    fn writer_loop(
+        mut conn: Connection,
+        rx: Receiver<()>,
+        stop: Arc<AtomicBool>,
+        spool: Arc<crate::log_spool::LogSpool>,
+        gate: Option<Arc<Mutex<()>>>,
+    ) {
         loop {
-            let result={let _guard=gate.as_ref().map(|g|g.lock());spool.import_batch(&mut conn)};
+            let result = {
+                let _guard = gate.as_ref().map(|g| g.lock());
+                spool.import_batch(&mut conn)
+            };
             match result {
-                Ok(true)=>continue,
-                Ok(false)=>{if stop.load(Ordering::Acquire){break;}},
-                Err(error)=>{spool.diagnostic(&error);if stop.load(Ordering::Acquire){break;}},
+                Ok(true) => continue,
+                Ok(false) => {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    spool.diagnostic(&error);
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
             }
             // A failed transaction keeps the entire journal batch intact for retry/restart.
-            let _=rx.recv_timeout(Duration::from_millis(200));
+            let _ = rx.recv_timeout(Duration::from_millis(200));
         }
     }
 
@@ -256,7 +296,7 @@ impl LogStore {
         since_ts: Option<f64>,
         source_domain: Option<&str>,
     ) -> Result<Vec<LogRecord>, StorageError> {
-        let _guard=self.query_gate.as_ref().map(|g|g.lock());
+        let _guard = self.query_gate.as_ref().map(|g| g.lock());
         let conn = self.query_conn.lock();
         let mut sql = format!(
             "SELECT id, ts, level, layer, component, message, phase, source_domain FROM {LOGS_TABLE} WHERE 1=1"
@@ -335,7 +375,7 @@ impl LogStore {
 impl Drop for LogStore {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _=self.tx.try_send(());
+        let _ = self.tx.try_send(());
         if let Some(handle) = self.writer_handle.take() {
             let _ = handle.join();
         }
@@ -377,7 +417,10 @@ impl KernelLogHub {
     /// Subscribes to the real-time stream of all log events (both structured logs and ephemeral progress).
     pub fn subscribe(&self) -> Receiver<LogRecord> {
         let (tx, rx) = mpsc::sync_channel(128);
-        self.subscribers.lock().push(tx);
+        let mut subscribers = self.subscribers.lock();
+        if subscribers.len() < 64 {
+            subscribers.push(tx);
+        }
         rx
     }
 
@@ -408,7 +451,9 @@ impl KernelLogHub {
                 let mut progress_map = self.active_progress.lock();
                 if record.done {
                     progress_map.remove(key);
-                } else {
+                } else if (progress_map.len() < 1024 || progress_map.contains_key(key))
+                    && serde_json::to_vec(&record).is_ok_and(|bytes| bytes.len() <= 65_536)
+                {
                     progress_map.insert(key.clone(), record.clone());
                 }
             }
@@ -417,24 +462,30 @@ impl KernelLogHub {
         }
 
         // 3. Accept into the durable journal before announcing a persistent live record.
-        if self.store.emit(record.clone()).is_err() { return; }
+        if self.store.emit(record.clone()).is_err() {
+            return;
+        }
         {
             let mut recent = self.recent_logs.lock();
             if recent.len() >= 500 {
                 recent.remove(0);
             }
-            recent.push(record.clone());
+            if serde_json::to_vec(&record).is_ok_and(|bytes| bytes.len() <= 65_536) {
+                recent.push(record.clone());
+            }
         }
 
         self.broadcast(record);
     }
 
     fn broadcast(&self, record: LogRecord) {
-        if serde_json::to_vec(&record).map_or(true,|v|v.len()>65_536) { return; }
+        if serde_json::to_vec(&record).map_or(true, |v| v.len() > 65_536) {
+            return;
+        }
         let mut subs = self.subscribers.lock();
         subs.retain(|tx| match tx.try_send(record.clone()) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_))=>true,
-            Err(mpsc::TrySendError::Disconnected(_))=>false,
+            Ok(()) | Err(mpsc::TrySendError::Full(_)) => true,
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
         });
     }
 
@@ -449,7 +500,9 @@ impl KernelLogHub {
     }
 
     /// Infrastructure health; an append failure remains visible until this host restarts.
-    pub fn persistence_error(&self)->Option<String>{self.store.persistence_error()}
+    pub fn persistence_error(&self) -> Option<String> {
+        self.store.persistence_error()
+    }
 
     /// Queries persisted logs from SQLite `hub_logs`.
     pub fn query_logs(
@@ -500,8 +553,7 @@ impl KernelLogHub {
             }
         }
         if let Some(domain) = source_domain {
-            let domain_match =
-                r.source_domain.as_deref() == Some(domain) || r.component == domain;
+            let domain_match = r.source_domain.as_deref() == Some(domain) || r.component == domain;
             if !domain_match {
                 return false;
             }
@@ -539,9 +591,9 @@ impl KernelLogHub {
             if !Self::matches_filter(&r, level, layer, component, phase, since_ts, source_domain) {
                 continue;
             }
-            let already_present = db_records
-                .iter()
-                .any(|d| (d.ts - r.ts).abs() < 0.001 && d.message == r.message && d.level == r.level);
+            let already_present = db_records.iter().any(|d| {
+                (d.ts - r.ts).abs() < 0.001 && d.message == r.message && d.level == r.level
+            });
             if !already_present {
                 db_records.insert(0, r);
             }
@@ -572,7 +624,14 @@ impl KernelLogHub {
         self.log_level("ERROR", layer, component, message.into(), "");
     }
 
-    pub fn phase(&self, level: &str, layer: &str, component: &str, phase: &str, message: impl Into<String>) {
+    pub fn phase(
+        &self,
+        level: &str,
+        layer: &str,
+        component: &str,
+        phase: &str,
+        message: impl Into<String>,
+    ) {
         self.log_level(level, layer, component, message.into(), phase);
     }
 
@@ -666,16 +725,27 @@ mod subscriber_bounds_tests {
     use super::*;
     #[test]
     fn slow_log_subscriber_is_bounded_and_recovers_after_drain() {
-        let hub=KernelLogHub::new(None).unwrap();let slow=hub.subscribe();let fast=hub.subscribe();
+        let hub = KernelLogHub::new(None).unwrap();
+        let slow = hub.subscribe();
+        let fast = hub.subscribe();
         for i in 0..10_000 {
-            hub.broadcast(LogRecord { message:format!("event {i}"),..LogRecord::default() });
+            hub.broadcast(LogRecord {
+                message: format!("event {i}"),
+                ..LogRecord::default()
+            });
             assert!(fast.try_recv().is_ok());
         }
-        assert_eq!(slow.try_iter().count(),128);
-        hub.broadcast(LogRecord{message:"after-drain".into(),..LogRecord::default()});
-        assert_eq!(slow.try_recv().unwrap().message,"after-drain");
+        assert_eq!(slow.try_iter().count(), 128);
+        hub.broadcast(LogRecord {
+            message: "after-drain".into(),
+            ..LogRecord::default()
+        });
+        assert_eq!(slow.try_recv().unwrap().message, "after-drain");
         // Large records may still be persisted; they must not multiply unboundedly per observer.
-        hub.broadcast(LogRecord{message:"x".repeat(70_000),..LogRecord::default()});
+        hub.broadcast(LogRecord {
+            message: "x".repeat(70_000),
+            ..LogRecord::default()
+        });
         assert!(slow.try_recv().is_err());
     }
 }
@@ -684,15 +754,31 @@ mod persistence_independence_test {
     use super::*;
     #[test]
     fn full_live_subscriber_does_not_remove_successfully_persisted_history() {
-        let hub=KernelLogHub::new(None).unwrap();let slow=hub.subscribe();
-        for _ in 0..128 {hub.broadcast(LogRecord::default());}
-        hub.reinject(LogRecord {message:"persisted-with-full-live-queue".into(),..LogRecord::default()});
-        let deadline=std::time::Instant::now()+Duration::from_secs(3);
-        loop {
-            let rows=hub.query_logs(20,None,None,None,None,None).unwrap();
-            if rows.iter().any(|r|r.message=="persisted-with-full-live-queue") {break;}
-            assert!(std::time::Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
+        let hub = KernelLogHub::new(None).unwrap();
+        let slow = hub.subscribe();
+        for _ in 0..128 {
+            hub.broadcast(LogRecord::default());
         }
-        assert!(!slow.try_iter().any(|r|r.message=="persisted-with-full-live-queue"));
+        hub.reinject(LogRecord {
+            message: "persisted-with-full-live-queue".into(),
+            ..LogRecord::default()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let rows = hub.query_logs(20, None, None, None, None, None).unwrap();
+            if rows
+                .iter()
+                .any(|r| r.message == "persisted-with-full-live-queue")
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !slow
+                .try_iter()
+                .any(|r| r.message == "persisted-with-full-live-queue")
+        );
     }
 }

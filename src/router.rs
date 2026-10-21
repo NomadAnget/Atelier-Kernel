@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use crate::outbox::PipeSender;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,20 +21,16 @@ use crate::protocol::{
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
-    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_OBSERVER, MSG_UNSUBSCRIBE_TELEMETRY,
-    MSG_UPDATE_DOMAIN, MessageReceipt, ObservationEvent, OutboundMessage,
-    now_millis, parse_target_address,
+    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_OBSERVER, MSG_UNSUBSCRIBE_TELEMETRY, MSG_UPDATE_DOMAIN,
+    MessageReceipt, ObservationEvent, OutboundMessage, now_millis, parse_target_address,
 };
 use crate::storage::DomainStorageEngine;
 
 struct ControlPermit {
     count: Arc<AtomicUsize>,
-    origins: Arc<Mutex<HashMap<String, u64>>>,
-    message_id: String,
 }
 impl Drop for ControlPermit {
     fn drop(&mut self) {
-        self.origins.lock().remove(&self.message_id);
         self.count.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -115,6 +111,33 @@ pub struct DrainingEntry {
     pub started_at: Instant,
 }
 
+fn generation_pipe(
+    domains: &RwLock<HashMap<String, DomainEntry>>,
+    key: &str,
+) -> Option<PipeSender> {
+    let (domain, generation) = key
+        .rsplit_once('#')
+        .and_then(|(d, g)| g.parse::<u64>().ok().map(|g| (d, g)))
+        .unwrap_or((key, 0));
+    let map = domains.read();
+    let entry = map.get(domain)?;
+    if generation == 0 || entry.instance_id == generation {
+        entry.pipe_tx.clone()
+    } else if let Some(candidate) = entry
+        .candidate
+        .as_ref()
+        .filter(|c| c.instance_id == generation)
+    {
+        Some(candidate.pipe_tx.clone())
+    } else {
+        entry
+            .draining
+            .iter()
+            .find(|d| d.instance_id == generation)
+            .map(|d| d.pipe_tx.clone())
+    }
+}
+
 /// Internal registration state of a single managed Domain.
 struct DomainEntry {
     /// Monotonically increasing process/pipe instance generation ID.
@@ -163,7 +186,6 @@ pub struct KernelRouter {
     /// Optional back-reference to domain supervisor for runtime queries and domain control.
     supervisor: RwLock<Option<Weak<crate::supervisor::DomainSupervisor>>>,
     control_inflight: Arc<AtomicUsize>,
-    control_origins: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl KernelRouter {
@@ -174,7 +196,8 @@ impl KernelRouter {
         logger: Arc<KernelLogHub>,
     ) -> Self {
         let domains = Arc::new(RwLock::new(HashMap::<String, DomainEntry>::new()));
-        let log_subscribers = Arc::new(RwLock::new(HashMap::<String, LogSubscriptionFilter>::new()));
+        let log_subscribers =
+            Arc::new(RwLock::new(HashMap::<String, LogSubscriptionFilter>::new()));
         let telemetry_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let notify_subscribers = Arc::new(RwLock::new(HashSet::new()));
         let observer_subscribers = Arc::new(RwLock::new(HashSet::<String>::new()));
@@ -204,29 +227,24 @@ impl KernelRouter {
                                 if !filter.matches(&record) {
                                     continue;
                                 }
-                                let domains_guard = domains_worker.read();
-                                if let Some(entry) = domains_guard.get(&domain_id) {
-                                    if entry.status != DomainStatus::Faulted && entry.status != DomainStatus::Stopped {
-                                        if let Some(tx) = &entry.pipe_tx {
-                                            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-                                            let now = now_millis();
-                                            let msg = KernelMessage {
-                                                logical_id: format!("sys_log_{}_{}", now, id),
-                                                message_id: format!("sys_log_{}_{}", now, id),
-                                                source_domain: record
-                                                    .source_domain
-                                                    .clone()
-                                                    .unwrap_or_else(|| "kernel".to_string()),
-                                                target: KERNEL_LOGGER_TARGET.to_string(),
-                                                targets: vec![KERNEL_LOGGER_TARGET.to_string()],
-                                                message_type: MSG_SYSTEM_LOG_EVENT.to_string(),
-                                                params: json!({}),
-                                                timestamp: now,
-                                                data: data.clone(),
-                                            };
-                                            let _ = tx.send(KernelToDomainFrame::Deliver(msg));
-                                        }
-                                    }
+                                if let Some(tx) = generation_pipe(&domains_worker, &domain_id) {
+                                    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+                                    let now = now_millis();
+                                    let msg = KernelMessage {
+                                        logical_id: format!("sys_log_{}_{}", now, id),
+                                        message_id: format!("sys_log_{}_{}", now, id),
+                                        source_domain: record
+                                            .source_domain
+                                            .clone()
+                                            .unwrap_or_else(|| "kernel".to_string()),
+                                        target: KERNEL_LOGGER_TARGET.to_string(),
+                                        targets: vec![KERNEL_LOGGER_TARGET.to_string()],
+                                        message_type: MSG_SYSTEM_LOG_EVENT.to_string(),
+                                        params: json!({}),
+                                        timestamp: now,
+                                        data: data.clone(),
+                                    };
+                                    let _ = tx.send(KernelToDomainFrame::Deliver(msg));
                                 }
                             }
                         }
@@ -235,7 +253,7 @@ impl KernelRouter {
                     }
                 }
             })
-            .ok();
+            .expect("cannot start kernel stream fanout");
 
         let obs_rx = observer.subscribe();
         let obs_subs_worker = Arc::clone(&observer_subscribers);
@@ -257,25 +275,20 @@ impl KernelRouter {
                                 Err(_) => continue,
                             };
                             for domain_id in subs {
-                                let domains_guard = obs_domains_worker.read();
-                                if let Some(entry) = domains_guard.get(&domain_id) {
-                                    if entry.status != DomainStatus::Faulted && entry.status != DomainStatus::Stopped {
-                                        if let Some(tx) = &entry.pipe_tx {
-                                            let msg = KernelMessage {
-                                                logical_id: event.logical_id.clone(),
-                                                message_id: format!("obs_{}", event.event_id),
-                                                source_domain: "kernel".to_string(),
-                                                target: KERNEL_OBSERVER_TARGET.to_string(),
-                                                targets: vec![KERNEL_OBSERVER_TARGET.to_string()],
-                                                message_type: MSG_SYSTEM_OBSERVER_EVENT.to_string(),
-                                                params: json!({}),
-                                                timestamp: event.timestamp,
-                                                data: data.clone(),
-                                            };
-                                            let frame = KernelToDomainFrame::Deliver(msg);
-                                            let _=tx.send(frame);
-                                        }
-                                    }
+                                if let Some(tx) = generation_pipe(&obs_domains_worker, &domain_id) {
+                                    let msg = KernelMessage {
+                                        logical_id: event.logical_id.clone(),
+                                        message_id: format!("obs_{}", event.event_id),
+                                        source_domain: "kernel".to_string(),
+                                        target: KERNEL_OBSERVER_TARGET.to_string(),
+                                        targets: vec![KERNEL_OBSERVER_TARGET.to_string()],
+                                        message_type: MSG_SYSTEM_OBSERVER_EVENT.to_string(),
+                                        params: json!({}),
+                                        timestamp: event.timestamp,
+                                        data: data.clone(),
+                                    };
+                                    let frame = KernelToDomainFrame::Deliver(msg);
+                                    let _ = tx.send(frame);
                                 }
                             }
                         }
@@ -284,7 +297,7 @@ impl KernelRouter {
                     }
                 }
             })
-            .ok();
+            .expect("cannot start kernel stream fanout");
 
         Self {
             next_instance_id: AtomicU64::new(1),
@@ -301,11 +314,10 @@ impl KernelRouter {
             notify_subscribers,
             observer_subscribers,
             stop_log_pump,
-            log_pump_handle: Mutex::new(pump_handle),
-            observer_pump_handle: Mutex::new(observer_pump_handle),
+            log_pump_handle: Mutex::new(Some(pump_handle)),
+            observer_pump_handle: Mutex::new(Some(observer_pump_handle)),
             supervisor: RwLock::new(None),
             control_inflight: Arc::new(AtomicUsize::new(0)),
-            control_origins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -356,6 +368,9 @@ impl KernelRouter {
 
     /// Ingests a message into the UI inbox ring buffer (bounded at 500 entries).
     pub fn push_ui_inbox(&self, msg: KernelMessage) {
+        if serde_json::to_vec(&msg).map_or(true, |bytes| bytes.len() > 256 * 1024) {
+            return;
+        }
         let mut inbox = self.ui_inbox.write();
         inbox.insert(0, msg);
         if inbox.len() > 500 {
@@ -385,15 +400,17 @@ impl KernelRouter {
         let gate = self.domain_gate(domain_id);
         let _domain_guard = gate.lock();
 
-        if let Some(previous)=self.domain_instance_id(domain_id) {
-            self.mark_domain_faulted_for_instance(domain_id,Some(previous),"domain process generation replaced");
+        if let Some(previous) = self.domain_instance_id(domain_id) {
+            self.mark_domain_faulted_for_instance(
+                domain_id,
+                Some(previous),
+                "domain process generation replaced",
+            );
         }
-        let _ = self.storage.ensure_domain_table(domain_id);
         let mut domains = self.domains.write();
         let mut routes = self.routes.write();
 
         let instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
-        self.ledger.clear_session_dedup_for_domain(domain_id);
 
         let entry = domains
             .entry(domain_id.to_string())
@@ -410,17 +427,13 @@ impl KernelRouter {
             routes.remove(&format!("{domain_id}.{h}"));
         }
         entry.handlers.clear();
-        if let Some(tx)=&entry.pipe_tx { tx.close(); }
         entry.candidate = None;
         entry.draining.clear();
         entry.instance_id = instance_id;
         entry.status = DomainStatus::Spawning;
         entry.pipe_tx = Some(pipe_tx);
 
-        self.log_subscribers.write().remove(domain_id);
-        self.telemetry_subscribers.write().remove(domain_id);
-        self.notify_subscribers.write().remove(domain_id);
-        self.observer_subscribers.write().remove(domain_id);
+        self.remove_subscriptions(domain_id, instance_id);
 
         instance_id
     }
@@ -431,7 +444,6 @@ impl KernelRouter {
         let _domain_guard = gate.lock();
 
         let candidate_instance_id = self.next_instance_id.fetch_add(1, Ordering::Relaxed);
-        self.ledger.clear_session_dedup_for_domain(domain_id);
         let mut domains = self.domains.write();
         let entry = domains
             .entry(domain_id.to_string())
@@ -453,13 +465,15 @@ impl KernelRouter {
     }
 
     /// Checks if a candidate instance has registered its handlers and is ready.
-    pub fn is_candidate_ready(&self, domain_id: &str, candidate_instance_id: u64) -> bool {
-        let domains = self.domains.read();
-        domains
-            .get(domain_id)
-            .and_then(|e| e.candidate.as_ref())
-            .map(|c| c.instance_id == candidate_instance_id && c.ready)
-            .unwrap_or(false)
+    pub fn is_candidate_ready(&self, domain: &str, generation: u64) -> bool {
+        let pipe = {
+            let map = self.domains.read();
+            map.get(domain)
+                .and_then(|e| e.candidate.as_ref())
+                .filter(|c| c.instance_id == generation && c.ready)
+                .map(|c| c.pipe_tx.clone())
+        };
+        pipe.is_some_and(|tx| tx.failure().is_none())
     }
 
     /// Atomically commits candidate instance, moving old instance into draining, and updating routes.
@@ -470,8 +484,12 @@ impl KernelRouter {
         let mut domains = self.domains.write();
         let mut routes = self.routes.write();
         if let Some(entry) = domains.get_mut(domain_id) {
-            if let Some(candidate) = entry.candidate.take() {
-                if candidate.instance_id == candidate_instance_id {
+            if entry
+                .candidate
+                .as_ref()
+                .is_some_and(|c| c.instance_id == candidate_instance_id)
+            {
+                if let Some(candidate) = entry.candidate.take() {
                     if let Some(old_pipe) = entry.pipe_tx.take() {
                         if entry.instance_id > 0 {
                             entry.draining.push(DrainingEntry {
@@ -499,28 +517,65 @@ impl KernelRouter {
     }
 
     /// Aborts a candidate instance without altering the active routes.
-    pub fn abort_candidate(&self, domain_id: &str, candidate_instance_id: u64) -> bool {
-        let gate = self.domain_gate(domain_id);
-        let _domain_guard = gate.lock();
-
-        let mut domains = self.domains.write();
-        if let Some(entry) = domains.get_mut(domain_id) {
-            if let Some(candidate) = &entry.candidate {
-                if candidate.instance_id == candidate_instance_id {
-                    entry.candidate = None;
-                    return true;
+    pub fn abort_candidate(&self, domain: &str, generation: u64) -> bool {
+        let candidate = {
+            let mut domains = self.domains.write();
+            domains.get_mut(domain).and_then(|e| {
+                if e.candidate
+                    .as_ref()
+                    .is_some_and(|c| c.instance_id == generation)
+                {
+                    e.candidate.take()
+                } else {
+                    None
                 }
-            }
+            })
+        };
+        if let Some(candidate) = candidate {
+            candidate.pipe_tx.close();
+            self.remove_subscriptions(domain, generation);
+            self.ledger
+                .clear_session_dedup_for_domain(&format!("{domain}#{generation}"));
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// Removes an old instance from draining once all in-flight messages have been reaped.
     pub fn cleanup_draining_instance(&self, domain_id: &str, instance_id: u64) {
-        let mut domains = self.domains.write();
-        if let Some(entry) = domains.get_mut(domain_id) {
-            entry.draining.retain(|d| d.instance_id != instance_id);
+        let old = {
+            let mut domains = self.domains.write();
+            domains.get_mut(domain_id).and_then(|e| {
+                e.draining
+                    .iter()
+                    .position(|d| d.instance_id == instance_id)
+                    .map(|i| e.draining.remove(i))
+            })
+        };
+        if let Some(old) = old {
+            old.pipe_tx.close();
+            for (source, receipt) in self.ledger.fail_inflight_for_channel(
+                domain_id,
+                old.pipe_tx.channel_id(),
+                "retired process generation",
+            ) {
+                self.observer.emit(
+                    &source,
+                    &receipt.target,
+                    &receipt.message_id,
+                    &receipt.logical_id,
+                    receipt.seq,
+                    &receipt.message_type,
+                    receipt.status,
+                    receipt.data.clone(),
+                );
+                self.send_to_domain_pipe(&source, KernelToDomainFrame::Receipt(receipt));
+            }
         }
+        self.remove_subscriptions(domain_id, instance_id);
+        self.ledger
+            .clear_session_dedup_for_domain(&format!("{domain_id}#{instance_id}"));
     }
 
     /// Validates whether an instance_id belongs to the active, candidate, or draining generation.
@@ -649,34 +704,42 @@ impl KernelRouter {
         if !self.is_valid_instance_for_domain(authenticated_domain, instance_id) {
             return;
         }
-        self.handle_raw_pipe_line_inner(authenticated_domain, raw_line);
+        self.handle_raw_pipe_line_inner(authenticated_domain, instance_id, raw_line);
     }
 
     /// Processes a raw JSON line coming from the physical stdout pipe of `authenticated_domain`.
     pub fn handle_raw_pipe_line(&self, authenticated_domain: &str, raw_line: &str) {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
-        self.handle_raw_pipe_line_inner(authenticated_domain, raw_line);
+        self.handle_raw_pipe_line_inner(
+            authenticated_domain,
+            self.domain_instance_id(authenticated_domain).unwrap_or(0),
+            raw_line,
+        );
     }
 
-    fn handle_raw_pipe_line_inner(&self, authenticated_domain: &str, raw_line: &str) {
+    fn handle_raw_pipe_line_inner(
+        &self,
+        authenticated_domain: &str,
+        instance_id: u64,
+        raw_line: &str,
+    ) {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
             return;
         }
         match serde_json::from_str::<DomainToKernelFrame>(trimmed) {
             Ok(frame) => {
-                self.handle_frame_inner(authenticated_domain, frame);
+                self.handle_frame_inner(authenticated_domain, instance_id, frame);
             }
             Err(err) => {
-                let (_, ids, _) = self.ledger.allocate_submission(authenticated_domain, 0, 1);
-                let msg_id = ids[0].clone();
+                let msg_id = self.ledger.generate_message_id();
                 let err_data = Some(json!({
                     "error": "invalid_json_frame",
                     "reason": err.to_string(),
                 }));
                 let receipt = MessageReceipt {
-                    logical_id: self.ledger.logical_id_for_message(&msg_id),
+                    logical_id: msg_id.replacen("msg_", "logical_", 1),
                     message_id: msg_id.clone(),
                     seq: 0,
                     target: "kernel.contract".to_string(),
@@ -689,14 +752,15 @@ impl KernelRouter {
                     authenticated_domain,
                     "kernel.contract",
                     &msg_id,
-                    &self.ledger.logical_id_for_message(&msg_id),
+                    &msg_id.replacen("msg_", "logical_", 1),
                     0,
                     "MalformedFrame",
                     ContractStatus::ContractInvalid,
                     err_data,
                 );
-                self.send_to_domain_pipe(
+                self.send_to_instance(
                     authenticated_domain,
+                    Some(instance_id),
                     KernelToDomainFrame::Receipt(receipt),
                 );
             }
@@ -716,7 +780,7 @@ impl KernelRouter {
         if !self.is_valid_instance_for_domain(authenticated_domain, instance_id) {
             return None;
         }
-        self.handle_frame_inner(authenticated_domain, frame)
+        self.handle_frame_inner(authenticated_domain, instance_id, frame)
     }
 
     /// Processes a structured `DomainToKernelFrame` from `authenticated_domain`.
@@ -728,20 +792,27 @@ impl KernelRouter {
     ) -> Option<Vec<String>> {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
-        self.handle_frame_inner(authenticated_domain, frame)
+        self.handle_frame_inner(
+            authenticated_domain,
+            self.domain_instance_id(authenticated_domain).unwrap_or(0),
+            frame,
+        )
     }
 
     fn handle_frame_inner(
         &self,
         authenticated_domain: &str,
+        instance_id: u64,
         frame: DomainToKernelFrame,
     ) -> Option<Vec<String>> {
         match frame {
-            DomainToKernelFrame::Send(outbound) => {
-                Some(self.handle_outbound_message(authenticated_domain, outbound))
-            }
+            DomainToKernelFrame::Send(outbound) => Some(self.handle_outbound_message_inner(
+                authenticated_domain,
+                instance_id,
+                outbound,
+            )),
             DomainToKernelFrame::Receipt(inbound) => {
-                self.handle_inbound_receipt(authenticated_domain, inbound);
+                self.handle_inbound_receipt_inner(authenticated_domain, Some(instance_id), inbound);
                 None
             }
             DomainToKernelFrame::Log(payload) => {
@@ -766,9 +837,22 @@ impl KernelRouter {
         authenticated_domain: &str,
         outbound: OutboundMessage,
     ) -> Vec<String> {
+        self.handle_outbound_message_inner(
+            authenticated_domain,
+            self.domain_instance_id(authenticated_domain).unwrap_or(0),
+            outbound,
+        )
+    }
+    fn handle_outbound_message_inner(
+        &self,
+        authenticated_domain: &str,
+        instance_id: u64,
+        outbound: OutboundMessage,
+    ) -> Vec<String> {
         let invalid = outbound.targets.is_empty()
             || outbound.message_type.trim().is_empty()
-            || !outbound.params.is_object();
+            || !outbound.params.is_object()
+            || outbound.targets.len() > 1024;
         let mut seen = HashSet::new();
         let targets: Vec<String> = if invalid {
             vec!["kernel.contract".into()]
@@ -780,14 +864,25 @@ impl KernelRouter {
                 .cloned()
                 .collect()
         };
-        let durable=targets.iter().all(|t|crate::protocol::DeliveryPolicy::resolve(t,&outbound.message_type)==crate::protocol::DeliveryPolicy::Durable);
-        let (logical_id,ids,duplicate)=match self.ledger.try_allocate_submission(authenticated_domain,outbound.seq,targets.len(),durable) {
-            Ok(value)=>value,
-            Err(error)=>{
-                let logical=self.ledger.generate_message_id();
-                let ids:Vec<_>=targets.iter().map(|_|self.ledger.generate_message_id()).collect();
-                for (target,id) in targets.iter().zip(&ids) {
-                    self.send_to_domain_pipe(authenticated_domain,KernelToDomainFrame::Receipt(MessageReceipt {
+        let durable = targets.iter().all(|t| {
+            crate::protocol::DeliveryPolicy::resolve(t, &outbound.message_type)
+                == crate::protocol::DeliveryPolicy::Durable
+        });
+        let (logical_id, ids, duplicate) = match self.ledger.try_allocate_submission(
+            &format!("{authenticated_domain}#{instance_id}"),
+            outbound.seq,
+            targets.len(),
+            durable,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let logical = self.ledger.generate_message_id();
+                let ids: Vec<_> = targets
+                    .iter()
+                    .map(|_| self.ledger.generate_message_id())
+                    .collect();
+                for (target, id) in targets.iter().zip(&ids) {
+                    self.send_to_instance(authenticated_domain,Some(instance_id),KernelToDomainFrame::Receipt(MessageReceipt {
                         logical_id:logical.clone(),message_id:id.clone(),seq:outbound.seq,target:target.clone(),message_type:outbound.message_type.clone(),
                         status:ContractStatus::ExecutionFailed,data:Some(json!({"error":"kernel_admission_failed","reason":error.to_string(),"persisted":false})),timestamp:now_millis(),
                     }));
@@ -799,16 +894,19 @@ impl KernelRouter {
             // Snapshot and replay under the publication gate too: otherwise a
             // stale replay can arrive after a newer live receipt.
             for id in &ids {
-                let gate=self.ledger.message_gate(id);let _guard=gate.lock();
+                let gate = self.ledger.message_gate(id);
+                let _guard = gate.lock();
                 for receipt in self.ledger.receipts_for_message(id) {
-                self.send_to_domain_pipe(
-                    authenticated_domain,
-                    KernelToDomainFrame::Receipt(receipt),
-                );
-            }
+                    self.send_to_instance(
+                        authenticated_domain,
+                        Some(instance_id),
+                        KernelToDomainFrame::Receipt(receipt),
+                    );
+                }
             }
             return ids;
         }
+        self.ledger.bind_origin(&ids, instance_id);
         let ingress_ts = now_millis();
         for (target, message_id) in targets.iter().zip(&ids) {
             let kernel_msg = KernelMessage {
@@ -826,7 +924,7 @@ impl KernelRouter {
                 let data = Some(
                     json!({"error":"contract_validation_failed","reason":"targets must be non-empty, message_type must be non-empty, and params must be a JSON object"}),
                 );
-                let (record, _) = self.ledger.record_initial_target_state(
+                let (record, _) = self.ledger.record_initial_target_state_locked(
                     message_id,
                     outbound.seq,
                     authenticated_domain,
@@ -864,33 +962,49 @@ impl KernelRouter {
                 // the source gate. Lifecycle work may replace that very source domain;
                 // execute it outside the gate, without weakening pipe identity checks.
                 if let Some(supervisor) = self.supervisor() {
-                    if self.control_inflight.fetch_update(Ordering::AcqRel, Ordering::Acquire,
-                        |count| (count < 32).then_some(count + 1)).is_err() {
-                        if self.emit_kernel_internal_stages(authenticated_domain, outbound.seq, &kernel_msg) {
+                    if self
+                        .control_inflight
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                            (count < 32).then_some(count + 1)
+                        })
+                        .is_err()
+                    {
+                        if self.emit_kernel_internal_stages(
+                            authenticated_domain,
+                            outbound.seq,
+                            &kernel_msg,
+                        ) {
                             self.complete_kernel_internal_target(authenticated_domain, &kernel_msg, ContractStatus::ExecutionFailed,
                                 Some(json!({"error":"supervisor_busy","reason":"Lifecycle control capacity reached"})));
                         }
                         continue;
                     }
-                    let generation = self.domain_instance_id(authenticated_domain).unwrap_or(0);
-                    self.control_origins.lock().insert(message_id.clone(), generation);
-                    let permit = ControlPermit { count: Arc::clone(&self.control_inflight),
-                        origins: Arc::clone(&self.control_origins), message_id: message_id.clone() };
+                    let permit = ControlPermit {
+                        count: Arc::clone(&self.control_inflight),
+                    };
                     let router = Arc::clone(supervisor.router());
                     let source = authenticated_domain.to_string();
                     let seq = outbound.seq;
                     let request = kernel_msg.clone();
-                    if let Err(error) = thread::Builder::new().name("kernel-lifecycle-control".into()).spawn(move || {
-                        let _permit = permit;
-                        router.dispatch_kernel_supervisor(&source, seq, &request);
-                    }) {
-                        if self.emit_kernel_internal_stages(authenticated_domain, seq, &kernel_msg) {
+                    if let Err(error) = thread::Builder::new()
+                        .name("kernel-lifecycle-control".into())
+                        .spawn(move || {
+                            let _permit = permit;
+                            router.dispatch_kernel_supervisor(&source, seq, &request);
+                        })
+                    {
+                        if self.emit_kernel_internal_stages(authenticated_domain, seq, &kernel_msg)
+                        {
                             self.complete_kernel_internal_target(authenticated_domain, &kernel_msg, ContractStatus::ExecutionFailed,
                                 Some(json!({"error":"supervisor_worker_failed","reason":error.to_string()})));
                         }
                     }
                 } else {
-                    self.dispatch_kernel_supervisor(authenticated_domain, outbound.seq, &kernel_msg);
+                    self.dispatch_kernel_supervisor(
+                        authenticated_domain,
+                        outbound.seq,
+                        &kernel_msg,
+                    );
                 }
             } else if target == KERNEL_TELEMETRY_TARGET
                 || target == "web_ui.metric_tick"
@@ -984,7 +1098,10 @@ impl KernelRouter {
                     return;
                 };
 
-                let _ = self.storage.ensure_domain_table(source_domain);
+                if let Err(error) = self.storage.ensure_domain_table(source_domain) {
+                    self.complete_kernel_internal_target(source_domain,msg,ContractStatus::ExecutionFailed,Some(json!({"error":"domain_storage_unavailable","reason":error.to_string()})));
+                    return;
+                }
 
                 let mut registered_routes = Vec::new();
                 let mut registered_handlers = Vec::new();
@@ -993,37 +1110,43 @@ impl KernelRouter {
                     let mut domains = self.domains.write();
                     if let Some(entry) = domains.get_mut(source_domain) {
                         if let Some(cand) = &mut entry.candidate {
-                            cand.handlers.clear();
-                            for (h, desc) in &handlers {
-                                let full_route = format!("{source_domain}.{h}");
-                                cand.handlers.insert(h.clone(), desc.clone());
-                                registered_routes.push(full_route.clone());
-                                registered_handlers.push(json!({
-                                    "target": full_route,
-                                    "domain": source_domain,
-                                    "handler": h,
-                                    "description": desc,
-                                }));
+                            if Some(cand.instance_id)
+                                == self.ledger.source_instance(&msg.message_id)
+                            {
+                                cand.handlers.clear();
+                                for (h, desc) in &handlers {
+                                    let full_route = format!("{source_domain}.{h}");
+                                    cand.handlers.insert(h.clone(), desc.clone());
+                                    registered_routes.push(full_route.clone());
+                                    registered_handlers.push(json!({
+                                        "target": full_route,
+                                        "domain": source_domain,
+                                        "handler": h,
+                                        "description": desc,
+                                    }));
+                                }
+                                cand.ready = true;
+                                candidate_pipe_opt = Some(cand.pipe_tx.clone());
                             }
-                            cand.ready = true;
-                            candidate_pipe_opt = Some(cand.pipe_tx.clone());
                         }
                     }
                 }
 
                 if let Some(cand_pipe) = candidate_pipe_opt {
-                    if let ReceiptTransition::Advanced { receipt, .. } = self.ledger.advance_status(
-                        "kernel",
-                        &msg.message_id,
-                        &msg.target,
-                        ContractStatus::Completed,
-                        Some(json!({
-                            "domain": source_domain,
-                            "status": "candidate_ready",
-                            "registered_routes": registered_routes,
-                            "handlers": registered_handlers,
-                        })),
-                    ) {
+                    if let ReceiptTransition::Advanced { receipt, .. } =
+                        self.ledger.advance_status_locked(
+                            "kernel",
+                            &msg.message_id,
+                            &msg.target,
+                            ContractStatus::Completed,
+                            Some(json!({
+                                "domain": source_domain,
+                                "status": "candidate_ready",
+                                "registered_routes": registered_routes,
+                                "handlers": registered_handlers,
+                            })),
+                        )
+                    {
                         self.observer.emit(
                             source_domain,
                             &msg.target,
@@ -1034,7 +1157,11 @@ impl KernelRouter {
                             ContractStatus::Completed,
                             receipt.data.clone(),
                         );
-                        let _ = cand_pipe.send(KernelToDomainFrame::Receipt(receipt));
+                        let _ = cand_pipe; // All receipt stages use the same authenticated origin path.
+                        self.send_to_domain_pipe(
+                            source_domain,
+                            KernelToDomainFrame::Receipt(receipt),
+                        );
                     }
                     return;
                 }
@@ -1053,6 +1180,21 @@ impl KernelRouter {
                                 candidate: None,
                                 draining: Vec::new(),
                             });
+                    if self
+                        .ledger
+                        .source_instance(&msg.message_id)
+                        .is_some_and(|origin| origin != 0 && origin != entry.instance_id)
+                    {
+                        drop(routes);
+                        drop(domains);
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({"error":"stale_generation_registration"})),
+                        );
+                        return;
+                    }
                     entry.status = DomainStatus::Active;
 
                     for (h, desc) in handlers {
@@ -1087,10 +1229,16 @@ impl KernelRouter {
                     let mut domains = self.domains.write();
                     let mut routes = self.routes.write();
                     if let Some(entry) = domains.get_mut(source_domain) {
-                        for (h, _) in entry.handlers.drain() {
-                            let full_route = format!("{source_domain}.{h}");
-                            routes.remove(&full_route);
-                            removed_routes.push(full_route);
+                        if self
+                            .ledger
+                            .source_instance(&msg.message_id)
+                            .is_none_or(|origin| origin == 0 || origin == entry.instance_id)
+                        {
+                            for (h, _) in entry.handlers.drain() {
+                                let full_route = format!("{source_domain}.{h}");
+                                routes.remove(&full_route);
+                                removed_routes.push(full_route);
+                            }
                         }
                     }
                 }
@@ -1198,7 +1346,9 @@ impl KernelRouter {
                     .or_else(|| msg.params.get("domain"))
                     .and_then(Value::as_str);
                 let filter = LogSubscriptionFilter::new(level, filter_domain);
-                self.log_subscribers.write().insert(source_domain.to_string(), filter);
+                self.log_subscribers
+                    .write()
+                    .insert(self.subscription_key(source_domain, msg), filter);
 
                 self.complete_kernel_internal_target(
                     source_domain,
@@ -1211,7 +1361,9 @@ impl KernelRouter {
                 );
             }
             MSG_UNSUBSCRIBE_LOGS => {
-                self.log_subscribers.write().remove(source_domain);
+                self.log_subscribers
+                    .write()
+                    .remove(&self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1240,9 +1392,10 @@ impl KernelRouter {
                     .or_else(|| msg.params.get("source_domain"))
                     .and_then(Value::as_str);
 
-                match self.logger.query_logs_filtered(
-                    limit, level, layer, component, phase, since_ts, domain_id,
-                ) {
+                match self
+                    .logger
+                    .query_logs_filtered(limit, level, layer, component, phase, since_ts, domain_id)
+                {
                     Ok(logs) => {
                         let total = logs.len();
                         self.complete_kernel_internal_target(
@@ -1303,7 +1456,9 @@ impl KernelRouter {
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_TELEMETRY => {
-                self.telemetry_subscribers.write().insert(source_domain.to_string());
+                self.telemetry_subscribers
+                    .write()
+                    .insert(self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1315,7 +1470,9 @@ impl KernelRouter {
                 );
             }
             MSG_UNSUBSCRIBE_TELEMETRY => {
-                self.telemetry_subscribers.write().remove(source_domain);
+                self.telemetry_subscribers
+                    .write()
+                    .remove(&self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1332,21 +1489,24 @@ impl KernelRouter {
                 let subs: Vec<String> = self.telemetry_subscribers.read().iter().cloned().collect();
                 if !subs.is_empty() {
                     static COUNTER: AtomicU64 = AtomicU64::new(1);
-                    let telem_data = if msg.data.is_object() && !msg.data.as_object().unwrap().is_empty() {
-                        let mut d = msg.data.clone();
-                        if let Some(obj) = d.as_object_mut() {
-                            obj.entry("metric_name".to_string()).or_insert_with(|| json!(msg.message_type));
-                            obj.entry("source_domain".to_string()).or_insert_with(|| json!(source_domain));
-                        }
-                        d
-                    } else {
-                        json!({
-                            "metric_name": msg.message_type,
-                            "source_domain": source_domain,
-                            "params": msg.params,
-                            "data": msg.data,
-                        })
-                    };
+                    let telem_data =
+                        if msg.data.is_object() && !msg.data.as_object().unwrap().is_empty() {
+                            let mut d = msg.data.clone();
+                            if let Some(obj) = d.as_object_mut() {
+                                obj.entry("metric_name".to_string())
+                                    .or_insert_with(|| json!(msg.message_type));
+                                obj.entry("source_domain".to_string())
+                                    .or_insert_with(|| json!(source_domain));
+                            }
+                            d
+                        } else {
+                            json!({
+                                "metric_name": msg.message_type,
+                                "source_domain": source_domain,
+                                "params": msg.params,
+                                "data": msg.data,
+                            })
+                        };
                     for sub_domain in subs {
                         let now = now_millis();
                         let sub_id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1361,7 +1521,9 @@ impl KernelRouter {
                             timestamp: now,
                             data: telem_data.clone(),
                         };
-                        self.send_to_domain_pipe(&sub_domain, KernelToDomainFrame::Deliver(event_msg));
+                        if let Some(tx) = generation_pipe(&self.domains, &sub_domain) {
+                            let _ = tx.send(KernelToDomainFrame::Deliver(event_msg));
+                        }
                     }
                 }
 
@@ -1387,7 +1549,9 @@ impl KernelRouter {
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_NOTIFY => {
-                self.notify_subscribers.write().insert(source_domain.to_string());
+                self.notify_subscribers
+                    .write()
+                    .insert(self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1399,7 +1563,9 @@ impl KernelRouter {
                 );
             }
             MSG_UNSUBSCRIBE_NOTIFY => {
-                self.notify_subscribers.write().remove(source_domain);
+                self.notify_subscribers
+                    .write()
+                    .remove(&self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1459,7 +1625,9 @@ impl KernelRouter {
                             timestamp: now,
                             data: alert_data.clone(),
                         };
-                        self.send_to_domain_pipe(&sub_domain, KernelToDomainFrame::Deliver(event_msg));
+                        if let Some(tx) = generation_pipe(&self.domains, &sub_domain) {
+                            let _ = tx.send(KernelToDomainFrame::Deliver(event_msg));
+                        }
                     }
                 }
 
@@ -1495,17 +1663,22 @@ impl KernelRouter {
             .or_else(|| msg.data.get("domain_id"))
             .and_then(Value::as_str);
 
-        let domains_guard = self.domains.read();
+        let entries: Vec<_> = self
+            .domains
+            .read()
+            .iter()
+            .map(|(id, e)| (id.clone(), e.status, e.instance_id, e.handlers.clone()))
+            .collect();
         let supervisor_opt = self.supervisor();
 
         let mut domain_list = Vec::new();
-        for (d_id, entry) in domains_guard.iter() {
+        for (d_id, status, instance_id, handlers) in &entries {
             if let Some(filter) = target_domain {
                 if d_id != filter {
                     continue;
                 }
             }
-            let mut routes: Vec<String> = entry.handlers.keys().map(|h| format!("{d_id}.{h}")).collect();
+            let mut routes: Vec<String> = handlers.keys().map(|h| format!("{d_id}.{h}")).collect();
             routes.sort();
 
             let process_info = if let Some(sup) = &supervisor_opt {
@@ -1533,16 +1706,15 @@ impl KernelRouter {
 
             domain_list.push(json!({
                 "domain_id": d_id,
-                "status": format!("{:?}", entry.status),
-                "instance_id": entry.instance_id,
+                "status": format!("{:?}", status),
+                "instance_id": instance_id,
                 "routes": routes,
-                "handlers": entry.handlers,
+                "handlers": handlers,
                 "process": process_info,
             }));
         }
         // Receipt publication reads domains again. A queued registration writer
         // makes a recursive read block forever while this snapshot owns the lock.
-        drop(domains_guard);
         domain_list.sort_by(|a, b| a["domain_id"].as_str().cmp(&b["domain_id"].as_str()));
 
         let single_domain = if domain_list.len() == 1 && target_domain.is_some() {
@@ -1575,7 +1747,9 @@ impl KernelRouter {
 
         match msg.message_type.as_str() {
             MSG_SUBSCRIBE_OBSERVER => {
-                self.observer_subscribers.write().insert(source_domain.to_string());
+                self.observer_subscribers
+                    .write()
+                    .insert(self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1587,7 +1761,9 @@ impl KernelRouter {
                 );
             }
             MSG_UNSUBSCRIBE_OBSERVER => {
-                self.observer_subscribers.write().remove(source_domain);
+                self.observer_subscribers
+                    .write()
+                    .remove(&self.subscription_key(source_domain, msg));
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -1602,27 +1778,34 @@ impl KernelRouter {
                 let msg_id_filter = msg.params.get("message_id").and_then(Value::as_str);
                 let target_filter = msg.params.get("target").and_then(Value::as_str);
                 let source_filter = msg.params.get("source_domain").and_then(Value::as_str);
-                let limit = msg.params.get("limit").and_then(Value::as_u64).unwrap_or(100) as usize;
+                let limit = msg
+                    .params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(100) as usize;
 
                 let all_events = self.observer.snapshot();
-                let mut filtered: Vec<ObservationEvent> = all_events.into_iter().filter(|e| {
-                    if let Some(mid) = msg_id_filter {
-                        if e.message_id != mid {
-                            return false;
+                let mut filtered: Vec<ObservationEvent> = all_events
+                    .into_iter()
+                    .filter(|e| {
+                        if let Some(mid) = msg_id_filter {
+                            if e.message_id != mid {
+                                return false;
+                            }
                         }
-                    }
-                    if let Some(tf) = target_filter {
-                        if e.target != tf {
-                            return false;
+                        if let Some(tf) = target_filter {
+                            if e.target != tf {
+                                return false;
+                            }
                         }
-                    }
-                    if let Some(sf) = source_filter {
-                        if e.source_domain != sf {
-                            return false;
+                        if let Some(sf) = source_filter {
+                            if e.source_domain != sf {
+                                return false;
+                            }
                         }
-                    }
-                    true
-                }).collect();
+                        true
+                    })
+                    .collect();
 
                 if filtered.len() > limit {
                     filtered = filtered.split_off(filtered.len() - limit);
@@ -1688,7 +1871,8 @@ impl KernelRouter {
 
                 let spec_val = msg.params.get("spec").or_else(|| msg.data.get("spec"));
                 let res = if let Some(sv) = spec_val {
-                    match serde_json::from_value::<crate::supervisor::DomainProcessSpec>(sv.clone()) {
+                    match serde_json::from_value::<crate::supervisor::DomainProcessSpec>(sv.clone())
+                    {
                         Ok(mut spec) => {
                             spec.domain_id = domain_id.to_string();
                             sup.spawn_process_domain(spec)
@@ -1713,7 +1897,9 @@ impl KernelRouter {
                             source_domain,
                             msg,
                             ContractStatus::Completed,
-                            Some(json!({ "domain_id": domain_id, "pid": pid, "status": "started" })),
+                            Some(
+                                json!({ "domain_id": domain_id, "pid": pid, "status": "started" }),
+                            ),
                         );
                     }
                     Err(e) => {
@@ -1795,7 +1981,8 @@ impl KernelRouter {
 
                 let spec_val = msg.params.get("spec").or_else(|| msg.data.get("spec"));
                 let new_spec = if let Some(sv) = spec_val {
-                    match serde_json::from_value::<crate::supervisor::DomainProcessSpec>(sv.clone()) {
+                    match serde_json::from_value::<crate::supervisor::DomainProcessSpec>(sv.clone())
+                    {
                         Ok(mut spec) => {
                             spec.domain_id = domain_id.to_string();
                             Some(spec)
@@ -1814,11 +2001,15 @@ impl KernelRouter {
                     None
                 };
 
-                let timeout_ms = msg.params.get("timeout_ms")
+                let timeout_ms = msg
+                    .params
+                    .get("timeout_ms")
                     .or_else(|| msg.data.get("timeout_ms"))
                     .and_then(Value::as_u64)
                     .unwrap_or(5000);
-                let probe_handler = msg.params.get("probe_handler")
+                let probe_handler = msg
+                    .params
+                    .get("probe_handler")
                     .or_else(|| msg.data.get("probe_handler"))
                     .and_then(Value::as_str);
 
@@ -1872,8 +2063,15 @@ impl KernelRouter {
     }
 
     /// Emits `Sent -> Received -> Started` receipts for kernel built-in targets (`kernel.registry`, `kernel.storage`, `kernel.logger`, etc.).
-    fn emit_kernel_internal_stages(&self, source_domain: &str, seq: u64, msg: &KernelMessage) -> bool {
-        let (sent_rec, created) = self.ledger.record_initial_target_state(
+    fn emit_kernel_internal_stages(
+        &self,
+        source_domain: &str,
+        seq: u64,
+        msg: &KernelMessage,
+    ) -> bool {
+        let gate = self.ledger.message_gate(&msg.message_id);
+        let _publication = gate.lock();
+        let (sent_rec, created) = self.ledger.record_initial_target_state_locked(
             &msg.message_id,
             seq,
             source_domain,
@@ -1883,7 +2081,10 @@ impl KernelRouter {
             None,
         );
         if !created {
-            self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(sent_rec.to_receipt()));
+            self.send_to_domain_pipe(
+                source_domain,
+                KernelToDomainFrame::Receipt(sent_rec.to_receipt()),
+            );
             return false;
         }
         self.observer.emit(
@@ -1902,10 +2103,13 @@ impl KernelRouter {
         );
 
         for stage in [ContractStatus::Received, ContractStatus::Started] {
-            if let ReceiptTransition::Advanced { receipt, .. } =
-                self.ledger
-                    .advance_status("kernel", &msg.message_id, &msg.target, stage, None)
-            {
+            if let ReceiptTransition::Advanced { receipt, .. } = self.ledger.advance_status_locked(
+                "kernel",
+                &msg.message_id,
+                &msg.target,
+                stage,
+                None,
+            ) {
                 self.observer.emit(
                     source_domain,
                     &msg.target,
@@ -1933,7 +2137,9 @@ impl KernelRouter {
         final_status: ContractStatus,
         data: Option<Value>,
     ) {
-        if let ReceiptTransition::Advanced { receipt, .. } = self.ledger.advance_status(
+        let gate = self.ledger.message_gate(&msg.message_id);
+        let _publication = gate.lock();
+        if let ReceiptTransition::Advanced { receipt, .. } = self.ledger.advance_status_locked(
             "kernel",
             &msg.message_id,
             &msg.target,
@@ -1941,15 +2147,21 @@ impl KernelRouter {
             data.clone(),
         ) {
             // Query payloads belong to the requester, not a second full result cache.
-            let observed_data = if crate::protocol::DeliveryPolicy::is_infrastructure_query(&msg.target, &msg.message_type)
-                && final_status == ContractStatus::Completed
+            let observed_data = if crate::protocol::DeliveryPolicy::is_infrastructure_query(
+                &msg.target,
+                &msg.message_type,
+            ) && final_status == ContractStatus::Completed
             {
                 data.as_ref().map(|value| {
-                    let count = value.get("count").and_then(Value::as_u64).unwrap_or_else(|| {
-                        ["items", "events", "domains", "handlers", "logs", "progress"]
-                            .iter().find_map(|key| value.get(key).and_then(Value::as_array))
-                            .map_or(0, |items| items.len() as u64)
-                    });
+                    let count = value
+                        .get("count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_else(|| {
+                            ["items", "events", "domains", "handlers", "logs", "progress"]
+                                .iter()
+                                .find_map(|key| value.get(key).and_then(Value::as_array))
+                                .map_or(0, |items| items.len() as u64)
+                        });
                     json!({ "count": count })
                 })
             } else {
@@ -1963,7 +2175,18 @@ impl KernelRouter {
                 receipt.seq,
                 &msg.message_type,
                 receipt.status,
-                if receipt.status == final_status && receipt.data.as_ref().and_then(|v| v.get("error")).and_then(Value::as_str) != Some("kernel_persistence_failed") { observed_data } else { receipt.data.clone() },
+                if receipt.status == final_status
+                    && receipt
+                        .data
+                        .as_ref()
+                        .and_then(|v| v.get("error"))
+                        .and_then(Value::as_str)
+                        != Some("kernel_persistence_failed")
+                {
+                    observed_data
+                } else {
+                    receipt.data.clone()
+                },
             );
             self.send_to_domain_pipe(source_domain, KernelToDomainFrame::Receipt(receipt));
         }
@@ -1972,7 +2195,8 @@ impl KernelRouter {
     /// Validates and routes a message targeting a business domain handler (`"<domain>.<handler>"`).
     /// If the target does not exist or is not Active, does NOT send the message and immediately returns `TargetInvalid`.
     fn dispatch_domain_target(&self, source_domain: &str, seq: u64, msg: KernelMessage) {
-        let gate=self.ledger.message_gate(&msg.message_id);let publication=gate.lock();
+        let gate = self.ledger.message_gate(&msg.message_id);
+        let publication = gate.lock();
         let target = msg.target.clone();
 
         // Check route table and target domain active pipe along with its generation `instance_id`.
@@ -1996,7 +2220,7 @@ impl KernelRouter {
                 "error": "target_not_found_or_inactive",
                 "target": target,
             }));
-            let (rec, created) = self.ledger.record_initial_target_state(
+            let (rec, created) = self.ledger.record_initial_target_state_locked(
                 &msg.message_id,
                 seq,
                 source_domain,
@@ -2025,18 +2249,58 @@ impl KernelRouter {
         };
 
         // Reliable admission commits the record and complete envelope in the same transaction.
-        let (sent_rec,created)=match target_pipe.accept(&self.ledger,&msg,seq) {
-            Ok(result)=>result,
-            Err(error)=>{
+        let (sent_rec, created) = match target_pipe.accept(&self.ledger, &msg, seq) {
+            Ok(result) => result,
+            Err(error) => {
+                let (failed, _) = self.ledger.record_initial_target_state_locked(
+                    &msg.message_id,
+                    seq,
+                    source_domain,
+                    &target,
+                    &msg.message_type,
+                    ContractStatus::ExecutionFailed,
+                    Some(json!({"error":"target_output_unavailable","reason":error.0})),
+                );
+                self.observer.emit(
+                    source_domain,
+                    &target,
+                    &msg.message_id,
+                    &msg.logical_id,
+                    seq,
+                    &msg.message_type,
+                    failed.status,
+                    failed.data.clone(),
+                );
+                self.send_to_domain_pipe(
+                    source_domain,
+                    KernelToDomainFrame::Receipt(failed.to_receipt()),
+                );
                 drop(publication);
-                if let Some((domain,_))=parse_target_address(&target) {
-                    self.mark_domain_faulted_for_instance(domain,Some(target_instance_id),&format!("domain output rejected: {}",error.0));
+                if let Some((domain, _)) = parse_target_address(&target) {
+                    self.mark_domain_faulted_for_instance(
+                        domain,
+                        Some(target_instance_id),
+                        &format!("domain output rejected: {}", error.0),
+                    );
                 }
                 return;
             }
         };
         if !created {
-            self.send_to_domain_pipe(source_domain,KernelToDomainFrame::Receipt(sent_rec.to_receipt()));
+            self.observer.emit(
+                source_domain,
+                &target,
+                &msg.message_id,
+                &msg.logical_id,
+                seq,
+                &msg.message_type,
+                sent_rec.status,
+                sent_rec.data.clone(),
+            );
+            self.send_to_domain_pipe(
+                source_domain,
+                KernelToDomainFrame::Receipt(sent_rec.to_receipt()),
+            );
             return;
         }
 
@@ -2059,13 +2323,33 @@ impl KernelRouter {
 
     /// Processes an inbound receipt (`Received`, `Started`, `Completed`, `ExecutionFailed`) reported by `reporting_domain`.
     pub fn handle_inbound_receipt(&self, reporting_domain: &str, inbound: InboundReceipt) {
+        self.handle_inbound_receipt_inner(reporting_domain, None, inbound)
+    }
+    fn handle_inbound_receipt_inner(
+        &self,
+        reporting_domain: &str,
+        instance: Option<u64>,
+        inbound: InboundReceipt,
+    ) {
+        if let Some(instance) = instance {
+            let Some(pipe) = self.pipe_for_instance(reporting_domain, instance) else {
+                return;
+            };
+            if !self
+                .ledger
+                .accepts_channel(&inbound.message_id, pipe.channel_id())
+            {
+                return;
+            }
+        }
         if !inbound.status.is_valid_inbound_receipt() {
             return;
         }
 
-        let gate=self.ledger.message_gate(&inbound.message_id);let _publication=gate.lock();
+        let gate = self.ledger.message_gate(&inbound.message_id);
+        let _publication = gate.lock();
 
-        match self.ledger.advance_status(
+        match self.ledger.advance_status_locked(
             reporting_domain,
             &inbound.message_id,
             &inbound.target,
@@ -2111,7 +2395,54 @@ impl KernelRouter {
         expected_instance_id: Option<u64>,
         reason: &str,
     ) -> bool {
+        if let Some(expected) = expected_instance_id {
+            let inactive = {
+                let mut domains = self.domains.write();
+                domains.get_mut(domain_id).and_then(|entry| {
+                    if entry.instance_id == expected {
+                        return None;
+                    }
+                    if entry
+                        .candidate
+                        .as_ref()
+                        .is_some_and(|c| c.instance_id == expected)
+                    {
+                        entry.candidate.take().map(|c| c.pipe_tx)
+                    } else {
+                        entry
+                            .draining
+                            .iter()
+                            .position(|d| d.instance_id == expected)
+                            .map(|i| entry.draining.remove(i).pipe_tx)
+                    }
+                })
+            };
+            if let Some(pipe) = inactive {
+                pipe.close();
+                self.remove_subscriptions(domain_id, expected);
+                for (source, receipt) in
+                    self.ledger
+                        .fail_inflight_for_channel(domain_id, pipe.channel_id(), reason)
+                {
+                    self.observer.emit(
+                        &source,
+                        &receipt.target,
+                        &receipt.message_id,
+                        &receipt.logical_id,
+                        receipt.seq,
+                        &receipt.message_type,
+                        receipt.status,
+                        receipt.data.clone(),
+                    );
+                    self.send_to_domain_pipe(&source, KernelToDomainFrame::Receipt(receipt));
+                }
+                self.ledger
+                    .clear_session_dedup_for_domain(&format!("{domain_id}#{expected}"));
+                return true;
+            }
+        }
         let old_pipe;
+        let generation;
         {
             let mut domains = self.domains.write();
             let mut routes = self.routes.write();
@@ -2124,6 +2455,11 @@ impl KernelRouter {
                 // Stale fault notification from an older process instance; ignore safely.
                 return false;
             }
+            generation = entry.instance_id;
+            eprintln!(
+                "kernel domain {domain_id} generation {} disconnected: {reason}",
+                entry.instance_id
+            );
             entry.status = DomainStatus::Faulted;
             old_pipe = entry.pipe_tx.take();
 
@@ -2133,13 +2469,15 @@ impl KernelRouter {
             entry.handlers.clear();
         }
 
-        self.log_subscribers.write().remove(domain_id);
-        self.telemetry_subscribers.write().remove(domain_id);
-        self.notify_subscribers.write().remove(domain_id);
-        self.observer_subscribers.write().remove(domain_id);
+        self.remove_subscriptions(domain_id, generation);
 
-        let failed_deliveries = self.ledger.fail_inflight_for_domain(domain_id, reason);
-        if let Some(tx)=old_pipe { tx.close(); }
+        let failed_deliveries = if let Some(tx) = old_pipe {
+            tx.close();
+            self.ledger
+                .fail_inflight_for_channel(domain_id, tx.channel_id(), reason)
+        } else {
+            Vec::new()
+        };
         for (source_domain, receipt) in failed_deliveries {
             self.observer.emit(
                 &source_domain,
@@ -2153,28 +2491,86 @@ impl KernelRouter {
             );
             self.send_to_domain_pipe(&source_domain, KernelToDomainFrame::Receipt(receipt));
         }
+        self.ledger
+            .clear_session_dedup_for_domain(&format!("{domain_id}#{generation}"));
         true
     }
 
-    pub(crate) fn failed_output_queues(&self) -> Vec<(String,u64,String)> {
-        self.domains.read().iter().filter_map(|(id,entry)|entry.pipe_tx.as_ref().and_then(|tx|tx.failure()).map(|reason|(id.clone(),entry.instance_id,reason))).collect()
-    }
-
-    fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {
-        let expected_generation = match &frame {
-            KernelToDomainFrame::Receipt(receipt) => self.control_origins.lock().get(&receipt.message_id).copied(),
-            _ => None,
-        };
-        let pipe_opt = self
+    pub(crate) fn failed_output_queues(&self) -> Vec<(String, u64, String)> {
+        let pipes: Vec<_> = self
             .domains
             .read()
-            .get(domain_id)
-            .and_then(|d| {
-                if expected_generation.is_some_and(|generation| generation != d.instance_id) { None }
-                else { d.pipe_tx.clone() }
-            });
-        if let Some(tx) = pipe_opt {
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .pipe_tx
+                    .as_ref()
+                    .map(|tx| (id.clone(), entry.instance_id, tx.clone()))
+            })
+            .collect();
+        pipes
+            .into_iter()
+            .filter_map(|(id, generation, tx)| tx.failure().map(|reason| (id, generation, reason)))
+            .collect()
+    }
+
+    fn subscription_key(&self, domain: &str, msg: &KernelMessage) -> String {
+        format!(
+            "{domain}#{}",
+            self.ledger.source_instance(&msg.message_id).unwrap_or(0)
+        )
+    }
+    fn remove_subscriptions(&self, domain: &str, generation: u64) {
+        let key = format!("{domain}#{generation}");
+        self.log_subscribers.write().remove(&key);
+        self.telemetry_subscribers.write().remove(&key);
+        self.notify_subscribers.write().remove(&key);
+        self.observer_subscribers.write().remove(&key);
+    }
+    fn pipe_for_instance(&self, domain: &str, instance: u64) -> Option<PipeSender> {
+        self.domains.read().get(domain).and_then(|entry| {
+            if entry.instance_id == instance {
+                entry.pipe_tx.clone()
+            } else if let Some(candidate) = entry
+                .candidate
+                .as_ref()
+                .filter(|c| c.instance_id == instance)
+            {
+                Some(candidate.pipe_tx.clone())
+            } else {
+                entry
+                    .draining
+                    .iter()
+                    .find(|d| d.instance_id == instance)
+                    .map(|d| d.pipe_tx.clone())
+            }
+        })
+    }
+    fn send_to_instance(&self, domain: &str, instance: Option<u64>, frame: KernelToDomainFrame) {
+        let pipe = match instance {
+            Some(id) if id > 0 => self.pipe_for_instance(domain, id),
+            _ => self
+                .domains
+                .read()
+                .get(domain)
+                .and_then(|e| e.pipe_tx.clone()),
+        };
+        if let Some(tx) = pipe {
             let _ = tx.send(frame);
+        }
+    }
+    fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {
+        let origin = match &frame {
+            KernelToDomainFrame::Receipt(r) => self.ledger.source_instance(&r.message_id),
+            _ => None,
+        };
+        let terminal = match &frame {
+            KernelToDomainFrame::Receipt(r) if r.status.is_terminal() => Some(r.clone()),
+            _ => None,
+        };
+        self.send_to_instance(domain_id, origin, frame);
+        if let Some(receipt) = terminal {
+            self.ledger.finish_publication(&receipt);
         }
     }
 }
@@ -2199,18 +2595,163 @@ mod control_generation_tests {
     fn old_control_completion_cannot_enter_replacement_pipe() {
         let kernel = crate::AtelierKernel::new_in_memory().unwrap();
         let old = kernel.attach_domain("controller");
-        kernel.router().control_origins.lock().insert("old-control".into(), old.instance_id());
+        let (_, ids, _) = kernel
+            .ledger()
+            .allocate_submission("controller-session", 2, 1);
+        let old_id = ids[0].clone();
+        kernel.ledger().bind_origin(&ids, old.instance_id());
         let replacement = kernel.attach_domain("controller");
         let receipt = MessageReceipt {
-            logical_id: "logical-old".into(), message_id: "old-control".into(), seq: 2,
-            target: KERNEL_SUPERVISOR_TARGET.into(), message_type: MSG_RESTART_DOMAIN.into(),
-            status: ContractStatus::Completed, data: Some(json!({"status":"restarted"})), timestamp: now_millis(),
+            logical_id: "logical-old".into(),
+            message_id: old_id,
+            seq: 2,
+            target: KERNEL_SUPERVISOR_TARGET.into(),
+            message_type: MSG_RESTART_DOMAIN.into(),
+            status: ContractStatus::Completed,
+            data: Some(json!({"status":"restarted"})),
+            timestamp: now_millis(),
         };
-        kernel.router().send_to_domain_pipe("controller", KernelToDomainFrame::Receipt(receipt.clone()));
+        kernel
+            .router()
+            .send_to_domain_pipe("controller", KernelToDomainFrame::Receipt(receipt.clone()));
         assert!(replacement.drain_frames().is_empty());
         let mut current = receipt;
         current.message_id = "current-control".into();
-        kernel.router().send_to_domain_pipe("controller", KernelToDomainFrame::Receipt(current));
+        kernel
+            .router()
+            .send_to_domain_pipe("controller", KernelToDomainFrame::Receipt(current));
         assert_eq!(replacement.drain_frames().len(), 1);
+    }
+}
+#[cfg(test)]
+mod generation_acceptance_tests {
+    use super::*;
+    fn register(router: &KernelRouter, generation: u64, name: &str) -> Vec<String> {
+        router
+            .handle_frame_for_instance(
+                "worker",
+                generation,
+                DomainToKernelFrame::Send(OutboundMessage {
+                    seq: 1,
+                    targets: vec![KERNEL_REGISTRY_TARGET.into()],
+                    message_type: MSG_REGISTER_HANDLERS.into(),
+                    params: json!({"handlers":[name]}),
+                    data: json!({}),
+                }),
+            )
+            .unwrap()
+    }
+    #[test]
+    fn candidate_sequence_registration_and_receipts_are_isolated_from_old_generation() {
+        let k = crate::AtelierKernel::new_in_memory().unwrap();
+        let old = k.attach_domain("worker");
+        old.register_handlers(&["old"]);
+        old.drain_frames();
+        let sender = k.attach_domain("sender");
+        let pending = sender.send_one(
+            vec!["worker.old".into()],
+            "Durable",
+            json!({}),
+            json!({"owner":"old"}),
+        );
+        old.drain_frames();
+        sender.drain_frames();
+        let (tx, rx) = crate::outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
+        let candidate = k.router().attach_candidate_pipe("worker", tx);
+        let ids = register(k.router(), candidate, "new");
+        assert!(k.router().is_candidate_ready("worker", candidate));
+        assert_eq!(k.router().active_routes(), vec!["worker.old"]);
+        let mut candidate_completed = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let KernelToDomainFrame::Receipt(r) = frame {
+                if r.message_id == ids[0] && r.status == ContractStatus::Completed {
+                    candidate_completed = true;
+                }
+            }
+            rx.acknowledge().unwrap();
+        }
+        assert!(
+            candidate_completed,
+            "candidate registration collided with old seq=1"
+        );
+        assert!(
+            old.drain_frames().is_empty(),
+            "candidate reply leaked to old pipe"
+        );
+        assert!(k.router().commit_candidate("worker", candidate));
+        let current = sender.send_one(
+            vec!["worker.new".into()],
+            "Durable",
+            json!({}),
+            json!({"owner":"new"}),
+        );
+        sender.drain_frames();
+        old.report_receipt(
+            &current,
+            "worker.new",
+            ContractStatus::Completed,
+            Some(json!({"wrong":true})),
+        );
+        assert_eq!(
+            k.ledger()
+                .get_record(&current, "worker.new")
+                .unwrap()
+                .status,
+            ContractStatus::Sent,
+            "draining old generation claimed new generation's message"
+        );
+        k.router()
+            .cleanup_draining_instance("worker", old.instance_id());
+        assert_eq!(
+            k.ledger()
+                .get_record(&pending, "worker.old")
+                .unwrap()
+                .status,
+            ContractStatus::ExecutionFailed
+        );
+        assert_eq!(
+            k.ledger()
+                .get_record(&current, "worker.new")
+                .unwrap()
+                .status,
+            ContractStatus::Sent,
+            "old generation cleanup failed new work"
+        );
+        k.router().handle_frame_for_instance(
+            "worker",
+            candidate,
+            DomainToKernelFrame::Receipt(InboundReceipt {
+                message_id: current.clone(),
+                target: "worker.new".into(),
+                status: ContractStatus::Completed,
+                data: Some(json!({"right":true})),
+            }),
+        );
+        assert_eq!(
+            k.ledger().get_record(&current, "worker.new").unwrap().data,
+            Some(json!({"right":true}))
+        );
+    }
+    #[test]
+    fn candidate_eof_removes_candidate_readiness_without_revoking_active_routes() {
+        let k = crate::AtelierKernel::new_in_memory().unwrap();
+        let old = k.attach_domain("worker");
+        old.register_handlers(&["old"]);
+        old.drain_frames();
+        let (tx, _rx) = crate::outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
+        let candidate = k.router().attach_candidate_pipe("worker", tx);
+        register(k.router(), candidate, "new");
+        assert!(k.router().is_candidate_ready("worker", candidate));
+        assert!(k.router().mark_domain_faulted_for_instance(
+            "worker",
+            Some(candidate),
+            "candidate IPC EOF"
+        ));
+        assert!(!k.router().is_candidate_ready("worker", candidate));
+        assert_eq!(
+            k.router().domain_status("worker"),
+            Some(DomainStatus::Active)
+        );
+        assert_eq!(k.router().active_routes(), vec!["worker.old"]);
     }
 }

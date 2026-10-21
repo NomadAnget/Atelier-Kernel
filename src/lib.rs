@@ -1,8 +1,8 @@
 pub mod discipline;
 pub mod frontend;
 pub mod ledger;
-pub mod logging;
 mod log_spool;
+pub mod logging;
 pub mod observer;
 pub mod outbox;
 pub mod protocol;
@@ -19,21 +19,20 @@ pub use frontend::InteractiveFrontendDomain;
 pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
 pub use logging::{KernelLogHub, LogFramePayload, LogRecord, LogStore};
 pub use observer::KernelObserver;
-pub use web_frontend::WebFrontendDomain;
 pub use protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
     InboundReceipt, KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET,
-    KERNEL_REGISTRY_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET,
-    KERNEL_SUPERVISOR_TARGET, KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame,
-    MSG_DELIVERY_DURABLE, MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_QUERY_DOMAIN_ASSEMBLY,
-    MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
+    KERNEL_REGISTRY_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET, KERNEL_SUPERVISOR_TARGET,
+    KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_DELIVERY_DURABLE,
+    MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_QUERY_DOMAIN_ASSEMBLY, MSG_QUERY_HANDLERS,
+    MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
     MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
-    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_OBSERVER, MSG_UNSUBSCRIBE_TELEMETRY,
-    MSG_UPDATE_DOMAIN, MessageReceipt, ObservationEvent, OutboundMessage,
+    MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_OBSERVER, MSG_UNSUBSCRIBE_TELEMETRY, MSG_UPDATE_DOMAIN,
+    MessageReceipt, ObservationEvent, OutboundMessage,
 };
 pub use router::{CandidateEntry, DrainingEntry, KernelRouter};
 pub use storage::{DomainStorageEngine, StorageError, StoredRecord};
@@ -41,6 +40,7 @@ pub use supervisor::{
     DomainPipeClient, DomainProcessSpec, DomainSupervisor, DomainUpdateResult, KernelBootConfig,
     SupervisorError,
 };
+pub use web_frontend::WebFrontendDomain;
 
 /// Top-level Atelier Kernel host combining:
 /// 1. Domain Supervisor (OS child process `Stdio` pipe lifecycle & physical identity binding)

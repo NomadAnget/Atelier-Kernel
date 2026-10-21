@@ -278,16 +278,10 @@ function enhance(Base,RequestError,ExecutionFailed) {
       }catch(error){this._diagnostic(`SDK lossy listener error: ${error}`);}
     }
     _invokeEventListener(callback,payload){
-      try{
-        const res=callback(payload);
-        if(res&&typeof res.then==='function'){
-          res.catch(error=>this._diagnostic(`SDK system event listener error: ${error}`));
-        }
-      }catch(error){
-        this._diagnostic(`SDK system event listener error: ${error}`);
-      }
+      this._invokeLossyEventListener(callback,payload,'_systemEventBusy');
     }
     _dispatch(frame){
+      if(this._active.size>=1024){this.reportReceipt(frame.message_id,frame.target,'execution_failed',{error:'sdk_execution_capacity_exhausted',reason:'domain execution capacity reached'});return;}
       const controller=new AbortController();
       const task=Promise.resolve().then(()=>this._execute(frame,controller.signal));
       this._active.set(task,{frame,controller});

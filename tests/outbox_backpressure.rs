@@ -232,7 +232,7 @@ fn actual_host_restart_preserves_failure_record_without_replaying_old_generation
     assert_eq!(record.status, ContractStatus::ExecutionFailed);
     assert_eq!(
         record.data.unwrap()["error"],
-        "kernel_restarted_with_pending_output"
+        "kernel_restarted_with_inflight_delivery"
     );
     let worker = k.attach_domain("worker");
     worker.register_handlers(&["run"]);

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use atelier_kernel::{
-    AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KernelToDomainFrame,
-    KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_TELEMETRY_TARGET, MSG_DELIVERY_DURABLE,
+    AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KERNEL_LOGGER_TARGET,
+    KERNEL_NOTIFY_TARGET, KERNEL_TELEMETRY_TARGET, KernelToDomainFrame, MSG_DELIVERY_DURABLE,
     MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_QUERY_LOGS, MSG_QUERY_PROGRESS,
     MSG_STORAGE_DELETE, MSG_STORAGE_QUERY, check_constitution,
 };
@@ -1180,6 +1180,7 @@ fn test_concurrent_multidomain_stress() {
         let _ = client.drain_frames();
 
         let expected_deliveries = (num_senders * msgs_per_sender) / num_workers;
+        let probe=Arc::clone(&kernel);
         worker_handles.push(std::thread::spawn(move || {
             let mut handled = 0usize;
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1213,10 +1214,14 @@ fn test_concurrent_multidomain_stress() {
                     }
                 }
             }
-            assert_eq!(
-                handled, expected_deliveries,
-                "Worker {w_name} did not receive all expected deliveries"
-            );
+            if handled!=expected_deliveries {
+                let history=probe.observer().snapshot();
+                let events:Vec<_>=history.iter().filter(|e|e.target==format!("{w_name}.process")).collect();
+                let done:std::collections::HashSet<_>=events.iter().filter(|e|e.status.is_terminal()).map(|e|&e.message_id).collect();
+                eprintln!("worker timeout: sent={} pending={:?}",events.iter().filter(|e|e.status==ContractStatus::Sent).count(),events.iter().filter(|e|!done.contains(&e.message_id)).collect::<Vec<_>>());
+                eprintln!("failure events: {:?}",history.iter().filter(|e|e.status==ContractStatus::ExecutionFailed || e.status==ContractStatus::TargetInvalid).collect::<Vec<_>>());
+            }
+            assert_eq!(handled,expected_deliveries,"Worker {w_name} did not receive all expected deliveries");
         }));
     }
 
@@ -1857,8 +1862,12 @@ fn test_kernel_built_in_processors_logger_telemetry_notify() {
     let client = kernel.attach_domain("worker_domain");
 
     // 1. Emit some logs and active progress
-    kernel.logger().info("CORE", "system", "Kernel initial startup completed");
-    kernel.logger().warning("ORDER", "order_svc", "Order rate approaching soft limit");
+    kernel
+        .logger()
+        .info("CORE", "system", "Kernel initial startup completed");
+    kernel
+        .logger()
+        .warning("ORDER", "order_svc", "Order rate approaching soft limit");
 
     use atelier_kernel::LogRecord;
     kernel.logger().reinject(LogRecord {
@@ -2050,8 +2059,8 @@ fn test_kernel_built_in_processors_logger_telemetry_notify() {
 #[test]
 fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
     use atelier_kernel::{
-        MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_TELEMETRY,
-        MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_TELEMETRY_EVENT,
+        MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_TELEMETRY, MSG_SYSTEM_LOG_EVENT,
+        MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_TELEMETRY_EVENT,
     };
 
     let kernel = AtelierKernel::new_in_memory().unwrap();
@@ -2085,8 +2094,12 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
     // 3. Emit logs: DEBUG, INFO (should be filtered out), WARNING, ERROR (should be received)
     kernel.logger().debug("CORE", "sys", "This is debug text");
     kernel.logger().info("CORE", "sys", "This is info text");
-    kernel.logger().warning("ORDER", "order_svc", "Low stock warning");
-    kernel.logger().error("PAYMENT", "pay_svc", "Payment gateway timeout");
+    kernel
+        .logger()
+        .warning("ORDER", "order_svc", "Low stock warning");
+    kernel
+        .logger()
+        .error("PAYMENT", "pay_svc", "Payment gateway timeout");
 
     // Poll up to 600ms for log event frames
     let start_wait = std::time::Instant::now();
@@ -2106,7 +2119,11 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    assert_eq!(received_logs.len(), 2, "Must receive exactly 2 logs matching level >= WARNING");
+    assert_eq!(
+        received_logs.len(),
+        2,
+        "Must receive exactly 2 logs matching level >= WARNING"
+    );
     let messages: Vec<&str> = received_logs
         .iter()
         .filter_map(|m| m.data.get("message").and_then(|v| v.as_str()))
@@ -2141,7 +2158,9 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
         let frames = sub_client.drain_frames();
         for f in frames {
             if let KernelToDomainFrame::Deliver(m) = f {
-                if m.target == KERNEL_TELEMETRY_TARGET && m.message_type == MSG_SYSTEM_TELEMETRY_EVENT {
+                if m.target == KERNEL_TELEMETRY_TARGET
+                    && m.message_type == MSG_SYSTEM_TELEMETRY_EVENT
+                {
                     received_telem.push(m);
                 }
             }
@@ -2151,7 +2170,11 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(received_telem.len(), 1, "Subscriber must receive the emitted telemetry event");
+    assert_eq!(
+        received_telem.len(),
+        1,
+        "Subscriber must receive the emitted telemetry event"
+    );
     assert_eq!(received_telem[0].source_domain, "sensor_domain");
     assert_eq!(
         received_telem[0].data.get("value").and_then(|v| v.as_f64()),
@@ -2194,18 +2217,30 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(received_notify.len(), 1, "Subscriber must receive the notify alert");
     assert_eq!(
-        received_notify[0].data.get("severity").and_then(|v| v.as_str()),
+        received_notify.len(),
+        1,
+        "Subscriber must receive the notify alert"
+    );
+    assert_eq!(
+        received_notify[0]
+            .data
+            .get("severity")
+            .and_then(|v| v.as_str()),
         Some("error")
     );
     assert_eq!(
-        received_notify[0].data.get("message").and_then(|v| v.as_str()),
+        received_notify[0]
+            .data
+            .get("message")
+            .and_then(|v| v.as_str()),
         Some("High disk pressure")
     );
 
     // 7. Auto-cleanup on domain fault / termination
-    kernel.router().mark_domain_faulted("subscriber_domain", "process terminated");
+    kernel
+        .router()
+        .mark_domain_faulted("subscriber_domain", "process terminated");
     assert_eq!(
         kernel.router().log_subscribers_count(),
         0,
@@ -2243,9 +2278,8 @@ fn test_kernel_processor_event_subscriptions_and_auto_cleanup() {
 fn test_kernel_runtime_observer_supervisor_smooth_update_and_rollback() {
     use atelier_kernel::{
         KERNEL_OBSERVER_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_SUPERVISOR_TARGET,
-        MSG_QUERY_OBSERVER, MSG_QUERY_RUNTIME, MSG_STOP_DOMAIN,
-        MSG_SUBSCRIBE_OBSERVER, MSG_SYSTEM_OBSERVER_EVENT, MSG_UNSUBSCRIBE_OBSERVER,
-        MSG_UPDATE_DOMAIN,
+        MSG_QUERY_OBSERVER, MSG_QUERY_RUNTIME, MSG_STOP_DOMAIN, MSG_SUBSCRIBE_OBSERVER,
+        MSG_SYSTEM_OBSERVER_EVENT, MSG_UNSUBSCRIBE_OBSERVER, MSG_UPDATE_DOMAIN,
     };
 
     let kernel = AtelierKernel::new_in_memory().unwrap();
@@ -2303,12 +2337,17 @@ for line in ipc_in:
         json!({}),
     );
     let q_frames = client.drain_frames();
-    let q_completed = q_frames.iter().find_map(|f| match f {
-        KernelToDomainFrame::Receipt(r) if r.message_id == q_ids[0] && r.status == ContractStatus::Completed => {
-            r.data.clone()
-        }
-        _ => None,
-    }).expect("Query runtime should complete");
+    let q_completed = q_frames
+        .iter()
+        .find_map(|f| match f {
+            KernelToDomainFrame::Receipt(r)
+                if r.message_id == q_ids[0] && r.status == ContractStatus::Completed =>
+            {
+                r.data.clone()
+            }
+            _ => None,
+        })
+        .expect("Query runtime should complete");
 
     let dom_info = q_completed.get("domain").expect("domain info present");
     assert_eq!(dom_info["domain_id"], "worker_roll");
@@ -2327,7 +2366,8 @@ for line in ipc_in:
     );
     let sub_obs_frames = client.drain_frames();
     assert!(sub_obs_frames.iter().any(|f| match f {
-        KernelToDomainFrame::Receipt(r) => r.message_id == sub_obs_ids[0] && r.status == ContractStatus::Completed,
+        KernelToDomainFrame::Receipt(r) =>
+            r.message_id == sub_obs_ids[0] && r.status == ContractStatus::Completed,
         _ => false,
     }));
     assert_eq!(kernel.router().observer_subscribers_count(), 1);
@@ -2348,11 +2388,22 @@ for line in ipc_in:
         let frames = client.drain_frames();
         for f in frames {
             match f {
-                KernelToDomainFrame::Receipt(r) if r.message_id == comp_ids[0] && r.status == ContractStatus::Completed => {
-                    assert_eq!(r.data.as_ref().and_then(|d| d.get("version")).and_then(|v| v.as_i64()), Some(1));
+                KernelToDomainFrame::Receipt(r)
+                    if r.message_id == comp_ids[0] && r.status == ContractStatus::Completed =>
+                {
+                    assert_eq!(
+                        r.data
+                            .as_ref()
+                            .and_then(|d| d.get("version"))
+                            .and_then(|v| v.as_i64()),
+                        Some(1)
+                    );
                     comp_done = true;
                 }
-                KernelToDomainFrame::Deliver(m) if m.target == KERNEL_OBSERVER_TARGET && m.message_type == MSG_SYSTEM_OBSERVER_EVENT => {
+                KernelToDomainFrame::Deliver(m)
+                    if m.target == KERNEL_OBSERVER_TARGET
+                        && m.message_type == MSG_SYSTEM_OBSERVER_EVENT =>
+                {
                     obs_events.push(m);
                 }
                 _ => {}
@@ -2364,7 +2415,10 @@ for line in ipc_in:
         std::thread::sleep(Duration::from_millis(30));
     }
     assert!(comp_done, "worker_roll v1 should have completed compute");
-    assert!(!obs_events.is_empty(), "Observer subscriber should receive observation events");
+    assert!(
+        !obs_events.is_empty(),
+        "Observer subscriber should receive observation events"
+    );
 
     // Query observer snapshots
     let q_obs_ids = client.send(
@@ -2374,12 +2428,17 @@ for line in ipc_in:
         json!({}),
     );
     let q_obs_frames = client.drain_frames();
-    let q_obs_data = q_obs_frames.iter().find_map(|f| match f {
-        KernelToDomainFrame::Receipt(r) if r.message_id == q_obs_ids[0] && r.status == ContractStatus::Completed => {
-            r.data.clone()
-        }
-        _ => None,
-    }).expect("Query observer snapshots should succeed");
+    let q_obs_data = q_obs_frames
+        .iter()
+        .find_map(|f| match f {
+            KernelToDomainFrame::Receipt(r)
+                if r.message_id == q_obs_ids[0] && r.status == ContractStatus::Completed =>
+            {
+                r.data.clone()
+            }
+            _ => None,
+        })
+        .expect("Query observer snapshots should succeed");
     assert!(q_obs_data["count"].as_u64().unwrap_or(0) >= 1);
 
     // Unsubscribe from observer
@@ -2391,7 +2450,8 @@ for line in ipc_in:
     );
     let unsub_frames = client.drain_frames();
     assert!(unsub_frames.iter().any(|f| match f {
-        KernelToDomainFrame::Receipt(r) => r.message_id == unsub_obs_ids[0] && r.status == ContractStatus::Completed,
+        KernelToDomainFrame::Receipt(r) =>
+            r.message_id == unsub_obs_ids[0] && r.status == ContractStatus::Completed,
         _ => false,
     }));
     assert_eq!(kernel.router().observer_subscribers_count(), 0);
@@ -2456,8 +2516,17 @@ for line in ipc_in:
     let upd_receipt = upd_receipt_opt.expect("UpdateDomain receipt should be received");
     assert_eq!(upd_receipt.status, ContractStatus::Completed);
     let upd_data = upd_receipt.data.as_ref().expect("upd_data present");
-    assert_eq!(upd_data.get("status").and_then(|v| v.as_str()), Some("updated"));
-    assert!(upd_data.get("instance_id").and_then(|v| v.as_u64()).unwrap() > initial_inst_id);
+    assert_eq!(
+        upd_data.get("status").and_then(|v| v.as_str()),
+        Some("updated")
+    );
+    assert!(
+        upd_data
+            .get("instance_id")
+            .and_then(|v| v.as_u64())
+            .unwrap()
+            > initial_inst_id
+    );
     let new_pid = upd_data.get("new_pid").and_then(|v| v.as_u64()).unwrap();
     assert_ne!(new_pid, pid1 as u64);
 
@@ -2476,7 +2545,13 @@ for line in ipc_in:
         for f in frames {
             if let KernelToDomainFrame::Receipt(r) = f {
                 if r.message_id == comp_v2_ids[0] && r.status == ContractStatus::Completed {
-                    assert_eq!(r.data.as_ref().and_then(|d| d.get("version")).and_then(|v| v.as_i64()), Some(2));
+                    assert_eq!(
+                        r.data
+                            .as_ref()
+                            .and_then(|d| d.get("version"))
+                            .and_then(|v| v.as_i64()),
+                        Some(2)
+                    );
                     comp_v2_done = true;
                     break;
                 }
@@ -2520,7 +2595,10 @@ for line in ipc_in:
         let frames = client.drain_frames();
         for f in frames {
             if let KernelToDomainFrame::Receipt(r) = f {
-                if r.message_id == bad_upd_ids[0] && (r.status == ContractStatus::ExecutionFailed || r.status == ContractStatus::Completed) {
+                if r.message_id == bad_upd_ids[0]
+                    && (r.status == ContractStatus::ExecutionFailed
+                        || r.status == ContractStatus::Completed)
+                {
                     bad_receipt_opt = Some(r);
                     break;
                 }
@@ -2534,7 +2612,14 @@ for line in ipc_in:
 
     let bad_receipt = bad_receipt_opt.expect("Bad Update receipt received");
     assert_eq!(bad_receipt.status, ContractStatus::ExecutionFailed);
-    assert_eq!(bad_receipt.data.as_ref().and_then(|d| d.get("error")).and_then(|v| v.as_str()), Some("update_failed"));
+    assert_eq!(
+        bad_receipt
+            .data
+            .as_ref()
+            .and_then(|d| d.get("error"))
+            .and_then(|v| v.as_str()),
+        Some("update_failed")
+    );
 
     // Verify existing v2 worker is STILL healthy and serves traffic without interruption
     let comp_still_v2 = client.send(
@@ -2550,7 +2635,13 @@ for line in ipc_in:
         for f in frames {
             if let KernelToDomainFrame::Receipt(r) = f {
                 if r.message_id == comp_still_v2[0] && r.status == ContractStatus::Completed {
-                    assert_eq!(r.data.as_ref().and_then(|d| d.get("version")).and_then(|v| v.as_i64()), Some(2));
+                    assert_eq!(
+                        r.data
+                            .as_ref()
+                            .and_then(|d| d.get("version"))
+                            .and_then(|v| v.as_i64()),
+                        Some(2)
+                    );
                     still_ok = true;
                     break;
                 }
@@ -2561,7 +2652,10 @@ for line in ipc_in:
         }
         std::thread::sleep(Duration::from_millis(30));
     }
-    assert!(still_ok, "Existing instance continues serving traffic after candidate rollback");
+    assert!(
+        still_ok,
+        "Existing instance continues serving traffic after candidate rollback"
+    );
 
     // 5. Test stop domain via supervisor
     let stop_ids = client.send(
@@ -2577,7 +2671,13 @@ for line in ipc_in:
         for f in frames {
             if let KernelToDomainFrame::Receipt(r) = f {
                 if r.message_id == stop_ids[0] && r.status == ContractStatus::Completed {
-                    assert_eq!(r.data.as_ref().and_then(|d| d.get("status")).and_then(|v| v.as_str()), Some("stopped"));
+                    assert_eq!(
+                        r.data
+                            .as_ref()
+                            .and_then(|d| d.get("status"))
+                            .and_then(|v| v.as_str()),
+                        Some("stopped")
+                    );
                     stop_done = true;
                     break;
                 }
@@ -2590,4 +2690,3 @@ for line in ipc_in:
     }
     assert!(stop_done, "StopDomain must complete");
 }
-

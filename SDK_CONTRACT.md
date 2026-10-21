@@ -66,3 +66,10 @@ kernel. Local Future/Promise receipt correlation remains client plumbing.
 Paired tests cover wire receipts, async RPC, large frames, resource bounds,
 storage messages, opaque business payloads/errors, startup without a second gate,
 and connection cleanup. Runtime integration is tested with the installed packages.
+
+
+## 内部执行和观察资源
+
+Python/Node 的现有调用保持不变。SDK 同时执行的入站业务调用有独立的内部上限（1024），不与出站请求额度关联；达到上限时经标准 ExecutionFailed 回执报告 `sdk_execution_capacity_exhausted`，不创建无限等待任务。该额度不代表业务调度或自动重试。同步阻塞或不响应取消的业务代码由进程停止隔离，SDK 不承诺能强制终止语言运行时中的任意函数。
+
+观察与实时日志订阅仍为尽力副本，内核历史、每个订阅和进程出口均有内部资源上限。慢订阅、超大事件、订阅资源不足或断开可能产生缺口；不提供持久重放保证，不新增队列/背压/重连参数。普通日志的持久接收独立于这些副本，主库写入落后可由独立 WAL 缓冲及游标恢复。

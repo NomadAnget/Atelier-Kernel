@@ -90,7 +90,7 @@ pub struct HandlerDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryPolicy {
-    /// Persisted to the SQLite `kernel_ledger` table and retained in the in-memory ledger.
+    /// Persisted in SQLite; only bounded live metadata and explicit failures reside in memory.
     Durable,
     /// Tracked in the in-memory ledger and observer only; never written to SQLite `kernel_ledger`.
     Volatile,
@@ -103,7 +103,9 @@ impl DeliveryPolicy {
     pub(crate) fn is_infrastructure_query(target: &str, message_type: &str) -> bool {
         match target {
             KERNEL_OBSERVER_TARGET => message_type == MSG_QUERY_OBSERVER,
-            KERNEL_RUNTIME_TARGET => matches!(message_type, MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY),
+            KERNEL_RUNTIME_TARGET => {
+                matches!(message_type, MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY)
+            }
             KERNEL_REGISTRY_TARGET => message_type == MSG_QUERY_HANDLERS,
             KERNEL_STORAGE_TARGET => message_type == MSG_STORAGE_QUERY,
             KERNEL_LOGGER_TARGET => matches!(message_type, MSG_QUERY_LOGS | MSG_QUERY_PROGRESS),

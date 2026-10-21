@@ -133,7 +133,7 @@ impl LogSpool {
             return Ok(false);
         }
         let last = batch.last().unwrap().0;
-        let tx = target.transaction()?;
+        let tx = target.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let cursor: u64 = tx
             .query_row(
                 "SELECT last_seq FROM kernel_log_import WHERE source_id=?1",

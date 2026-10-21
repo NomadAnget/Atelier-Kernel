@@ -119,7 +119,11 @@ impl WebFrontendDomain {
             if let Some(receipt) = receipts.iter().find(|r| ids.contains(&r.message_id)) {
                 return Some(receipt.logical_id.clone());
             }
-            if self.receipt_changed.wait_until(&mut receipts, deadline).timed_out() {
+            if self
+                .receipt_changed
+                .wait_until(&mut receipts, deadline)
+                .timed_out()
+            {
                 return None;
             }
         }
@@ -494,10 +498,28 @@ mod identity_tests {
         let kernel = Arc::new(AtelierKernel::new_in_memory().unwrap());
         let config: KernelBootConfig = serde_json::from_value(json!({"domains":[]})).unwrap();
         let dashboard = WebFrontendDomain::attach_with_config(kernel.clone(), &config);
-        let ids = dashboard.client.send(vec!["kernel.runtime".into()], "QueryRuntime", json!({}), json!({}));
+        let ids = dashboard.client.send(
+            vec!["kernel.runtime".into()],
+            "QueryRuntime",
+            json!({}),
+            json!({}),
+        );
         let logical = dashboard.submission_logical_id(&ids).unwrap();
         assert_ne!(logical, ids[0]);
-        assert_eq!(kernel.observer().events_for_message(&ids[0]).last().unwrap().logical_id, logical);
-        assert!(kernel.ledger().get_record(&ids[0], "kernel.runtime").is_none());
+        assert_eq!(
+            kernel
+                .observer()
+                .events_for_message(&ids[0])
+                .last()
+                .unwrap()
+                .logical_id,
+            logical
+        );
+        assert!(
+            kernel
+                .ledger()
+                .get_record(&ids[0], "kernel.runtime")
+                .is_none()
+        );
     }
 }

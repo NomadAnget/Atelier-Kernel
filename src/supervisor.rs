@@ -1,10 +1,10 @@
+use crate::outbox::{self, PipeReceiver};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use crate::outbox::{self, PipeReceiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::logging::{LogRecord, now_secs_f64};
+use crate::logging::LogRecord;
 use crate::protocol::{
     ContractStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
     KERNEL_STORAGE_TARGET, KernelToDomainFrame, MSG_REGISTER_HANDLERS, MSG_STORAGE_DELETE,
@@ -120,11 +120,7 @@ impl KernelBootConfig {
         let mut seen = HashSet::new();
         for spec in &self.domains {
             let id = spec.domain_id.trim();
-            if id.is_empty()
-                || !id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
+            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 return Err(SupervisorError::ConfigValidationFailed {
                     path: path_str.to_string(),
                     reason: format!(
@@ -265,101 +261,223 @@ fn allocate_non_stdio_pipes() -> std::io::Result<(
 
 #[cfg(windows)]
 unsafe extern "system" {
-    fn SetHandleInformation(
-        hObject: *mut std::ffi::c_void,
-        dwMask: u32,
-        dwFlags: u32,
-    ) -> i32;
+    fn SetHandleInformation(hObject: *mut std::ffi::c_void, dwMask: u32, dwFlags: u32) -> i32;
 }
 
 #[cfg(windows)]
 const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
 
-
-#[cfg(windows)] static PIPE_INHERITANCE:Mutex<()>=Mutex::new(());
-const MAX_IPC_FRAME:usize=16*1024*1024;
+#[cfg(windows)]
+static PIPE_INHERITANCE: Mutex<()> = Mutex::new(());
+const MAX_IPC_FRAME: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
-fn nonblocking<T:std::os::fd::AsRawFd>(io:&T)->std::io::Result<()> {
-    #[cfg(target_os="macos")] const NONBLOCK:i32=4;
-    #[cfg(not(target_os="macos"))] const NONBLOCK:i32=2048;
-    let fd=io.as_raw_fd();let flags=unsafe{fcntl(fd,3)};
-    if flags<0 || unsafe{fcntl(fd,4,flags|NONBLOCK)}<0 {Err(std::io::Error::last_os_error())}else{Ok(())}
+fn nonblocking<T: std::os::fd::AsRawFd>(io: &T) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    const NONBLOCK: i32 = 4;
+    #[cfg(not(target_os = "macos"))]
+    const NONBLOCK: i32 = 2048;
+    let fd = io.as_raw_fd();
+    let flags = unsafe { fcntl(fd, 3) };
+    if flags < 0 || unsafe { fcntl(fd, 4, flags | NONBLOCK) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 #[cfg(windows)]
-fn cancel_worker(handle:&thread::JoinHandle<()>) {
+fn cancel_worker(handle: &thread::JoinHandle<()>) {
     use std::os::windows::thread::JoinHandleExt;
-    #[link(name="kernel32")] unsafe extern "system"{fn CancelSynchronousIo(thread:*mut std::ffi::c_void)->i32;}
-    unsafe{CancelSynchronousIo(handle.as_raw_handle());}
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+    }
+    unsafe {
+        CancelSynchronousIo(handle.as_raw_handle());
+    }
 }
-fn pump_lines<R:std::io::Read>(mut input:R,stop:&AtomicBool,mut line:impl FnMut(&str))->std::io::Result<()> {
-    let mut bytes=Vec::new();let mut chunk=[0u8;8192];
+fn pump_lines<R: std::io::Read>(
+    mut input: R,
+    stop: &AtomicBool,
+    mut line: impl FnMut(&str),
+) -> std::io::Result<()> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
     while !stop.load(Ordering::Acquire) {
         match input.read(&mut chunk) {
-            Ok(0)=>return Ok(()),
-            Ok(n)=>for part in chunk[..n].split_inclusive(|b|*b==b'\n') {
-                if bytes.len()+part.len()>MAX_IPC_FRAME{return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"IPC/diagnostic frame exceeds limit"));}
-                bytes.extend_from_slice(part);
-                if bytes.last()==Some(&b'\n') {let text=std::str::from_utf8(&bytes).map_err(|e|std::io::Error::new(std::io::ErrorKind::InvalidData,e))?;line(text);bytes.clear();}
-            },
-            Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(5)),
-            Err(e) if e.kind()==std::io::ErrorKind::Interrupted=>{},Err(e)=>return Err(e),
+            Ok(0) => {
+                if !bytes.is_empty() {
+                    let text = std::str::from_utf8(&bytes)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                    line(text);
+                }
+                return Ok(());
+            }
+            Ok(n) => {
+                for part in chunk[..n].split_inclusive(|b| *b == b'\n') {
+                    if bytes.len() + part.len() > MAX_IPC_FRAME {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "IPC/diagnostic frame exceeds limit",
+                        ));
+                    }
+                    bytes.extend_from_slice(part);
+                    if bytes.last() == Some(&b'\n') {
+                        let text = std::str::from_utf8(&bytes)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        line(text);
+                        bytes.clear();
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())
 }
-fn write_frame(output:&mut std::io::PipeWriter,frame:&KernelToDomainFrame,stop:&AtomicBool)->std::io::Result<()> {
-    let mut bytes=serde_json::to_vec(frame).map_err(std::io::Error::other)?;bytes.push(b'\n');
-    if bytes.len()>MAX_IPC_FRAME{return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,"outbound frame exceeds IPC limit"));}
-    let mut offset=0;
-    while offset<bytes.len() {
-        if stop.load(Ordering::Acquire){return Err(std::io::Error::new(std::io::ErrorKind::Interrupted,"process stopping"));}
+fn write_frame(
+    output: &mut std::io::PipeWriter,
+    frame: &KernelToDomainFrame,
+    stop: &AtomicBool,
+) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(frame).map_err(std::io::Error::other)?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_IPC_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "outbound frame exceeds IPC limit",
+        ));
+    }
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if stop.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "process stopping",
+            ));
+        }
         match output.write(&bytes[offset..]) {
-            Ok(0)=>return Err(std::io::Error::new(std::io::ErrorKind::WriteZero,"closed domain pipe")),
-            Ok(n)=>offset+=n,
-            Err(e) if e.kind()==std::io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(5)),
-            Err(e) if e.kind()==std::io::ErrorKind::Interrupted=>{},Err(e)=>return Err(e),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "closed domain pipe",
+                ));
+            }
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     output.flush()
 }
 /// One owner for Child and all its workers. Workers never hold this owner or Child.
 struct ManagedProcess {
-    instance_id:u64,pid:u32,child:Option<Child>,stop:Arc<AtomicBool>,
-    output:crate::outbox::PipeSender,workers:Vec<thread::JoinHandle<()>>,
+    instance_id: u64,
+    pid: u32,
+    child: Option<Child>,
+    stop: Arc<AtomicBool>,
+    output: crate::outbox::PipeSender,
+    workers: Vec<thread::JoinHandle<()>>,
 }
 impl ManagedProcess {
-    fn exited(&mut self)->bool {self.child.as_mut().is_none_or(|c|c.try_wait().map_or(true,|s|s.is_some()))}
-    fn terminate(&mut self){
-        self.stop.store(true,Ordering::Release);self.output.close();
-        #[cfg(windows)] for worker in &self.workers{cancel_worker(worker);}
-        if let Some(mut child)=self.child.take(){let _=child.kill();if let Err(error)=child.wait(){eprintln!("kernel failed to reap pid {}: {error}",self.pid);}}
-        for worker in self.workers.drain(..){if let Err(error)=worker.join(){eprintln!("kernel worker panicked for pid {}: {error:?}",self.pid);}}
+    fn exited(&mut self) -> bool {
+        // IPC worker panic or early return is also a failed process connection.
+        if self
+            .workers
+            .iter()
+            .take(2)
+            .any(|worker| worker.is_finished())
+        {
+            return true;
+        }
+        self.child
+            .as_mut()
+            .is_none_or(|c| c.try_wait().map_or(true, |s| s.is_some()))
+    }
+    fn terminate(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.output.close();
+        #[cfg(windows)]
+        for worker in &self.workers {
+            cancel_worker(worker);
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            if let Err(error) = child.wait() {
+                eprintln!("kernel failed to reap pid {}: {error}", self.pid);
+            }
+        }
+        for worker in self.workers.drain(..) {
+            if let Err(error) = worker.join() {
+                eprintln!("kernel worker panicked for pid {}: {error:?}", self.pid);
+            }
+        }
     }
 }
-impl Drop for ManagedProcess{fn drop(&mut self){self.terminate();}}
-struct DomainState {
-    spec:DomainProcessSpec,process:Option<ManagedProcess>,stopped:bool,
-    restart_count:u32,last_spawn:Option<Instant>,restart_at:Option<Instant>,
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
-struct DomainControl {operation:Mutex<()>,state:Mutex<DomainState>}
+struct DomainState {
+    spec: DomainProcessSpec,
+    process: Option<ManagedProcess>,
+    stopped: bool,
+    restart_count: u32,
+    last_spawn: Option<Instant>,
+    restart_at: Option<Instant>,
+}
+struct DomainControl {
+    operation: Mutex<()>,
+    state: Mutex<DomainState>,
+}
 struct DomainSupervisorInner {
-    router:Arc<KernelRouter>,
-    domains:RwLock<HashMap<String,Arc<DomainControl>>>,
-    shutdown:Arc<AtomicBool>,
+    router: Arc<KernelRouter>,
+    domains: RwLock<HashMap<String, Arc<DomainControl>>>,
+    shutdown: Arc<AtomicBool>,
 }
 impl DomainSupervisorInner {
-    fn control(&self,id:&str)->Option<Arc<DomainControl>>{self.domains.read().get(id).cloned()}
-    fn ensure(&self,spec:&DomainProcessSpec)->Arc<DomainControl>{
-        let mut domains=self.domains.write();domains.entry(spec.domain_id.clone()).or_insert_with(||Arc::new(DomainControl {
-            operation:Mutex::new(()),state:Mutex::new(DomainState {spec:spec.clone(),process:None,stopped:false,restart_count:0,last_spawn:None,restart_at:None}),
-        })).clone()
+    fn control(&self, id: &str) -> Option<Arc<DomainControl>> {
+        self.domains.read().get(id).cloned()
+    }
+    fn ensure(&self, spec: &DomainProcessSpec) -> Result<Arc<DomainControl>, SupervisorError> {
+        let mut domains = self.domains.write();
+        if domains.len() >= 1024 && !domains.contains_key(&spec.domain_id) {
+            return Err(SupervisorError::SpawnFailed {
+                domain: spec.domain_id.clone(),
+                source: std::io::Error::other("kernel managed domain registry capacity exhausted"),
+            });
+        }
+        Ok(domains
+            .entry(spec.domain_id.clone())
+            .or_insert_with(|| {
+                Arc::new(DomainControl {
+                    operation: Mutex::new(()),
+                    state: Mutex::new(DomainState {
+                        spec: spec.clone(),
+                        process: None,
+                        stopped: false,
+                        restart_count: 0,
+                        last_spawn: None,
+                        restart_at: None,
+                    }),
+                })
+            })
+            .clone())
     }
     fn spawn_child_pipes(
         &self,
         domain_id: &str,
         spec: &DomainProcessSpec,
     ) -> Result<(Child, std::io::PipeWriter, std::io::PipeReader), SupervisorError> {
-        #[cfg(windows)] let _inheritance = PIPE_INHERITANCE.lock();
+        #[cfg(windows)]
+        let _inheritance = PIPE_INHERITANCE.lock();
 
         #[cfg(unix)]
         let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) =
@@ -399,11 +517,8 @@ impl DomainSupervisorInner {
             unsafe {
                 if SetHandleInformation(r_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
                     == 0
-                    || SetHandleInformation(
-                        w_h as *mut _,
-                        HANDLE_FLAG_INHERIT,
-                        HANDLE_FLAG_INHERIT,
-                    ) == 0
+                    || SetHandleInformation(w_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
+                        == 0
                 {
                     return Err(SupervisorError::SpawnFailed {
                         domain: domain_id.to_string(),
@@ -428,7 +543,13 @@ impl DomainSupervisorInner {
                     .env("ATELIER_IPC_WRITE_FD", w_fd.to_string());
                 // Only the child clears CLOEXEC. Concurrent Unix spawns cannot inherit each other's pipes.
                 use std::os::unix::process::CommandExt;
-                unsafe {cmd.pre_exec(move||{clear_cloexec(r_fd)?;clear_cloexec(w_fd)?;Ok(())});}
+                unsafe {
+                    cmd.pre_exec(move || {
+                        clear_cloexec(r_fd)?;
+                        clear_cloexec(w_fd)?;
+                        Ok(())
+                    });
+                }
             }
             #[cfg(windows)]
             {
@@ -488,143 +609,470 @@ impl DomainSupervisorInner {
         Ok((child, k2d_tx, d2k_rx))
     }
 
-
-    fn launch(&self,spec:&DomainProcessSpec,candidate:bool)->Result<ManagedProcess,SupervisorError>{
-        let id=&spec.domain_id;
-        let (mut child,mut tx,rx)=self.spawn_child_pipes(id,spec)?;
-        let pid=child.id();let stdout=child.stdout.take();let stderr=child.stderr.take();
-        let (sender,inbox)=outbox::channel(self.router.ledger().db_conn.as_ref().unwrap().clone());
-        let generation=if candidate{self.router.attach_candidate_pipe(id,sender.clone())}else{self.router.attach_domain_pipe(id,sender.clone())};
-        let mut process=ManagedProcess{instance_id:generation,pid,child:Some(child),stop:Arc::new(AtomicBool::new(false)),output:sender,workers:Vec::new()};
-        let result=(||->std::io::Result<()>{
-            #[cfg(unix)] {nonblocking(&tx)?;nonblocking(&rx)?;if let Some(io)=&stdout{nonblocking(io)?;}if let Some(io)=&stderr{nonblocking(io)?;}}
-            let weak=Arc::downgrade(&self.router);let stop=process.stop.clone();let domain=id.clone();
-            process.workers.push(thread::Builder::new().name(format!("kernel-tx-{id}-{generation}")).spawn(move||{
-                while !stop.load(Ordering::Acquire) {
-                    match inbox.recv_timeout(Duration::from_millis(50)) {
-                        Ok(frame)=>{
-                            if write_frame(&mut tx,&frame,&stop).is_err() || inbox.acknowledge().is_err(){break;}
-                        },Err(mpsc::RecvTimeoutError::Timeout)=>continue,Err(_)=>break,
-                    }
+    fn launch(
+        &self,
+        spec: &DomainProcessSpec,
+        candidate: bool,
+    ) -> Result<ManagedProcess, SupervisorError> {
+        let id = &spec.domain_id;
+        let (mut child, mut tx, rx) = self.spawn_child_pipes(id, spec)?;
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let (sender, inbox) =
+            outbox::channel(self.router.ledger().db_conn.as_ref().unwrap().clone());
+        let generation = if candidate {
+            self.router.attach_candidate_pipe(id, sender.clone())
+        } else {
+            self.router.attach_domain_pipe(id, sender.clone())
+        };
+        let mut process = ManagedProcess {
+            instance_id: generation,
+            pid,
+            child: Some(child),
+            stop: Arc::new(AtomicBool::new(false)),
+            output: sender,
+            workers: Vec::new(),
+        };
+        let result = (|| -> std::io::Result<()> {
+            #[cfg(unix)]
+            {
+                nonblocking(&tx)?;
+                nonblocking(&rx)?;
+                if let Some(io) = &stdout {
+                    nonblocking(io)?;
                 }
-                if !stop.load(Ordering::Acquire){if let Some(router)=weak.upgrade(){router.mark_domain_faulted_for_instance(&domain,Some(generation),"domain writer failed");}}
-            })?);
-            let weak=Arc::downgrade(&self.router);let stop=process.stop.clone();let domain=id.clone();
-            process.workers.push(thread::Builder::new().name(format!("kernel-rx-{id}-{generation}")).spawn(move||{
-                let result=pump_lines(rx,&stop,|line|{if let Some(router)=weak.upgrade(){router.handle_raw_pipe_line_for_instance(&domain,generation,line);}});
-                if !stop.load(Ordering::Acquire){if let Some(router)=weak.upgrade(){router.mark_domain_faulted_for_instance(&domain,Some(generation),&format!("domain IPC closed: {result:?}"));}}
-            })?);
-            for (label,input) in [("stdout",stdout.map(|s|Box::new(s) as Box<dyn std::io::Read+Send>)),("stderr",stderr.map(|s|Box::new(s) as Box<dyn std::io::Read+Send>))] {
-                if let Some(input)=input {
-                    let weak=Arc::downgrade(&self.router);let stop=process.stop.clone();let domain=id.clone();
-                    process.workers.push(thread::Builder::new().name(format!("kernel-{label}-{id}-{generation}")).spawn(move||{
-                        let result=pump_lines(input,&stop,|text|{if let Some(router)=weak.upgrade(){router.logger().reinject(LogRecord {
-                            source_domain:Some(domain.clone()),component:domain.clone(),layer:"SUBPROCESS".into(),level:if label=="stderr"{"WARNING"}else{"INFO"}.into(),message:text.trim_end().into(),..LogRecord::default()
-                        });}});
-                        if let Err(error)=result {if !stop.load(Ordering::Acquire){eprintln!("kernel {domain} {label} reader failed: {error}");}}
-                    })?);
+                if let Some(io) = &stderr {
+                    nonblocking(io)?;
+                }
+            }
+            let weak = Arc::downgrade(&self.router);
+            let stop = process.stop.clone();
+            let domain = id.clone();
+            process.workers.push(
+                thread::Builder::new()
+                    .name(format!("kernel-tx-{id}-{generation}"))
+                    .spawn(move || {
+                        while !stop.load(Ordering::Acquire) {
+                            match inbox.recv_timeout(Duration::from_millis(50)) {
+                                Ok(frame) => {
+                                    if write_frame(&mut tx, &frame, &stop).is_err()
+                                        || inbox.acknowledge().is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(_) => break,
+                            }
+                        }
+                        if !stop.load(Ordering::Acquire) {
+                            if let Some(router) = weak.upgrade() {
+                                router.mark_domain_faulted_for_instance(
+                                    &domain,
+                                    Some(generation),
+                                    "domain writer failed",
+                                );
+                            }
+                        }
+                    })?,
+            );
+            let weak = Arc::downgrade(&self.router);
+            let stop = process.stop.clone();
+            let domain = id.clone();
+            process.workers.push(
+                thread::Builder::new()
+                    .name(format!("kernel-rx-{id}-{generation}"))
+                    .spawn(move || {
+                        let result = pump_lines(rx, &stop, |line| {
+                            if let Some(router) = weak.upgrade() {
+                                router.handle_raw_pipe_line_for_instance(&domain, generation, line);
+                            }
+                        });
+                        if !stop.load(Ordering::Acquire) {
+                            if let Some(router) = weak.upgrade() {
+                                router.mark_domain_faulted_for_instance(
+                                    &domain,
+                                    Some(generation),
+                                    &format!("domain IPC closed: {result:?}"),
+                                );
+                            }
+                        }
+                    })?,
+            );
+            for (label, input) in [
+                (
+                    "stdout",
+                    stdout.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                ),
+                (
+                    "stderr",
+                    stderr.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+                ),
+            ] {
+                if let Some(input) = input {
+                    let weak = Arc::downgrade(&self.router);
+                    let stop = process.stop.clone();
+                    let domain = id.clone();
+                    process.workers.push(
+                        thread::Builder::new()
+                            .name(format!("kernel-{label}-{id}-{generation}"))
+                            .spawn(move || {
+                                let result = pump_lines(input, &stop, |text| {
+                                    if let Some(router) = weak.upgrade() {
+                                        router.logger().reinject(LogRecord {
+                                            source_domain: Some(domain.clone()),
+                                            component: domain.clone(),
+                                            layer: "SUBPROCESS".into(),
+                                            level: if label == "stderr" {
+                                                "WARNING"
+                                            } else {
+                                                "INFO"
+                                            }
+                                            .into(),
+                                            message: text.trim_end().into(),
+                                            ..LogRecord::default()
+                                        });
+                                    }
+                                });
+                                if let Err(error) = result {
+                                    if !stop.load(Ordering::Acquire) {
+                                        eprintln!("kernel {domain} {label} reader failed: {error}");
+                                    }
+                                }
+                            })?,
+                    );
                 }
             }
             Ok(())
         })();
-        if let Err(source)=result {
-            if candidate{self.router.abort_candidate(id,generation);}else{self.router.mark_domain_faulted_for_instance(id,Some(generation),"cannot start domain workers");}
-            return Err(SupervisorError::SpawnFailed{domain:id.clone(),source});
+        if let Err(source) = result {
+            if candidate {
+                self.router.abort_candidate(id, generation);
+            } else {
+                self.router.mark_domain_faulted_for_instance(
+                    id,
+                    Some(generation),
+                    "cannot start domain workers",
+                );
+            }
+            return Err(SupervisorError::SpawnFailed {
+                domain: id.clone(),
+                source,
+            });
         }
         Ok(process)
     }
-    fn stop_owned(&self,id:&str,mut process:ManagedProcess,reason:&str){
-        self.router.mark_domain_faulted_for_instance(id,Some(process.instance_id),reason);
+    fn stop_owned(&self, id: &str, mut process: ManagedProcess, reason: &str) {
+        self.router
+            .mark_domain_faulted_for_instance(id, Some(process.instance_id), reason);
         process.terminate();
     }
-    fn monitor(&self){
-        for (id,generation,reason) in self.router.failed_output_queues(){self.router.mark_domain_faulted_for_instance(&id,Some(generation),&reason);}
-        let domains:Vec<_>=self.domains.read().iter().map(|(id,c)|(id.clone(),c.clone())).collect();
-        for (id,control) in domains {
-            if self.shutdown.load(Ordering::Acquire){break;}
-            let Some(_operation)=control.operation.try_lock()else{continue;};
-            let failed={let mut state=control.state.lock();let faulted=self.router.domain_status(&id)==Some(crate::protocol::DomainStatus::Faulted);
-                if state.process.as_mut().is_some_and(|p|faulted || p.exited()){state.process.take()}else{None}};
-            if let Some(process)=failed {
-                self.stop_owned(&id,process,"domain disconnected");
-                let mut state=control.state.lock();
-                if state.last_spawn.is_some_and(|at|at.elapsed()>Duration::from_secs(5)){state.restart_count=0;}
-                if !state.stopped && state.spec.auto_restart && state.spec.max_restarts.is_none_or(|n|state.restart_count<n) {
-                    state.restart_count+=1;state.restart_at=Some(Instant::now()+Duration::from_millis(state.spec.restart_delay_ms));
+    fn monitor(&self) {
+        for (id, generation, reason) in self.router.failed_output_queues() {
+            self.router
+                .mark_domain_faulted_for_instance(&id, Some(generation), &reason);
+        }
+        let domains: Vec<_> = self
+            .domains
+            .read()
+            .iter()
+            .map(|(id, c)| (id.clone(), c.clone()))
+            .collect();
+        for (id, control) in domains {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            let Some(_operation) = control.operation.try_lock() else {
+                continue;
+            };
+            let failed = {
+                let mut state = control.state.lock();
+                let faulted =
+                    self.router.domain_status(&id) == Some(crate::protocol::DomainStatus::Faulted);
+                if state
+                    .process
+                    .as_mut()
+                    .is_some_and(|p| faulted || p.exited())
+                {
+                    state.process.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(process) = failed {
+                self.stop_owned(&id, process, "domain disconnected");
+                let mut state = control.state.lock();
+                if state
+                    .last_spawn
+                    .is_some_and(|at| at.elapsed() > Duration::from_secs(5))
+                {
+                    state.restart_count = 0;
+                }
+                if !state.stopped && state.spec.auto_restart {
+                    // Public counter includes the final denied restart attempt, as before.
+                    state.restart_count = state.restart_count.saturating_add(1);
+                    if state
+                        .spec
+                        .max_restarts
+                        .is_none_or(|n| state.restart_count <= n)
+                    {
+                        state.restart_at = Some(
+                            Instant::now() + Duration::from_millis(state.spec.restart_delay_ms),
+                        );
+                    }
                 }
             }
-            let restart={let mut state=control.state.lock();
-                if !state.stopped && state.restart_at.is_some_and(|at|Instant::now()>=at){state.restart_at=None;Some(state.spec.clone())}else{None}};
-            if let Some(spec)=restart {
-                match self.launch(&spec,false) {
-                    Ok(process)=>{let mut s=control.state.lock();s.process=Some(process);s.last_spawn=Some(Instant::now());},
-                    Err(error)=>{eprintln!("kernel auto-restart {id} failed: {error}");let mut s=control.state.lock();
-                        if s.spec.max_restarts.is_none_or(|max|s.restart_count<max){s.restart_count+=1;s.restart_at=Some(Instant::now()+Duration::from_millis(s.spec.restart_delay_ms));}
-                    },
+            let restart = {
+                let mut state = control.state.lock();
+                if !state.stopped && state.restart_at.is_some_and(|at| Instant::now() >= at) {
+                    state.restart_at = None;
+                    Some(state.spec.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(spec) = restart {
+                match self.launch(&spec, false) {
+                    Ok(process) => {
+                        let mut s = control.state.lock();
+                        s.process = Some(process);
+                        s.last_spawn = Some(Instant::now());
+                    }
+                    Err(error) => {
+                        eprintln!("kernel auto-restart {id} failed: {error}");
+                        let mut s = control.state.lock();
+                        s.restart_count = s.restart_count.saturating_add(1);
+                        if s.spec.max_restarts.is_none_or(|max| s.restart_count <= max) {
+                            s.restart_at = Some(
+                                Instant::now() + Duration::from_millis(s.spec.restart_delay_ms),
+                            );
+                        }
+                    }
                 }
             }
         }
     }
 }
 /// Owns its monitor. The monitor holds only a Weak reference and exits before process teardown.
-pub struct DomainSupervisor {inner:Arc<DomainSupervisorInner>,monitor:Mutex<Option<thread::JoinHandle<()>>>}
+pub struct DomainSupervisor {
+    inner: Arc<DomainSupervisorInner>,
+    monitor: Mutex<Option<thread::JoinHandle<()>>>,
+}
 impl DomainSupervisor {
-    pub fn new(router:Arc<KernelRouter>)->Self {
-        let inner=Arc::new(DomainSupervisorInner {router,domains:RwLock::new(HashMap::new()),shutdown:Arc::new(AtomicBool::new(false))});
-        let weak=Arc::downgrade(&inner);let stop=inner.shutdown.clone();
-        let handle=thread::Builder::new().name("kernel-supervisor-monitor".into()).spawn(move||{
-            while !stop.load(Ordering::Acquire) {if let Some(inner)=weak.upgrade(){inner.monitor();}else{break;}thread::sleep(Duration::from_millis(25));}
-        }).expect("cannot start kernel process monitor");
-        Self{inner,monitor:Mutex::new(Some(handle))}
-    }
-    pub fn router(&self)->&Arc<KernelRouter>{&self.inner.router}
-    pub fn is_stopped(&self,id:&str)->bool{self.inner.control(id).is_some_and(|c|c.state.lock().stopped)}
-    pub fn restart_count(&self,id:&str)->u32{self.inner.control(id).map_or(0,|c|c.state.lock().restart_count)}
-    pub fn boot_from_config(&self,config:&KernelBootConfig)->Vec<(String,Result<u32,SupervisorError>)>{config.domains.iter().map(|s|(s.domain_id.clone(),self.spawn_process_domain(s.clone()))).collect()}
-    pub fn respawn_domain(&self,id:&str)->Result<u32,SupervisorError>{let spec=self.get_spec(id).ok_or_else(||SupervisorError::UnknownDomainSpec(id.into()))?;self.spawn_process_domain(spec)}
-    pub fn get_spec(&self,id:&str)->Option<DomainProcessSpec>{self.inner.control(id).map(|c|c.state.lock().spec.clone())}
-    pub fn list_specs(&self)->Vec<DomainProcessSpec>{let controls:Vec<_>=self.inner.domains.read().values().cloned().collect();let mut specs:Vec<_>=controls.into_iter().map(|c|c.state.lock().spec.clone()).collect();specs.sort_by(|a,b|a.domain_id.cmp(&b.domain_id));specs}
-    pub fn spawn_process_domain(&self,spec:DomainProcessSpec)->Result<u32,SupervisorError>{
-        let id=spec.domain_id.clone();let control=self.inner.ensure(&spec);let _operation=control.operation.lock();
-        let previous={let mut state=control.state.lock();state.stopped=false;state.restart_count=0;state.restart_at=None;state.process.take()};
-        if let Some(process)=previous{self.inner.stop_owned(&id,process,"domain restarted");}
-        let process=self.inner.launch(&spec,false)?;let pid=process.pid;
-        let mut state=control.state.lock();state.spec=spec;state.process=Some(process);state.last_spawn=Some(Instant::now());Ok(pid)
-    }
-    pub fn stop_process_domain(&self,id:&str)->bool{
-        let Some(control)=self.inner.control(id)else{return false;};let _operation=control.operation.lock();
-        let process={let mut state=control.state.lock();state.stopped=true;state.restart_at=None;state.process.take()};
-        if let Some(process)=process{self.inner.stop_owned(id,process,"domain stopped by kernel supervisor");true}else{false}
-    }
-    pub fn attach_in_process_domain(&self,id:&str)->DomainPipeClient{
-        let (tx,rx)=outbox::channel(self.inner.router.ledger().db_conn.as_ref().unwrap().clone());let generation=self.inner.router.attach_domain_pipe(id,tx);
-        DomainPipeClient{domain_id:id.into(),instance_id:generation,router:self.inner.router.clone(),inbox:Mutex::new(rx),next_seq:std::sync::atomic::AtomicU64::new(1)}
-    }
-    pub fn get_pid(&self,id:&str)->Option<u32>{self.inner.control(id).and_then(|c|c.state.lock().process.as_ref().map(|p|p.pid))}
-    pub fn update_process_domain(&self,id:&str,new_spec:Option<DomainProcessSpec>,_probe_handler:Option<&str>,timeout:Duration)->Result<DomainUpdateResult,SupervisorError>{
-        let spec=new_spec.or_else(||self.get_spec(id)).ok_or_else(||SupervisorError::UnknownDomainSpec(id.into()))?;
-        if spec.domain_id!=id{return Err(SupervisorError::UpdateValidationFailed{domain:id.into(),reason:"candidate domain identity mismatch".into()});}
-        let control=self.inner.ensure(&spec);let operation=control.operation.lock();
-        let old_pid=control.state.lock().process.as_ref().map(|p|p.pid);
-        if old_pid.is_none(){drop(operation);let pid=self.spawn_process_domain(spec)?;return Ok(DomainUpdateResult{domain_id:id.into(),new_pid:pid,old_pid:None,instance_id:self.inner.router.domain_instance_id(id).unwrap_or(0),status:"started".into()});}
-        let mut candidate=self.inner.launch(&spec,true)?;let generation=candidate.instance_id;let deadline=Instant::now()+timeout;
-        while Instant::now()<deadline && !candidate.exited() && !self.inner.shutdown.load(Ordering::Acquire) {
-            if self.inner.router.is_candidate_ready(id,generation){break;}thread::sleep(Duration::from_millis(10));
+    pub fn new(router: Arc<KernelRouter>) -> Self {
+        let inner = Arc::new(DomainSupervisorInner {
+            router,
+            domains: RwLock::new(HashMap::new()),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        });
+        let weak = Arc::downgrade(&inner);
+        let stop = inner.shutdown.clone();
+        let handle = thread::Builder::new()
+            .name("kernel-supervisor-monitor".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    if let Some(inner) = weak.upgrade() {
+                        inner.monitor();
+                    } else {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+            })
+            .expect("cannot start kernel process monitor");
+        Self {
+            inner,
+            monitor: Mutex::new(Some(handle)),
         }
-        if candidate.exited() || !self.inner.router.is_candidate_ready(id,generation) || !self.inner.router.commit_candidate(id,generation) {
-            self.inner.router.abort_candidate(id,generation);candidate.terminate();return Err(SupervisorError::UpdateValidationFailed{domain:id.into(),reason:"candidate did not register ready before deadline".into()});
+    }
+    pub fn router(&self) -> &Arc<KernelRouter> {
+        &self.inner.router
+    }
+    pub fn is_stopped(&self, id: &str) -> bool {
+        self.inner
+            .control(id)
+            .is_some_and(|c| c.state.lock().stopped)
+    }
+    pub fn restart_count(&self, id: &str) -> u32 {
+        self.inner
+            .control(id)
+            .map_or(0, |c| c.state.lock().restart_count)
+    }
+    pub fn boot_from_config(
+        &self,
+        config: &KernelBootConfig,
+    ) -> Vec<(String, Result<u32, SupervisorError>)> {
+        config
+            .domains
+            .iter()
+            .map(|s| (s.domain_id.clone(), self.spawn_process_domain(s.clone())))
+            .collect()
+    }
+    pub fn respawn_domain(&self, id: &str) -> Result<u32, SupervisorError> {
+        let spec = self
+            .get_spec(id)
+            .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?;
+        self.spawn_process_domain(spec)
+    }
+    pub fn get_spec(&self, id: &str) -> Option<DomainProcessSpec> {
+        self.inner.control(id).map(|c| c.state.lock().spec.clone())
+    }
+    pub fn list_specs(&self) -> Vec<DomainProcessSpec> {
+        let controls: Vec<_> = self.inner.domains.read().values().cloned().collect();
+        let mut specs: Vec<_> = controls
+            .into_iter()
+            .map(|c| c.state.lock().spec.clone())
+            .collect();
+        specs.sort_by(|a, b| a.domain_id.cmp(&b.domain_id));
+        specs
+    }
+    pub fn spawn_process_domain(&self, spec: DomainProcessSpec) -> Result<u32, SupervisorError> {
+        let id = spec.domain_id.clone();
+        let control = self.inner.ensure(&spec)?;
+        let _operation = control.operation.lock();
+        let previous = {
+            let mut state = control.state.lock();
+            state.stopped = false;
+            state.restart_count = 0;
+            state.restart_at = None;
+            state.process.take()
+        };
+        if let Some(process) = previous {
+            self.inner.stop_owned(&id, process, "domain restarted");
         }
-        let pid=candidate.pid;
-        let previous={let mut state=control.state.lock();state.spec=spec;state.stopped=false;state.restart_count=0;state.last_spawn=Some(Instant::now());state.process.replace(candidate)};
-        if let Some(mut old)=previous {thread::sleep(Duration::from_millis(600));self.inner.router.cleanup_draining_instance(id,old.instance_id);old.terminate();}
-        Ok(DomainUpdateResult{domain_id:id.into(),new_pid:pid,old_pid,instance_id:generation,status:"updated".into()})
+        let process = self.inner.launch(&spec, false)?;
+        let pid = process.pid;
+        let mut state = control.state.lock();
+        state.spec = spec;
+        state.process = Some(process);
+        state.last_spawn = Some(Instant::now());
+        Ok(pid)
+    }
+    pub fn stop_process_domain(&self, id: &str) -> bool {
+        let Some(control) = self.inner.control(id) else {
+            return false;
+        };
+        let _operation = control.operation.lock();
+        let process = {
+            let mut state = control.state.lock();
+            state.stopped = true;
+            state.restart_at = None;
+            state.process.take()
+        };
+        if let Some(process) = process {
+            self.inner
+                .stop_owned(id, process, "domain stopped by kernel supervisor");
+            true
+        } else {
+            false
+        }
+    }
+    pub fn attach_in_process_domain(&self, id: &str) -> DomainPipeClient {
+        let (tx, rx) =
+            outbox::channel(self.inner.router.ledger().db_conn.as_ref().unwrap().clone());
+        let generation = self.inner.router.attach_domain_pipe(id, tx);
+        DomainPipeClient {
+            domain_id: id.into(),
+            instance_id: generation,
+            router: self.inner.router.clone(),
+            inbox: Mutex::new(rx),
+            next_seq: std::sync::atomic::AtomicU64::new(1),
+        }
+    }
+    pub fn get_pid(&self, id: &str) -> Option<u32> {
+        self.inner
+            .control(id)
+            .and_then(|c| c.state.lock().process.as_ref().map(|p| p.pid))
+    }
+    pub fn update_process_domain(
+        &self,
+        id: &str,
+        new_spec: Option<DomainProcessSpec>,
+        _probe_handler: Option<&str>,
+        timeout: Duration,
+    ) -> Result<DomainUpdateResult, SupervisorError> {
+        let spec = new_spec
+            .or_else(|| self.get_spec(id))
+            .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?;
+        if spec.domain_id != id {
+            return Err(SupervisorError::UpdateValidationFailed {
+                domain: id.into(),
+                reason: "candidate domain identity mismatch".into(),
+            });
+        }
+        let control = self.inner.ensure(&spec)?;
+        let operation = control.operation.lock();
+        let old_pid = control.state.lock().process.as_ref().map(|p| p.pid);
+        if old_pid.is_none() {
+            drop(operation);
+            let pid = self.spawn_process_domain(spec)?;
+            return Ok(DomainUpdateResult {
+                domain_id: id.into(),
+                new_pid: pid,
+                old_pid: None,
+                instance_id: self.inner.router.domain_instance_id(id).unwrap_or(0),
+                status: "started".into(),
+            });
+        }
+        let mut candidate = self.inner.launch(&spec, true)?;
+        let generation = candidate.instance_id;
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline
+            && !candidate.exited()
+            && !self.inner.shutdown.load(Ordering::Acquire)
+        {
+            if self.inner.router.is_candidate_ready(id, generation) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if candidate.exited()
+            || !self.inner.router.is_candidate_ready(id, generation)
+            || !self.inner.router.commit_candidate(id, generation)
+        {
+            self.inner.router.abort_candidate(id, generation);
+            candidate.terminate();
+            return Err(SupervisorError::UpdateValidationFailed {
+                domain: id.into(),
+                reason: "candidate did not register ready before deadline".into(),
+            });
+        }
+        let pid = candidate.pid;
+        let previous = {
+            let mut state = control.state.lock();
+            state.spec = spec;
+            state.stopped = false;
+            state.restart_count = 0;
+            state.last_spawn = Some(Instant::now());
+            state.process.replace(candidate)
+        };
+        if let Some(mut old) = previous {
+            thread::sleep(Duration::from_millis(600));
+            self.inner
+                .router
+                .cleanup_draining_instance(id, old.instance_id);
+            old.terminate();
+        }
+        Ok(DomainUpdateResult {
+            domain_id: id.into(),
+            new_pid: pid,
+            old_pid,
+            instance_id: generation,
+            status: "updated".into(),
+        })
     }
 }
 impl Drop for DomainSupervisor {
-    fn drop(&mut self){
-        self.inner.shutdown.store(true,Ordering::Release);
-        if let Some(worker)=self.monitor.lock().take(){let _=worker.join();}
-        let ids:Vec<_>=self.inner.domains.read().keys().cloned().collect();for id in ids{self.stop_process_domain(&id);}
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.monitor.lock().take() {
+            let _ = worker.join();
+        }
+        let ids: Vec<_> = self.inner.domains.read().keys().cloned().collect();
+        for id in ids {
+            self.stop_process_domain(&id);
+        }
     }
 }
 
@@ -799,9 +1247,9 @@ impl DomainPipeClient {
 
     /// Receives the next frame (`Deliver(KernelMessage)` or `Receipt(MessageReceipt)`) from the Kernel pipe.
     pub fn recv_frame(&self) -> Result<KernelToDomainFrame, mpsc::RecvError> {
-        let inbox=self.inbox.lock();
+        let inbox = self.inbox.lock();
         let frame = inbox.recv()?;
-        inbox.acknowledge().map_err(|_|mpsc::RecvError)?;
+        inbox.acknowledge().map_err(|_| mpsc::RecvError)?;
         Ok(frame)
     }
 
@@ -810,9 +1258,11 @@ impl DomainPipeClient {
         &self,
         timeout: std::time::Duration,
     ) -> Result<KernelToDomainFrame, mpsc::RecvTimeoutError> {
-        let inbox=self.inbox.lock();
+        let inbox = self.inbox.lock();
         let frame = inbox.recv_timeout(timeout)?;
-        inbox.acknowledge().map_err(|_|mpsc::RecvTimeoutError::Disconnected)?;
+        inbox
+            .acknowledge()
+            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)?;
         Ok(frame)
     }
 
@@ -821,9 +1271,51 @@ impl DomainPipeClient {
         let mut out = Vec::new();
         let inbox = self.inbox.lock();
         while let Ok(frame) = inbox.try_recv() {
-            if inbox.acknowledge().is_err() { break; }
+            if inbox.acknowledge().is_err() {
+                break;
+            }
             out.push(frame);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod domain_resource_acceptance {
+    use super::*;
+    #[test]
+    fn dynamic_domain_metadata_has_explicit_limit_without_breaking_existing_control() {
+        let k = crate::AtelierKernel::new_in_memory().unwrap();
+        for n in 0..1024 {
+            k.supervisor()
+                .inner
+                .ensure(&DomainProcessSpec::new(
+                    format!("bounded_{n}"),
+                    "never-executed",
+                    vec![],
+                ))
+                .unwrap();
+        }
+        assert!(
+            k.supervisor()
+                .inner
+                .ensure(&DomainProcessSpec::new(
+                    "over-limit",
+                    "never-executed",
+                    vec![]
+                ))
+                .is_err()
+        );
+        assert!(
+            k.supervisor()
+                .inner
+                .ensure(&DomainProcessSpec::new(
+                    "bounded_0",
+                    "never-executed",
+                    vec![]
+                ))
+                .is_ok()
+        );
+        assert_eq!(k.supervisor().list_specs().len(), 1024);
     }
 }

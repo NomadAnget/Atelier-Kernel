@@ -149,10 +149,7 @@ fn check_boot_config_file(
             report.violations.push(ConstitutionViolation {
                 rule: "M6".to_string(),
                 location: format!("{} (domain '{}')", loc, spec.domain_id),
-                detail: format!(
-                    "working_dir '{}' does not exist",
-                    work_dir.display()
-                ),
+                detail: format!("working_dir '{}' does not exist", work_dir.display()),
             });
             continue;
         }
@@ -176,10 +173,7 @@ fn check_boot_config_file(
                     report.violations.push(ConstitutionViolation {
                         rule: "M6".to_string(),
                         location: format!("{} (domain '{}')", loc, spec.domain_id),
-                        detail: format!(
-                            "entry script '{}' does not exist",
-                            script_path.display()
-                        ),
+                        detail: format!("entry script '{}' does not exist", script_path.display()),
                     });
                 } else {
                     files_to_scan.insert(script_path);
@@ -204,18 +198,44 @@ fn check_sqlite_schema_drift(
         return;
     };
 
-    if table_exists(&conn,"kernel_outbox") {
-        report.checked_tables+=1;
-        if let Err(err)=verify_sqlite_table_columns(&conn,"kernel_outbox",crate::outbox::OUTBOX_COLUMNS) {
+    if table_exists(&conn, "kernel_sessions") {
+        report.checked_tables += 1;
+        if let Err(err) = verify_sqlite_table_columns(
+            &conn,
+            "kernel_sessions",
+            &["source", "seq", "logical_id", "children"],
+        ) {
             report.violations.push(ConstitutionViolation {
-                rule:"M7".into(),location:format!("{}::kernel_outbox",db_path.display()),detail:err.to_string(),
+                rule: "M7".into(),
+                location: format!("{}::kernel_sessions", db_path.display()),
+                detail: err.to_string(),
             });
         }
     }
-    if table_exists(&conn,"kernel_log_import") {
-        report.checked_tables+=1;
-        if let Err(err)=verify_sqlite_table_columns(&conn,"kernel_log_import",crate::log_spool::CURSOR_COLUMNS) {
-            report.violations.push(ConstitutionViolation {rule:"M7".into(),location:format!("{}::kernel_log_import",db_path.display()),detail:err.to_string()});
+    if table_exists(&conn, "kernel_outbox") {
+        report.checked_tables += 1;
+        if let Err(err) =
+            verify_sqlite_table_columns(&conn, "kernel_outbox", crate::outbox::OUTBOX_COLUMNS)
+        {
+            report.violations.push(ConstitutionViolation {
+                rule: "M7".into(),
+                location: format!("{}::kernel_outbox", db_path.display()),
+                detail: err.to_string(),
+            });
+        }
+    }
+    if table_exists(&conn, "kernel_log_import") {
+        report.checked_tables += 1;
+        if let Err(err) = verify_sqlite_table_columns(
+            &conn,
+            "kernel_log_import",
+            crate::log_spool::CURSOR_COLUMNS,
+        ) {
+            report.violations.push(ConstitutionViolation {
+                rule: "M7".into(),
+                location: format!("{}::kernel_log_import", db_path.display()),
+                detail: err.to_string(),
+            });
         }
     }
     // Check `kernel_ledger` if it exists
@@ -425,12 +445,7 @@ fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
     }
 }
 
-fn scan_python_source(
-    path: &Path,
-    source: &str,
-    depth: usize,
-    report: &mut ConstitutionReport,
-) {
+fn scan_python_source(path: &Path, source: &str, depth: usize, report: &mut ConstitutionReport) {
     // 1. Industry-standard AST analysis via ruff_python_parser
     if let Ok(parsed) = ruff_python_parser::parse_module(source) {
         let mut visitor = PythonConstitutionVisitor {
@@ -459,12 +474,7 @@ fn scan_python_source(
     }
 }
 
-fn scan_python_fallback(
-    path: &Path,
-    source: &str,
-    depth: usize,
-    report: &mut ConstitutionReport,
-) {
+fn scan_python_fallback(path: &Path, source: &str, depth: usize, report: &mut ConstitutionReport) {
     let mut in_triple_double = false;
     let mut in_triple_single = false;
 
@@ -504,18 +514,15 @@ fn scan_python_fallback(
             report.violations.push(ConstitutionViolation {
                 rule: "M4".to_string(),
                 location,
-                detail: "direct sqlite3 access in domain code is forbidden; use kernel.storage messages".to_string(),
+                detail:
+                    "direct sqlite3 access in domain code is forbidden; use kernel.storage messages"
+                        .to_string(),
             });
         }
     }
 }
 
-fn scan_js_source(
-    path: &Path,
-    source: &str,
-    depth: usize,
-    report: &mut ConstitutionReport,
-) {
+fn scan_js_source(path: &Path, source: &str, depth: usize, report: &mut ConstitutionReport) {
     let mut in_block_comment = false;
 
     for (idx, raw_line) in source.lines().enumerate() {

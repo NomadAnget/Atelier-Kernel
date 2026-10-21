@@ -255,7 +255,9 @@ fn print_help() {
     );
     println!("  --cli             Run interactive CLI REPL frontend domain");
     println!("  --auto, -a        Run automated 7-stage kernel verification suite and exit");
-    println!("  --check [path]    Run Machine Constitution (M1-M7) check on config or domain directory");
+    println!(
+        "  --check [path]    Run Machine Constitution (M1-M7) check on config or domain directory"
+    );
     println!("  --init <dir>      Initialize a new product variant directory with config template");
     println!("  --version, -v     Print version information");
     println!("  --help, -h        Print this help message");

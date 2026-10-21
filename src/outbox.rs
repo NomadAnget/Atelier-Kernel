@@ -26,10 +26,20 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), crate::storage::Storag
     Ok(())
 }
 
-pub(crate) fn insert_frame(db:&Connection,channel:&str,frame:&KernelToDomainFrame)->Result<(),crate::storage::StorageError> {
-    let (_,lane)=classify(frame);
-    let id=match frame {KernelToDomainFrame::Deliver(m)=>Some(m.message_id.as_str()),_=>None};
-    db.execute("INSERT INTO kernel_outbox(channel,delivery_id,priority,frame) VALUES(?1,?2,?3,?4)",params![channel,id,lane as i64,serde_json::to_string(frame)?])?;
+pub(crate) fn insert_frame(
+    db: &Connection,
+    channel: &str,
+    frame: &KernelToDomainFrame,
+) -> Result<(), crate::storage::StorageError> {
+    let (_, lane) = classify(frame);
+    let id = match frame {
+        KernelToDomainFrame::Deliver(m) => Some(m.message_id.as_str()),
+        _ => None,
+    };
+    db.execute(
+        "INSERT INTO kernel_outbox(channel,delivery_id,priority,frame) VALUES(?1,?2,?3,?4)",
+        params![channel, id, lane as i64, serde_json::to_string(frame)?],
+    )?;
     Ok(())
 }
 
@@ -49,7 +59,7 @@ struct State {
     bytes: [usize; 3],
     counts: [usize; 3],
     pending: usize,
-    sent: [i64;2],
+    sent: [i64; 2],
     pending_receipts: usize,
     turn: usize,
     lease: Option<Lease>,
@@ -88,7 +98,7 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
             bytes: [0; 3],
             counts: [0; 3],
             pending: 0,
-            sent: [0;2],
+            sent: [0; 2],
             pending_receipts: 0,
             turn: 0,
             lease: None,
@@ -106,8 +116,10 @@ fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
             // Storage failure feedback must not depend on the storage that just failed.
             let failed_storage = r.status == crate::protocol::ContractStatus::ExecutionFailed
                 && r.data.as_ref().is_some_and(|d| {
-                    d.get("error").and_then(|v| v.as_str()) == Some("kernel_persistence_failed")
-                        && d.get("persisted") == Some(&serde_json::Value::Bool(false))
+                    matches!(
+                        d.get("error").and_then(|v| v.as_str()),
+                        Some("kernel_persistence_failed" | "kernel_admission_failed")
+                    ) && d.get("persisted") == Some(&serde_json::Value::Bool(false))
                 });
             (
                 !failed_storage
@@ -134,17 +146,48 @@ fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
     }
 }
 impl PipeSender {
-    pub(crate) fn accept(&self,ledger:&crate::ledger::KernelLedger,msg:&crate::protocol::KernelMessage,seq:u64)->Result<(crate::ledger::DeliveryRecord,bool),QueueError> {
-        if DeliveryPolicy::resolve(&msg.target,&msg.message_type)!=DeliveryPolicy::Durable {
-            let (record,created)=ledger.record_delivery(msg,seq,&self.0.channel);
-            if created {self.send(KernelToDomainFrame::Deliver(msg.clone()))?;}
-            return Ok((record,created));
+    pub(crate) fn accept(
+        &self,
+        ledger: &crate::ledger::KernelLedger,
+        msg: &crate::protocol::KernelMessage,
+        seq: u64,
+    ) -> Result<(crate::ledger::DeliveryRecord, bool), QueueError> {
+        let mut state = self.0.state.lock();
+        if state.closed {
+            return Err(QueueError("domain output disconnected".into()));
         }
-        let mut state=self.0.state.lock();
-        if state.closed{return Err(QueueError("domain output disconnected".into()));}
-        let (record,created)=ledger.record_delivery(msg,seq,&self.0.channel);
-        if created {state.pending+=1;self.0.wake.notify_one();}
-        Ok((record,created))
+        let (record, created) = ledger.record_delivery(msg, seq, &self.0.channel);
+        if created {
+            if DeliveryPolicy::resolve(&msg.target, &msg.message_type) == DeliveryPolicy::Durable {
+                state.pending += 1;
+                self.0.wake.notify_one();
+            } else {
+                let frame = KernelToDomainFrame::Deliver(msg.clone());
+                let bytes = serde_json::to_string(&frame)
+                    .map_err(|e| QueueError(e.to_string()))?
+                    .len();
+                if bytes > MEMORY_BYTES
+                    || state.bytes[1] > MEMORY_BYTES - bytes
+                    || state.counts[1] >= MEMORY_ITEMS
+                {
+                    state.closed = true;
+                    state.failure = Some("nonpersistent domain output budget exhausted".into());
+                    self.0.wake.notify_all();
+                    return Err(QueueError(
+                        "nonpersistent domain output budget exhausted".into(),
+                    ));
+                }
+                state.bytes[1] += bytes;
+                state.counts[1] += 1;
+                state.memory[1].push_back(MemoryItem {
+                    frame,
+                    bytes,
+                    lane: 1,
+                });
+                self.0.wake.notify_one();
+            }
+        }
+        Ok((record, created))
     }
     pub fn send(&self, frame: KernelToDomainFrame) -> Result<(), QueueError> {
         let (mut durable, lane) = classify(&frame);
@@ -169,7 +212,7 @@ impl PipeSender {
             durable = false;
         }
         if durable {
-            let result=insert_frame(&self.0.db.lock(),&self.0.channel,&frame);
+            let result = insert_frame(&self.0.db.lock(), &self.0.channel, &frame);
             if let Err(e) = result {
                 let error = format!("kernel_outbox_persistence_failed: {e}");
                 s.failure = Some(error.clone());
@@ -206,6 +249,9 @@ impl PipeSender {
         }
         self.0.wake.notify_one();
         Ok(())
+    }
+    pub(crate) fn channel_id(&self) -> &str {
+        &self.0.channel
     }
     pub fn failure(&self) -> Option<String> {
         let s = self.0.state.lock();
@@ -324,7 +370,7 @@ impl PipeReceiver {
                     s.closed = true;
                     return Err(QueueError(error));
                 }
-                s.sent[if receipt {0}else{1}]=id;
+                s.sent[if receipt { 0 } else { 1 }] = id;
                 s.pending -= 1;
                 if receipt {
                     s.pending_receipts -= 1;
@@ -346,7 +392,8 @@ fn close(inner: &Inner) {
     s.bytes = [0; 3];
     s.counts = [0; 3];
     s.lease = None;
-    // Lifecycle ledger failure is recorded by the router before discarding this generation's queue.
+    // Only already committed terminal envelopes are cleaned here. The ledger closes live
+    // deliveries after transport closure and removes their envelopes in the terminal transaction.
     if let Err(e) = inner.db.lock().execute(
         "DELETE FROM kernel_outbox WHERE channel=?1 AND (delivery_id IS NULL OR EXISTS(SELECT 1 FROM kernel_ledger WHERE message_id=delivery_id AND status IN ('completed','execution_failed','contract_invalid','target_invalid')))",
         [&inner.channel],
@@ -492,20 +539,18 @@ mod tests {
         assert!(sender.drain_frames().iter().any(|f|matches!(f,KernelToDomainFrame::Receipt(r) if r.message_id==ids[0] && r.status==ContractStatus::ExecutionFailed)));
     }
     #[test]
-    fn startup_closes_stale_generation_without_automatic_replay() {
+    fn transport_schema_initialization_does_not_mutate_ledger_facts() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE kernel_ledger(message_id TEXT,status TEXT,data TEXT); INSERT INTO kernel_ledger VALUES('pending','sent',NULL);").unwrap();
         initialize(&conn).unwrap();
-        conn.execute("INSERT INTO kernel_outbox(channel,delivery_id,priority,frame) VALUES ('old','pending',1,'{}')",[]).unwrap();
-        initialize(&conn).unwrap();
         let status: String = conn
-            .query_row("SELECT status FROM kernel_ledger", [], |r| r.get(0))
+            .query_row("SELECT status FROM kernel_ledger", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(status, "execution_failed");
-        let pending: i64 = conn
-            .query_row("SELECT count(*) FROM kernel_outbox", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(pending, 0);
+        assert_eq!(
+            status, "sent",
+            "startup recovery belongs to the ledger's atomic transaction, not transport schema setup"
+        );
+        // End-to-end process recovery is covered in tests/core_reliability.rs and outbox_backpressure.rs.
     }
     #[test]
     fn outbox_insert_failure_is_explicit_and_does_not_accept_payload() {

@@ -247,6 +247,9 @@ class AsyncRuntime(MessageClient):
         self.report_receipt(frame['message_id'],frame['target'],'execution_failed',dict(code=code,error=code,reason=reason))
 
     def _dispatch(self,frame):
+        if len(self._active)>=1024:
+            self._reply_error(frame,'sdk_execution_capacity_exhausted','domain execution capacity reached')
+            return
         task=asyncio.create_task(self._execute(frame))
         self._active[task]=frame
         def done(item):
@@ -364,14 +367,7 @@ class AsyncRuntime(MessageClient):
             self._diagnostic('SDK lossy listener error: %s', error)
 
     def _invoke_event_listener(self, listener, payload):
-        try:
-            res = listener(payload)
-            if inspect.isawaitable(res):
-                task = asyncio.create_task(res)
-                self._callbacks.add(task)
-                task.add_done_callback(self._callbacks.discard)
-        except Exception as e:
-            self._diagnostic("SDK system event listener error: %s", e)
+        self._invoke_lossy_event_listener(listener,payload,'_system_event_busy')
 
     async def run_async(self,on_start=None,on_close=None):
         if self._state!='new':raise RuntimeError('domain receive session already started or closed')

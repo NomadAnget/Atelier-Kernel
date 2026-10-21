@@ -43,8 +43,8 @@ fn starting_own_domain_must_return_or_reject_without_recursive_gate_deadlock() {
     std::thread::spawn(move || {
         let _keep_alive=kernel;
         client.send(vec!["kernel.supervisor".into()],"StartDomain",json!({
-            "domain":"selfprobe","spec":{"domain_id":"selfprobe","command":"/bin/true",
-            "args":[],"auto_restart":false}}),json!({}));
+            "domain":"selfprobe","spec":{"domain_id":"selfprobe","command":"/bin/sh",
+            "args":["-c","exit 0"],"auto_restart":false}}),json!({}));
         let _=done_tx.send(());
     });
     assert!(done_rx.recv_timeout(std::time::Duration::from_secs(3)).is_ok(),

@@ -1,6 +1,6 @@
 # 最终复审六项修复的验收记录
 
-状态：实现已完成，本地集中验收通过；尚未提交或推送，用户已授权提交推送，等待云端原生三平台结果。基线为 `be1b0ee`，保留 [修复前审查记录](FINAL_RELIABILITY_REVIEW.md) 和 `tmp/final-review/repeat-{1,2,3}.log`。
+状态：六项修复与本地/云端验收全部通过。实现提交 `29c20c0` 已推送到 main；未发版或部署。修复前基线 `be1b0ee`，原始复审和失败证据保留。
 
 ## 修复与所有权
 
@@ -19,7 +19,7 @@
 
 - 最终 Rust 主套件：**92 passed，0 failed**。另 4 项显式 ignored 故障/测量夹具不计为普通通过；其中隔离子进程夹具由相应恢复测试调用。
 - 九组 Python/Node SDK 检查通过，包括真实原生内核下的观察查询与自身重启；公开 SDK 文件与协议类型未修改。
-- Windows GNU 目标 all-targets 编译检查通过。它不是 Windows 原生运行证明；Windows/macOS/Linux 云端矩阵仍待本轮提交推送后执行，不能引用旧提交的绿灯作为本轮完成。
+- Windows GNU 目标 all-targets 编译检查通过。Windows/macOS/Linux 云端原生矩阵也已通过；Rust 与九组 SDK 步骤全部成功。[Actions 39663133119](https://github.com/NomadAnget/Atelier-Kernel/actions/runs/39663133119) 对应实现提交 29c20c0。
 - 原六项审查探针修后对照：第二宿主不再被接受；第一宿主收到 Completed 且保存实际结果；损坏查询/patch 为 ExecutionFailed 且原文保留；非法域启动拒绝；正常完成身份为 0；撤销来源不能投递/恢复注册；释放宿主后旧 PID 和 Router 均已消失。
 
 证据在 `tmp/final-fix-acceptance/`：`rust-final.log`、九个 `sdk_*.log`、`windows-check.log`、`old-probes-after.log`、机器核对 `verify.py` 与 `summary.json`。原失败证据未覆盖。
@@ -29,6 +29,6 @@
 - 没有改变现有信封/回执、SDK 方法、消息 ID、路由或业务域调用方式；持久表结构不变，可信失败标志只在内核私有内存库。
 - Observer 和实时日志副本仍允许缺口，没有变成持久事件系统。
 - 数据库宿主锁文件会保留为空文件，OS 锁才是活性依据；禁止删除运行中守卫文件以强行启动第二宿主。普通软链接路径会规范化，硬链接数据库不作为安全 SQLite WAL 部署方式接受。
-- 本轮未修改依赖声明/锁文件，未操作生产目录/数据库、运行服务或模型资源；没有提交、推送、发版或部署。
+- 本轮未修改依赖声明/锁文件，未操作生产目录/数据库、运行服务或模型资源；已按用户明确授权提交并推送实现与验收记录；没有发版或部署。
 
-本地交付已可审查。完整计划的最终云端平台项尚未关闭，需要用户明确授权本轮提交与推送；不擅自创建版本或同步生产。
+完整计划已关闭。云端原始结果另存 tmp/final-fix-acceptance/cloud-result.json；发布任务保持 skipped，不创建版本标签，不同步生产。

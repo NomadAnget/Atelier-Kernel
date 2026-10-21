@@ -116,3 +116,5 @@
 六项新发现的执行目标、顺序及集中验收清单已记录于 [修复计划](docs/CORE_RELIABILITY_FIX_PLAN.md)。当前仅建立计划，尚未开始实现，等待用户手动启动。
 
 2026-10-22 修复进展：R1–R6 主体已完成，原探针修后行为符合契约，本地 Rust 92 项及九组双 SDK 通过。详情见 [六项修复验收](docs/CORE_RELIABILITY_FIX_ACCEPTANCE.md)。本轮尚未提交推送，原生云端三平台验收待本轮授权，不能以旧提交的 CI 结果代替。未发版或修改生产。
+
+2026-10-22 最终结果：六项修复已由用户授权推送 main（实现提交 29c20c0）。本地 92 项 Rust、九组双 SDK，及云端 Ubuntu/macOS/Windows 的 Rust 和 SDK 原生矩阵全部成功：[Actions 39663133119](https://github.com/NomadAnget/Atelier-Kernel/actions/runs/39663133119)。修复计划已全部勾选，证据索引见修复验收记录。未发版、未部署、未改运行服务。

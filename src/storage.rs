@@ -332,13 +332,14 @@ impl DomainStorageEngine {
         let rows = stmt.query_map([], |row| {
             let params_raw: String = row.get(4)?;
             let data_raw: String = row.get(5)?;
+            let record_id: String = row.get(0)?;
             Ok(StoredRecord {
-                record_id: row.get(0)?,
+                record_id: record_id.clone(),
                 message_id: row.get(1)?,
                 category: row.get(2)?,
                 message_type: row.get(3)?,
-                params: serde_json::from_str(&params_raw).unwrap_or(Value::Null),
-                data: serde_json::from_str(&data_raw).unwrap_or(Value::Null),
+                params: Self::decode_record_json(table, &record_id, "params", 4, &params_raw)?,
+                data: Self::decode_record_json(table, &record_id, "data", 5, &data_raw)?,
                 created_at: row.get(6)?,
                 updated_at: row.get(7)?,
             })
@@ -405,12 +406,13 @@ impl DomainStorageEngine {
             }));
         };
 
-        let mut final_data: Value = serde_json::from_str(&existing_raw).unwrap_or(Value::Null);
-        if patch_mode {
-            merge_json_objects(&mut final_data, &msg.data);
+        let final_data = if patch_mode {
+            let mut value = Self::decode_record_json(table, record_id, "data", 0, &existing_raw)?;
+            merge_json_objects(&mut value, &msg.data);
+            value
         } else {
-            final_data = msg.data.clone();
-        }
+            msg.data.clone()
+        };
 
         let new_data_str = serde_json::to_string(&final_data)?;
         let now = now_millis();
@@ -455,6 +457,24 @@ impl DomainStorageEngine {
         }))
     }
 
+    fn decode_record_json(
+        table: &str,
+        record: &str,
+        field: &str,
+        index: usize,
+        raw: &str,
+    ) -> rusqlite::Result<Value> {
+        serde_json::from_str(raw).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("corrupt JSON in {table} record {record:?} field {field}: {error}"),
+                )),
+            )
+        })
+    }
     fn table_name(domain: &str) -> Result<String, StorageError> {
         if domain.is_empty()
             || !domain

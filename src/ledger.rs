@@ -83,6 +83,7 @@ pub struct KernelLedger {
     memory: Mutex<Connection>,
     pub(crate) db_conn: Option<Arc<Mutex<Connection>>>,
     gates: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    _owner: Option<std::fs::File>,
 }
 const MAX_LIVE: i64 = 65_536;
 const MAX_TRANSIENT_BYTES: i64 = 64 * 1024 * 1024;
@@ -103,7 +104,68 @@ impl KernelLedger {
         Self::open_with_db(None).expect("cannot initialize kernel ledger")
     }
     pub fn open_with_db(path: Option<&Path>) -> Result<Self, StorageError> {
-        let mut db = match path {
+        let prepared = path
+            .map(|path| -> Result<_, StorageError> {
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent)?;
+                }
+                // Creating an empty file is safe; no SQLite/recovery mutation precedes the guard.
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(path)?;
+                let canonical = path.canonicalize()?;
+                // SQLite WAL databases must have a single filesystem name. A hard-link alias
+                // has a different WAL/lock filename, so reject it rather than recover it.
+                #[cfg(unix)]
+                let metadata = std::fs::metadata(&canonical)?;
+                #[cfg(unix)]
+                let links = { use std::os::unix::fs::MetadataExt; metadata.nlink() };
+                #[cfg(windows)]
+                let links = {
+                    use std::os::windows::io::AsRawHandle;
+                    #[repr(C)]
+                    #[derive(Default)]
+                    struct FileInformation {
+                        attributes: u32, creation: [u32;2], access: [u32;2], write: [u32;2],
+                        volume: u32, size_high: u32, size_low: u32, links: u32, index_high: u32, index_low: u32,
+                    }
+                    #[link(name="kernel32")]
+                    unsafe extern "system" {
+                        fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut FileInformation) -> i32;
+                    }
+                    let file=std::fs::File::open(&canonical)?;
+                    let mut info=FileInformation::default();
+                    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    info.links as u64
+                };
+                #[cfg(not(any(unix, windows)))]
+                let links = 1;
+                if links > 1 {
+                    return Err(StorageError::Io(std::io::Error::other("hard-linked SQLite database is unsafe; use its canonical path or a symbolic link")));
+                }
+                let mut lock_path = canonical.as_os_str().to_os_string();
+                lock_path.push(".kernel-owner.lock");
+                let owner = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(std::path::PathBuf::from(lock_path))?;
+                owner.try_lock().map_err(|error| {
+                    StorageError::Io(std::io::Error::other(format!(
+                        "cannot acquire exclusive kernel database owner for {}: {error}",
+                        canonical.display()
+                    )))
+                })?;
+                Ok((canonical, owner))
+            })
+            .transpose()?;
+        let mut db = match prepared.as_ref().map(|(path, _)| path) {
             Some(p) => {
                 if let Some(parent) = p.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent)?;
@@ -169,7 +231,7 @@ impl KernelLedger {
         memory.execute_batch(
             "ALTER TABLE kernel_sessions ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;",
         )?;
-        memory.execute_batch("CREATE TABLE identities(message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,source TEXT NOT NULL,seq INTEGER NOT NULL,origin INTEGER NOT NULL DEFAULT 0,channel TEXT,record TEXT);
+        memory.execute_batch("CREATE TABLE identities(message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,source TEXT NOT NULL,seq INTEGER NOT NULL,origin INTEGER NOT NULL DEFAULT 0,channel TEXT,record TEXT,persistence_failed INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX identities_logical ON identities(logical_id);
             CREATE TABLE highwater(source TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
         Ok(Self {
@@ -178,7 +240,16 @@ impl KernelLedger {
             memory: Mutex::new(memory),
             db_conn: Some(Arc::new(Mutex::new(db))),
             gates: Mutex::new(HashMap::new()),
+            _owner: prepared.map(|(_, owner)| owner),
         })
+    }
+    pub(crate) fn database_path(&self) -> Option<std::path::PathBuf> {
+        self.db_conn
+            .as_ref()
+            .unwrap()
+            .lock()
+            .path()
+            .map(std::path::PathBuf::from)
     }
     pub(crate) fn message_gate(&self, id: &str) -> Arc<Mutex<()>> {
         let mut gates = self.gates.lock();
@@ -238,7 +309,13 @@ impl KernelLedger {
     }
     fn remember_failure(&self, r: &DeliveryRecord) {
         // Failure feedback never depends on the disk which failed. Space is reserved at ingress.
-        Self::write(&self.memory.lock(), r).expect("kernel cannot retain reserved failure state");
+        let mem = self.memory.lock();
+        Self::write(&mem, r).expect("kernel cannot retain reserved failure state");
+        mem.execute(
+            "UPDATE identities SET persistence_failed=1 WHERE message_id=?1",
+            [&r.message_id],
+        )
+        .expect("failure provenance");
     }
     pub fn generate_message_id(&self) -> String {
         format!(
@@ -418,6 +495,18 @@ impl KernelLedger {
             .expect("live channel lookup")
             .unwrap_or(false)
     }
+    pub(crate) fn has_unpersisted_failure(&self, id: &str) -> bool {
+        self.memory
+            .lock()
+            .query_row(
+                "SELECT persistence_failed FROM identities WHERE message_id=?1",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()
+            .expect("failure provenance lookup")
+            .unwrap_or(false)
+    }
     pub(crate) fn finish_publication(&self, r: &MessageReceipt) {
         if !r.status.is_terminal() {
             return;
@@ -425,12 +514,13 @@ impl KernelLedger {
         let policy = DeliveryPolicy::resolve(&r.target, &r.message_type);
         let mem = self.memory.lock();
         let abandoned:bool=mem.query_row("SELECT NOT EXISTS(SELECT 1 FROM identities i JOIN highwater h ON h.source=i.source WHERE i.message_id=?1)",[&r.message_id],|row|row.get(0)).expect("source lifetime query");
-        if r.data.as_ref().is_some_and(|v| v["persisted"] == false) && !abandoned {
+        let unpersisted: bool = mem.query_row("SELECT coalesce((SELECT persistence_failed FROM identities WHERE message_id=?1),0)",[&r.message_id], |row|row.get(0)).expect("publication provenance");
+        if unpersisted && !abandoned {
             return;
         }
         if abandoned {
             mem.execute(
-                "DELETE FROM kernel_ledger WHERE message_id=?1 AND status='execution_failed' AND json_extract(data,'$.error')='kernel_persistence_failed'",
+                "DELETE FROM kernel_ledger WHERE message_id=?1 AND message_id IN (SELECT message_id FROM identities WHERE persistence_failed=1)",
                 [&r.message_id],
             )
             .expect("exited source result cleanup");
@@ -451,7 +541,7 @@ impl KernelLedger {
     pub fn clear_session_dedup_for_domain(&self, source: &str) {
         {
             let mem = self.memory.lock();
-            mem.execute("DELETE FROM kernel_ledger WHERE status='execution_failed' AND json_extract(data,'$.error')='kernel_persistence_failed' AND message_id IN (SELECT value FROM kernel_sessions,json_each(children) WHERE source=?1)",[source]).expect("finished source results cleanup");
+            mem.execute("DELETE FROM kernel_ledger WHERE message_id IN (SELECT message_id FROM identities WHERE source=?1 AND persistence_failed=1)",[source]).expect("finished source results cleanup");
             mem.execute("DELETE FROM identities WHERE source=?1 AND record IS NOT NULL AND json_extract(record,'$.status') IN ('completed','execution_failed','contract_invalid','target_invalid')",[source]).expect("finished source context cleanup");
             mem.execute("DELETE FROM kernel_sessions WHERE source=?1", [source])
                 .expect("memory session cleanup");
@@ -692,7 +782,7 @@ impl KernelLedger {
         }
         if !resident_terminal
             && old.status == ContractStatus::ExecutionFailed
-            && old.data.as_ref().is_some_and(|d| d["persisted"] == false)
+            && self.has_unpersisted_failure(id)
         {
             return ReceiptTransition::Advanced {
                 source_domain: old.source_domain.clone(),

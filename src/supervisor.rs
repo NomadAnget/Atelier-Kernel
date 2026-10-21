@@ -119,26 +119,16 @@ impl KernelBootConfig {
     pub fn validate(&self, path_str: &str) -> Result<(), SupervisorError> {
         let mut seen = HashSet::new();
         for spec in &self.domains {
-            let id = spec.domain_id.trim();
-            if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                return Err(SupervisorError::ConfigValidationFailed {
-                    path: path_str.to_string(),
-                    reason: format!(
-                        "[M1] invalid domain_id '{}': must be non-empty ASCII alphanumeric or '_'",
-                        spec.domain_id
-                    ),
-                });
-            }
+            spec.validate()
+                .map_err(|reason| SupervisorError::ConfigValidationFailed {
+                    path: path_str.into(),
+                    reason,
+                })?;
+            let id = spec.domain_id.as_str();
             if !seen.insert(id.to_string()) {
                 return Err(SupervisorError::ConfigValidationFailed {
                     path: path_str.to_string(),
                     reason: format!("[M1/M6] duplicate domain_id '{id}' in domains list"),
-                });
-            }
-            if spec.command.trim().is_empty() {
-                return Err(SupervisorError::ConfigValidationFailed {
-                    path: path_str.to_string(),
-                    reason: format!("[M6] domain '{id}' has an empty command"),
                 });
             }
         }
@@ -191,6 +181,31 @@ impl Default for DomainProcessSpec {
 }
 
 impl DomainProcessSpec {
+    fn validate(&self) -> Result<(), String> {
+        if self.domain_id.is_empty()
+            || !self
+                .domain_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return Err(format!(
+                "[M1] invalid domain_id {:?}: expected non-empty ASCII alphanumeric or '_'",
+                self.domain_id
+            ));
+        }
+        if self.command.trim().is_empty()
+            || self.command.contains('\0')
+            || self.args.iter().any(|arg| arg.contains('\0'))
+        {
+            return Err("[M6] empty command or NUL in process arguments".into());
+        }
+        if let Some(dir) = &self.working_dir {
+            if dir.contains('\0') || !std::path::Path::new(dir).is_dir() {
+                return Err(format!("[M6] working_dir is not a directory: {dir:?}"));
+            }
+        }
+        Ok(())
+    }
     pub fn new(
         domain_id: impl Into<String>,
         command: impl Into<String>,
@@ -516,6 +531,11 @@ impl DomainSupervisorInner {
         self.domains.read().get(id).cloned()
     }
     fn ensure(&self, spec: &DomainProcessSpec) -> Result<Arc<DomainControl>, SupervisorError> {
+        spec.validate()
+            .map_err(|reason| SupervisorError::ConfigValidationFailed {
+                path: "dynamic process specification".into(),
+                reason,
+            })?;
         let mut domains = self.domains.write();
         if domains.len() >= 1024 && !domains.contains_key(&spec.domain_id) {
             return Err(SupervisorError::SpawnFailed {
@@ -967,6 +987,31 @@ impl DomainSupervisor {
             monitor: Mutex::new(Some(handle)),
         }
     }
+    pub(crate) fn shutdown_signal(&self) -> Arc<AtomicBool> {
+        self.inner.shutdown.clone()
+    }
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.inner.shutdown.load(Ordering::Acquire)
+    }
+    pub(crate) fn shutdown(&self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.monitor.lock().take() {
+            let _ = worker.join();
+        }
+        let ids: Vec<_> = self.inner.domains.read().keys().cloned().collect();
+        for id in ids {
+            self.stop_process_domain(&id);
+        }
+    }
+    fn require_running(&self, domain: &str) -> Result<(), SupervisorError> {
+        if self.is_shutting_down() {
+            return Err(SupervisorError::SpawnFailed {
+                domain: domain.into(),
+                source: std::io::Error::other("kernel host is closing"),
+            });
+        }
+        Ok(())
+    }
     pub fn router(&self) -> &Arc<KernelRouter> {
         &self.inner.router
     }
@@ -1010,8 +1055,10 @@ impl DomainSupervisor {
     }
     pub fn spawn_process_domain(&self, spec: DomainProcessSpec) -> Result<u32, SupervisorError> {
         let id = spec.domain_id.clone();
+        self.require_running(&id)?;
         let control = self.inner.ensure(&spec)?;
         let _operation = control.operation.lock();
+        self.require_running(&id)?;
         let previous = {
             let mut state = control.state.lock();
             state.stopped = false;
@@ -1082,8 +1129,10 @@ impl DomainSupervisor {
                 reason: "candidate domain identity mismatch".into(),
             });
         }
+        self.require_running(id)?;
         let control = self.inner.ensure(&spec)?;
         let operation = control.operation.lock();
+        self.require_running(id)?;
         let old_pid = control.state.lock().process.as_ref().map(|p| p.pid);
         if old_pid.is_none() {
             drop(operation);
@@ -1109,7 +1158,8 @@ impl DomainSupervisor {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        if candidate.exited()
+        if self.is_shutting_down()
+            || candidate.exited()
             || candidate.drain.load(Ordering::Acquire)
             || !self.inner.router.is_candidate_ready(id, generation)
             || !self.inner.router.commit_candidate(id, generation)
@@ -1148,14 +1198,7 @@ impl DomainSupervisor {
 }
 impl Drop for DomainSupervisor {
     fn drop(&mut self) {
-        self.inner.shutdown.store(true, Ordering::Release);
-        if let Some(worker) = self.monitor.lock().take() {
-            let _ = worker.join();
-        }
-        let ids: Vec<_> = self.inner.domains.read().keys().cloned().collect();
-        for id in ids {
-            self.stop_process_domain(&id);
-        }
+        self.shutdown();
     }
 }
 

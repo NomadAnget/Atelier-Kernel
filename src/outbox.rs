@@ -112,22 +112,10 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
 }
 fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
     match frame {
-        KernelToDomainFrame::Receipt(r) => {
-            // Storage failure feedback must not depend on the storage that just failed.
-            let failed_storage = r.status == crate::protocol::ContractStatus::ExecutionFailed
-                && r.data.as_ref().is_some_and(|d| {
-                    matches!(
-                        d.get("error").and_then(|v| v.as_str()),
-                        Some("kernel_persistence_failed" | "kernel_admission_failed")
-                    ) && d.get("persisted") == Some(&serde_json::Value::Bool(false))
-                });
-            (
-                !failed_storage
-                    && DeliveryPolicy::resolve(&r.target, &r.message_type)
-                        == DeliveryPolicy::Durable,
-                0,
-            )
-        }
+        KernelToDomainFrame::Receipt(r) => (
+            DeliveryPolicy::resolve(&r.target, &r.message_type) == DeliveryPolicy::Durable,
+            0,
+        ),
         KernelToDomainFrame::Deliver(m) => {
             if m.target.starts_with("kernel.")
                 && matches!(
@@ -190,7 +178,17 @@ impl PipeSender {
         Ok((record, created))
     }
     pub fn send(&self, frame: KernelToDomainFrame) -> Result<(), QueueError> {
+        self.send_inner(frame, false)
+    }
+    pub(crate) fn send_unpersisted_failure(
+        &self,
+        frame: KernelToDomainFrame,
+    ) -> Result<(), QueueError> {
+        self.send_inner(frame, true)
+    }
+    fn send_inner(&self, frame: KernelToDomainFrame, unpersisted: bool) -> Result<(), QueueError> {
         let (mut durable, lane) = classify(&frame);
+        durable &= !unpersisted;
         let encoded = serde_json::to_string(&frame).map_err(|e| QueueError(e.to_string()))?;
         let mut s = self.0.state.lock();
         if s.closed {

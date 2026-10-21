@@ -109,3 +109,10 @@
 - 注入终态持久化失败并同时使回执不可达：保留存活会话的失败身份，返回状态为 ExecutionFailed/persisted=false，不伪装为成功或持久终态。
 - 边界：上述查询验证针对 Rust KernelLedger 现有 API；现有跨进程 SDK 没有按旧 ID 查询账本/重启后自动取回旧回执的协议。新源进程不接收旧代际的主动补发；观察历史查询也不是完整持久结果接口。这里没有新增查询、重连或业务补偿接口。
 - 证据：`tmp/core-final-acceptance/exit-drain-before.log`（修复前确定性失败）、`exit-drain-all.log`、`exit-drain-windows-check.log`、`receipt-publication-check.log`。
+## 2026-10-22 最终复审：六项新发现，尚不能判定最终验收完成
+
+以 be1b0ee 为基线，原有 83 项 Rust 测试通过，但新增隔离探针连续三轮确认：同库第二宿主破坏活跃消息（P1）、损坏域存储 JSON 静默变 null 且 patch 覆盖原文（P1）、Faulted 旧代际仍能提交与恢复注册（P1）、业务 persisted=false 阻止终态身份回收（P2）、异步更新保活已释放宿主（P2）、动态启动绕过域名校验（P2）。详见 [最终可靠性复审](docs/FINAL_RELIABILITY_REVIEW.md)，证据在 tmp/final-review/。本轮仅审查和复现，未改内核实现，未提交推送或发版。此前阶段性验收结论不覆盖这六项边界。
+
+六项新发现的执行目标、顺序及集中验收清单已记录于 [修复计划](docs/CORE_RELIABILITY_FIX_PLAN.md)。当前仅建立计划，尚未开始实现，等待用户手动启动。
+
+2026-10-22 修复进展：R1–R6 主体已完成，原探针修后行为符合契约，本地 Rust 92 项及九组双 SDK 通过。详情见 [六项修复验收](docs/CORE_RELIABILITY_FIX_ACCEPTANCE.md)。本轮尚未提交推送，原生云端三平台验收待本轮授权，不能以旧提交的 CI 结果代替。未发版或修改生产。

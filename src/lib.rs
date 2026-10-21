@@ -70,8 +70,9 @@ impl AtelierKernel {
     /// Creates a new Atelier Kernel backed by a persistent SQLite database file.
     pub fn open_with_db(db_path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let ledger = Arc::new(KernelLedger::open_with_db(Some(db_path.as_ref()))?);
-        let storage = Arc::new(DomainStorageEngine::open_file(db_path.as_ref())?);
-        let logger = Arc::new(KernelLogHub::new(Some(db_path.as_ref()))?);
+        let path = ledger.database_path().expect("file-backed database path");
+        let storage = Arc::new(DomainStorageEngine::open_file(&path)?);
+        let logger = Arc::new(KernelLogHub::new(Some(&path))?);
         Ok(Self::from_components(ledger, storage, logger))
     }
 
@@ -132,5 +133,13 @@ impl AtelierKernel {
     /// Attaches an in-process Domain endpoint bound to `domain_id`.
     pub fn attach_domain(&self, domain_id: &str) -> DomainPipeClient {
         self.supervisor.attach_in_process_domain(domain_id)
+    }
+}
+
+impl Drop for AtelierKernel {
+    fn drop(&mut self) {
+        // Signal while this host still owns its supervisor, independent of background Arcs.
+        self.supervisor.shutdown();
+        self.router.finish_shutdown();
     }
 }

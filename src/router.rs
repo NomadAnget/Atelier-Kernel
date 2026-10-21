@@ -184,7 +184,7 @@ pub struct KernelRouter {
     /// Handle to the background observer fanout worker thread.
     observer_pump_handle: Mutex<Option<thread::JoinHandle<()>>>,
     /// Optional back-reference to domain supervisor for runtime queries and domain control.
-    supervisor: RwLock<Option<Weak<crate::supervisor::DomainSupervisor>>>,
+    supervisor: RwLock<Option<(Weak<crate::supervisor::DomainSupervisor>, Arc<AtomicBool>)>>,
     control_inflight: Arc<AtomicUsize>,
 }
 
@@ -324,12 +324,30 @@ impl KernelRouter {
         }
     }
 
+    pub(crate) fn finish_shutdown(&self) {
+        // The supervisor's closing flag rejects new input. Wait out frames that entered
+        // before it was set, then their bounded lifecycle workers. No lock is held while waiting.
+        let gates: Vec<_> = self.domain_gates.read().values().cloned().collect();
+        for gate in gates {
+            drop(gate.lock());
+        }
+        while self.control_inflight.load(Ordering::Acquire) != 0 {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
     pub fn set_supervisor(&self, supervisor: Weak<crate::supervisor::DomainSupervisor>) {
-        *self.supervisor.write() = Some(supervisor);
+        let closing = supervisor.upgrade().map_or_else(
+            || Arc::new(AtomicBool::new(true)),
+            |owner| owner.shutdown_signal(),
+        );
+        *self.supervisor.write() = Some((supervisor, closing));
     }
 
     pub fn supervisor(&self) -> Option<Arc<crate::supervisor::DomainSupervisor>> {
-        self.supervisor.read().as_ref().and_then(|w| w.upgrade())
+        self.supervisor
+            .read()
+            .as_ref()
+            .and_then(|(owner, _)| owner.upgrade())
     }
 
     pub fn observer_subscribers_count(&self) -> usize {
@@ -404,7 +422,7 @@ impl KernelRouter {
         let _domain_guard = gate.lock();
 
         if let Some(previous) = self.domain_instance_id(domain_id) {
-            self.mark_domain_faulted_for_instance(
+            self.mark_domain_faulted_locked(
                 domain_id,
                 Some(previous),
                 "domain process generation replaced",
@@ -521,6 +539,8 @@ impl KernelRouter {
 
     /// Aborts a candidate instance without altering the active routes.
     pub fn abort_candidate(&self, domain: &str, generation: u64) -> bool {
+        let gate = self.domain_gate(domain);
+        let _domain_guard = gate.lock();
         let candidate = {
             let mut domains = self.domains.write();
             domains.get_mut(domain).and_then(|e| {
@@ -547,6 +567,8 @@ impl KernelRouter {
 
     /// Removes an old instance from draining once all in-flight messages have been reaped.
     pub fn cleanup_draining_instance(&self, domain_id: &str, instance_id: u64) {
+        let gate = self.domain_gate(domain_id);
+        let _domain_guard = gate.lock();
         let old = {
             let mut domains = self.domains.write();
             domains.get_mut(domain_id).and_then(|e| {
@@ -583,10 +605,20 @@ impl KernelRouter {
 
     /// Validates whether an instance_id belongs to the active, candidate, or draining generation.
     pub fn is_valid_instance_for_domain(&self, domain_id: &str, instance_id: u64) -> bool {
+        // Share the supervisor's existing signal, never temporarily own the supervisor
+        // while holding an input gate (its last Arc could otherwise run Drop recursively).
+        if self
+            .supervisor
+            .read()
+            .as_ref()
+            .is_some_and(|(_, closing)| closing.load(Ordering::Acquire))
+        {
+            return false;
+        }
         let domains = self.domains.read();
         if let Some(entry) = domains.get(domain_id) {
             if entry.instance_id == instance_id {
-                return true;
+                return entry.pipe_tx.is_some();
             }
             if let Some(c) = &entry.candidate {
                 if c.instance_id == instance_id {
@@ -714,11 +746,10 @@ impl KernelRouter {
     pub fn handle_raw_pipe_line(&self, authenticated_domain: &str, raw_line: &str) {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
-        self.handle_raw_pipe_line_inner(
-            authenticated_domain,
-            self.domain_instance_id(authenticated_domain).unwrap_or(0),
-            raw_line,
-        );
+        let instance = self.domain_instance_id(authenticated_domain).unwrap_or(0);
+        if self.is_valid_instance_for_domain(authenticated_domain, instance) {
+            self.handle_raw_pipe_line_inner(authenticated_domain, instance, raw_line);
+        }
     }
 
     fn handle_raw_pipe_line_inner(
@@ -795,11 +826,11 @@ impl KernelRouter {
     ) -> Option<Vec<String>> {
         let gate = self.domain_gate(authenticated_domain);
         let _domain_guard = gate.lock();
-        self.handle_frame_inner(
-            authenticated_domain,
-            self.domain_instance_id(authenticated_domain).unwrap_or(0),
-            frame,
-        )
+        let instance = self.domain_instance_id(authenticated_domain).unwrap_or(0);
+        if !self.is_valid_instance_for_domain(authenticated_domain, instance) {
+            return None;
+        }
+        self.handle_frame_inner(authenticated_domain, instance, frame)
     }
 
     fn handle_frame_inner(
@@ -840,11 +871,8 @@ impl KernelRouter {
         authenticated_domain: &str,
         outbound: OutboundMessage,
     ) -> Vec<String> {
-        self.handle_outbound_message_inner(
-            authenticated_domain,
-            self.domain_instance_id(authenticated_domain).unwrap_or(0),
-            outbound,
-        )
+        self.handle_frame(authenticated_domain, DomainToKernelFrame::Send(outbound))
+            .unwrap_or_default()
     }
     fn handle_outbound_message_inner(
         &self,
@@ -885,10 +913,10 @@ impl KernelRouter {
                     .map(|_| self.ledger.generate_message_id())
                     .collect();
                 for (target, id) in targets.iter().zip(&ids) {
-                    self.send_to_instance(authenticated_domain,Some(instance_id),KernelToDomainFrame::Receipt(MessageReceipt {
+                    self.send_to_instance_inner(authenticated_domain,Some(instance_id),KernelToDomainFrame::Receipt(MessageReceipt {
                         logical_id:logical.clone(),message_id:id.clone(),seq:outbound.seq,target:target.clone(),message_type:outbound.message_type.clone(),
                         status:ContractStatus::ExecutionFailed,data:Some(json!({"error":"kernel_admission_failed","reason":error.to_string(),"persisted":false})),timestamp:now_millis(),
-                    }));
+                    }), true);
                 }
                 return ids;
             }
@@ -2179,12 +2207,7 @@ impl KernelRouter {
                 &msg.message_type,
                 receipt.status,
                 if receipt.status == final_status
-                    && receipt
-                        .data
-                        .as_ref()
-                        .and_then(|v| v.get("error"))
-                        .and_then(Value::as_str)
-                        != Some("kernel_persistence_failed")
+                    && !self.ledger.has_unpersisted_failure(&receipt.message_id)
                 {
                     observed_data
                 } else {
@@ -2199,7 +2222,7 @@ impl KernelRouter {
     /// If the target does not exist or is not Active, does NOT send the message and immediately returns `TargetInvalid`.
     fn dispatch_domain_target(&self, source_domain: &str, seq: u64, msg: KernelMessage) {
         let gate = self.ledger.message_gate(&msg.message_id);
-        let publication = gate.lock();
+        let _publication = gate.lock();
         let target = msg.target.clone();
 
         // Check route table and target domain active pipe along with its generation `instance_id`.
@@ -2217,7 +2240,7 @@ impl KernelRouter {
             })
         };
 
-        let Some((target_instance_id, target_pipe)) = target_pipe_opt else {
+        let Some((_target_instance_id, target_pipe)) = target_pipe_opt else {
             // Core Rule: Target does not exist or is not ready -> DO NOT SEND, return `TargetInvalid`.
             let err_data = Some(json!({
                 "error": "target_not_found_or_inactive",
@@ -2255,7 +2278,7 @@ impl KernelRouter {
         let (sent_rec, created) = match target_pipe.accept(&self.ledger, &msg, seq) {
             Ok(result) => result,
             Err(error) => {
-                let (failed, _) = self.ledger.record_initial_target_state_locked(
+                let (mut failed, _) = self.ledger.record_initial_target_state_locked(
                     &msg.message_id,
                     seq,
                     source_domain,
@@ -2264,6 +2287,22 @@ impl KernelRouter {
                     ContractStatus::ExecutionFailed,
                     Some(json!({"error":"target_output_unavailable","reason":error.0})),
                 );
+                if !failed.status.is_terminal() {
+                    if let Some((owner, _)) = parse_target_address(&target) {
+                        if let ReceiptTransition::Advanced { receipt, .. } =
+                            self.ledger.advance_status_locked(
+                                owner,
+                                &msg.message_id,
+                                &target,
+                                ContractStatus::ExecutionFailed,
+                                Some(json!({"error":"target_output_unavailable","reason":error.0})),
+                            )
+                        {
+                            failed.status = receipt.status;
+                            failed.data = receipt.data;
+                        }
+                    }
+                }
                 self.observer.emit(
                     source_domain,
                     &target,
@@ -2278,14 +2317,8 @@ impl KernelRouter {
                     source_domain,
                     KernelToDomainFrame::Receipt(failed.to_receipt()),
                 );
-                drop(publication);
-                if let Some((domain, _)) = parse_target_address(&target) {
-                    self.mark_domain_faulted_for_instance(
-                        domain,
-                        Some(target_instance_id),
-                        &format!("domain output rejected: {}", error.0),
-                    );
-                }
+                // The closed outbox already carries the generation's failure. The monitor
+                // revokes it outside source/message locks, avoiding A->B / B->A lock cycles.
                 return;
             }
         };
@@ -2393,6 +2426,16 @@ impl KernelRouter {
     /// matches the currently active generation `instance_id` of `domain_id`.
     /// Prevents a stale reader thread from an old process generation from revoking a newly respawned domain's routes.
     pub fn mark_domain_faulted_for_instance(
+        &self,
+        domain_id: &str,
+        expected_instance_id: Option<u64>,
+        reason: &str,
+    ) -> bool {
+        let gate = self.domain_gate(domain_id);
+        let _domain_guard = gate.lock();
+        self.mark_domain_faulted_locked(domain_id, expected_instance_id, reason)
+    }
+    fn mark_domain_faulted_locked(
         &self,
         domain_id: &str,
         expected_instance_id: Option<u64>,
@@ -2550,6 +2593,16 @@ impl KernelRouter {
         })
     }
     fn send_to_instance(&self, domain: &str, instance: Option<u64>, frame: KernelToDomainFrame) {
+        let failure = matches!(&frame, KernelToDomainFrame::Receipt(r) if self.ledger.has_unpersisted_failure(&r.message_id));
+        self.send_to_instance_inner(domain, instance, frame, failure);
+    }
+    fn send_to_instance_inner(
+        &self,
+        domain: &str,
+        instance: Option<u64>,
+        frame: KernelToDomainFrame,
+        unpersisted: bool,
+    ) {
         let pipe = match instance {
             Some(id) if id > 0 => self.pipe_for_instance(domain, id),
             _ => self
@@ -2562,7 +2615,11 @@ impl KernelRouter {
             // Enqueue failures close this generation's outbox and retain its failure reason.
             // The supervisor converges it outside publication/domain locks; do not fault
             // synchronously here (that would recursively publish under the same locks).
-            let _ = tx.send(frame);
+            let _ = if unpersisted {
+                tx.send_unpersisted_failure(frame)
+            } else {
+                tx.send(frame)
+            };
         }
     }
     fn send_to_domain_pipe(&self, domain_id: &str, frame: KernelToDomainFrame) {

@@ -171,7 +171,12 @@ class DomainLogger {
     this._log(level, msg, { ...opts, phase: phaseName });
   }
 
-  progress(msg, { key = null, frac = null, waiting = false, done = false, layer = "", component = "" } = {}) {
+  progress(msg, { key = null, frac = null, waiting = false, done = false, state = null, layer = "", component = "" } = {}) {
+    if (state === null) state = done ? "completed" : "running";
+    if (!["running", "completed", "failed", "cancelled"].includes(state)) {
+      throw new TypeError("invalid progress state");
+    }
+    done = state !== "running";
     const record = {
       ts: Date.now() / 1000,
       level: "INFO",
@@ -183,7 +188,8 @@ class DomainLogger {
       ephemeral: true,
       key: key || null,
       frac: typeof frac === "number" ? frac : null,
-      waiting: Boolean(waiting),
+      waiting: Boolean(waiting) && !done,
+      state,
       done: Boolean(done),
     };
     this._domain._emitLog(record);

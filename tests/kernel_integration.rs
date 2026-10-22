@@ -638,6 +638,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
         frac: None,
         waiting: false,
         done: false,
+        state: None,
     });
 
     // 3. Log ephemeral progress: downloading weights
@@ -1184,7 +1185,7 @@ fn test_concurrent_multidomain_stress() {
         let _ = client.drain_frames();
 
         let expected_deliveries = (num_senders * msgs_per_sender) / num_workers;
-        let probe=Arc::clone(&kernel);
+        let probe = Arc::clone(&kernel);
         worker_handles.push(std::thread::spawn(move || {
             let mut handled = 0usize;
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1218,14 +1219,41 @@ fn test_concurrent_multidomain_stress() {
                     }
                 }
             }
-            if handled!=expected_deliveries {
-                let history=probe.observer().snapshot();
-                let events:Vec<_>=history.iter().filter(|e|e.target==format!("{w_name}.process")).collect();
-                let done:std::collections::HashSet<_>=events.iter().filter(|e|e.status.is_terminal()).map(|e|&e.message_id).collect();
-                eprintln!("worker timeout: sent={} pending={:?}",events.iter().filter(|e|e.status==ContractStatus::Sent).count(),events.iter().filter(|e|!done.contains(&e.message_id)).collect::<Vec<_>>());
-                eprintln!("failure events: {:?}",history.iter().filter(|e|e.status==ContractStatus::ExecutionFailed || e.status==ContractStatus::TargetInvalid).collect::<Vec<_>>());
+            if handled != expected_deliveries {
+                let history = probe.observer().snapshot();
+                let events: Vec<_> = history
+                    .iter()
+                    .filter(|e| e.target == format!("{w_name}.process"))
+                    .collect();
+                let done: std::collections::HashSet<_> = events
+                    .iter()
+                    .filter(|e| e.status.is_terminal())
+                    .map(|e| &e.message_id)
+                    .collect();
+                eprintln!(
+                    "worker timeout: sent={} pending={:?}",
+                    events
+                        .iter()
+                        .filter(|e| e.status == ContractStatus::Sent)
+                        .count(),
+                    events
+                        .iter()
+                        .filter(|e| !done.contains(&e.message_id))
+                        .collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "failure events: {:?}",
+                    history
+                        .iter()
+                        .filter(|e| e.status == ContractStatus::ExecutionFailed
+                            || e.status == ContractStatus::TargetInvalid)
+                        .collect::<Vec<_>>()
+                );
             }
-            assert_eq!(handled,expected_deliveries,"Worker {w_name} did not receive all expected deliveries");
+            assert_eq!(
+                handled, expected_deliveries,
+                "Worker {w_name} did not receive all expected deliveries"
+            );
         }));
     }
 

@@ -17,7 +17,7 @@ use std::sync::Arc;
 pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
 pub use frontend::InteractiveFrontendDomain;
 pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
-pub use logging::{KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore};
+pub use logging::{KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore, ProgressState};
 pub use observer::KernelObserver;
 pub use protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,

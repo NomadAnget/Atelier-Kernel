@@ -26,6 +26,16 @@ fn default_info_level() -> String {
     "INFO".to_string()
 }
 
+/// Outcome of an ephemeral progress update; independent of message receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 /// Unified Multi-State Structured Log Record.
 ///
 /// Supports 3 core operational patterns:
@@ -67,9 +77,11 @@ pub struct LogRecord {
     /// True when the task is waiting/queuing before active execution.
     #[serde(default)]
     pub waiting: bool,
-    /// True when the ephemeral task is finished (signals UI to complete/clear the progress row).
+    /// True when the ephemeral task is finished (signals termination, not necessarily success).
     #[serde(default)]
     pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ProgressState>,
 }
 
 impl Default for LogRecord {
@@ -89,6 +101,7 @@ impl Default for LogRecord {
             frac: None,
             waiting: false,
             done: false,
+            state: None,
         }
     }
 }
@@ -480,6 +493,7 @@ impl LogStore {
                 frac: None,
                 waiting: false,
                 done: false,
+                state: None,
             })
         })?;
 
@@ -543,7 +557,7 @@ pub struct KernelLogHub {
     store: Arc<LogStore>,
     subscribers: Mutex<Vec<std::sync::mpsc::SyncSender<LogRecord>>>,
     recent_logs: Mutex<Vec<LogRecord>>,
-    active_progress: Mutex<HashMap<String, LogRecord>>,
+    active_progress: Mutex<HashMap<(String, String), LogRecord>>,
     console_enabled: AtomicBool,
 }
 
@@ -597,11 +611,25 @@ impl KernelLogHub {
 
         // 2. Ephemeral Progress: in-memory tracking & SSE fanout (NEVER enters SQLite hub_logs)
         if record.ephemeral {
+            let state = record.state.unwrap_or(if record.done {
+                ProgressState::Completed
+            } else {
+                ProgressState::Running
+            });
+            record.state = Some(state);
+            record.done = state != ProgressState::Running;
+            if record.done {
+                record.waiting = false;
+            }
             if let Some(key) = &record.key {
+                let key = (
+                    record.source_domain.clone().unwrap_or_default(),
+                    key.clone(),
+                );
                 let mut progress_map = self.active_progress.lock();
                 if record.done {
-                    progress_map.remove(key);
-                } else if (progress_map.len() < 1024 || progress_map.contains_key(key))
+                    progress_map.remove(&key);
+                } else if (progress_map.len() < 1024 || progress_map.contains_key(&key))
                     && serde_json::to_vec(&record).is_ok_and(|bytes| bytes.len() <= 65_536)
                 {
                     progress_map.insert(key.clone(), record.clone());
@@ -748,6 +776,7 @@ impl KernelLogHub {
             frac,
             waiting,
             done,
+            state: None,
         });
     }
 
@@ -767,6 +796,7 @@ impl KernelLogHub {
             frac: None,
             waiting: false,
             done: false,
+            state: None,
         });
     }
 
@@ -867,6 +897,78 @@ mod persistence_independence_test {
             !slow
                 .try_iter()
                 .any(|r| r.message == "persisted-with-full-live-queue")
+        );
+    }
+}
+
+#[cfg(test)]
+mod progress_state_tests {
+    use super::*;
+    #[test]
+    fn terminal_states_clear_before_broadcast_and_preserve_fraction() {
+        for state in [
+            ProgressState::Completed,
+            ProgressState::Failed,
+            ProgressState::Cancelled,
+        ] {
+            let hub = KernelLogHub::new(None).unwrap();
+            let rx = hub.subscribe();
+            let record = LogRecord {
+                source_domain: Some("a".into()),
+                ephemeral: true,
+                key: Some("shared".into()),
+                frac: Some(0.4),
+                waiting: true,
+                ..Default::default()
+            };
+            hub.reinject(record.clone());
+            assert_eq!(rx.recv().unwrap().state, Some(ProgressState::Running));
+            hub.reinject(LogRecord {
+                source_domain: Some("b".into()),
+                ..record.clone()
+            });
+            rx.recv().unwrap();
+            hub.reinject(LogRecord {
+                state: Some(state),
+                ..record
+            });
+            let terminal = rx.recv().unwrap();
+            assert_eq!(terminal.state, Some(state));
+            assert!(terminal.done);
+            assert!(!terminal.waiting);
+            assert_eq!(terminal.frac, Some(0.4));
+            let active = hub.active_progress();
+            assert_eq!(active.len(), 1);
+            assert_eq!(active[0].source_domain.as_deref(), Some("b"));
+        }
+    }
+    #[test]
+    fn legacy_done_and_explicit_running_precedence() {
+        let hub = KernelLogHub::new(None).unwrap();
+        let rx = hub.subscribe();
+        let record = LogRecord {
+            ephemeral: true,
+            key: Some("k".into()),
+            done: true,
+            ..Default::default()
+        };
+        hub.reinject(LogRecord {
+            state: Some(ProgressState::Running),
+            ..record.clone()
+        });
+        assert!(!rx.recv().unwrap().done);
+        assert_eq!(hub.active_progress().len(), 1);
+        hub.reinject(record);
+        assert_eq!(rx.recv().unwrap().state, Some(ProgressState::Completed));
+        assert!(hub.active_progress().is_empty());
+        assert!(
+            serde_json::from_value::<LogRecord>(serde_json::json!({"state":"unknown"})).is_err()
+        );
+        assert!(
+            serde_json::from_value::<LogRecord>(serde_json::json!({"done":true}))
+                .unwrap()
+                .state
+                .is_none()
         );
     }
 }

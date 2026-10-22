@@ -291,3 +291,18 @@ if __name__ == "__main__":
 ## Historical log pages
 
 Use the existing log query method with optional `before_id` (Node also accepts `beforeId`). Read `logs`, `total` (page count), `has_more`, and `next_before_id`. Pass the last returned cursor to read older records with unchanged filters; stop when `has_more` is false. The default limit is 200, maximum 2000. Pages are bounded to 2 MiB; a single oversized record explicitly fails with its ID. History contains imported persistent records only; normal journal import can lag behind live log delivery. No query forces a journal flush. Real-time progress is not persisted history.
+
+### Progress outcomes
+
+`logger.progress` accepts optional `state`: `running`, `completed`, `failed`, or
+`cancelled`. Explicit state takes precedence over legacy `done`. Missing/null state
+maps done=true to completed, otherwise running. Terminal updates normalize
+`done=true`, `waiting=false`, preserve `frac`, and remove the source-domain/key
+from active progress before broadcasting. Reuse the original key to finish it.
+Invalid states are rejected. Python state is keyword-only; Node uses options.
+
+Events remain ephemeral and may be lost. A missing active key means no longer
+active, not successful. QueryProgress refreshes active entries, not past outcomes.
+Older kernels discard state; paired kernel/SDK upgrades are required for failure
+semantics. Old UIs must not interpret done as success. Process-crash cleanup is
+outside this change. No subscriber queue or retry management API is added.

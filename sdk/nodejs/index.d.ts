@@ -59,6 +59,7 @@ export interface ProgressOptions {
   frac?: number | null;
   waiting?: boolean;
   done?: boolean;
+  state?: "running" | "completed" | "failed" | "cancelled" | null;
   layer?: string;
   component?: string;
 }

@@ -245,6 +245,7 @@ class DomainLogger:
         frac: Optional[float] = None,
         waiting: bool = False,
         done: bool = False,
+        state: Optional[str] = None,
         layer: str = "",
         component: str = "",
     ) -> None:
@@ -252,6 +253,11 @@ class DomainLogger:
         Ephemeral real-time progress update.
         Dispatched in-memory to Web UI / SSE observers; never enters SQLite hub_logs.
         """
+        if state is None:
+            state = "completed" if done else "running"
+        if state not in ("running", "completed", "failed", "cancelled"):
+            raise ValueError("invalid progress state")
+        done = state != "running"
         record: Dict[str, Any] = {
             "ts": time.time(),
             "level": "INFO",
@@ -263,7 +269,8 @@ class DomainLogger:
             "ephemeral": True,
             "key": key or None,
             "frac": frac,
-            "waiting": bool(waiting),
+            "waiting": bool(waiting) and not done,
+            "state": state,
             "done": bool(done),
         }
         self._domain._emit_log(record)

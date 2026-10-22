@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::ledger::{KernelLedger, ReceiptTransition};
-use crate::logging::{KernelLogHub, LogRecord};
+use crate::logging::{KernelLogHub, LogQuery, LogRecord};
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DomainStatus, DomainToKernelFrame, HandlerDescriptor, InboundReceipt,
@@ -1406,37 +1406,28 @@ impl KernelRouter {
                 );
             }
             MSG_QUERY_LOGS => {
-                let limit = msg
-                    .params
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(200) as usize;
-                let level = msg.params.get("level").and_then(Value::as_str);
-                let layer = msg.params.get("layer").and_then(Value::as_str);
-                let component = msg.params.get("component").and_then(Value::as_str);
-                let phase = msg.params.get("phase").and_then(Value::as_str);
-                let since_ts = msg.params.get("since_ts").and_then(Value::as_f64);
-                let domain_id = msg
-                    .params
-                    .get("domain_id")
-                    .or_else(|| msg.params.get("domain"))
-                    .or_else(|| msg.params.get("source_domain"))
-                    .and_then(Value::as_str);
-
-                match self
-                    .logger
-                    .query_logs_filtered(limit, level, layer, component, phase, since_ts, domain_id)
-                {
-                    Ok(logs) => {
-                        let total = logs.len();
+                let query = match LogQuery::from_params(&msg.params) {
+                    Ok(query) => query,
+                    Err(error) => {
+                        self.complete_kernel_internal_target(
+                            source_domain,
+                            msg,
+                            ContractStatus::ContractInvalid,
+                            Some(json!({"error":"invalid_log_query","reason":error.to_string()})),
+                        );
+                        return;
+                    }
+                };
+                match self.logger.query_logs_page(&query) {
+                    Ok(page) => {
                         self.complete_kernel_internal_target(
                             source_domain,
                             msg,
                             ContractStatus::Completed,
-                            Some(json!({
-                                "logs": logs,
-                                "total": total,
-                            })),
+                            Some(
+                                json!({"logs":page.logs,"total":page.total,"has_more":page.has_more,
+                                "next_before_id":page.next_before_id}),
+                            ),
                         );
                     }
                     Err(err) => {

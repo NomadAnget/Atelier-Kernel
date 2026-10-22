@@ -5,7 +5,7 @@ Official zero-dependency Python SDK for building **Atelier Kernel** domains.
 ## Installation
 
 ```bash
-pip install atelier_sdk-0.1.11-py3-none-any.whl
+pip install atelier_sdk-0.1.12-py3-none-any.whl
 ```
 
 ---
@@ -287,3 +287,7 @@ if __name__ == "__main__":
 - **故障自清理**：域异常退出或故障时，内核自动清理其订阅通道，杜绝内存泄漏。
 
 实时日志订阅是允许缺口的尽力推送。慢异步日志回调只保留一个在途调用，忙时跳过后续推送，完成后自动继续；不积压任务，不影响其他订阅者。历史补查仅能读取已成功入库且仍保留的记录，本次不增加自动补查或可靠日志协议。
+
+## Historical log pages
+
+Use the existing log query method with optional `before_id` (Node also accepts `beforeId`). Read `logs`, `total` (page count), `has_more`, and `next_before_id`. Pass the last returned cursor to read older records with unchanged filters; stop when `has_more` is false. The default limit is 200, maximum 2000. Pages are bounded to 2 MiB; a single oversized record explicitly fails with its ID. History contains imported persistent records only; normal journal import can lag behind live log delivery. No query forces a journal flush. Real-time progress is not persisted history.

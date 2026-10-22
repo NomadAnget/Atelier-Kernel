@@ -131,7 +131,7 @@ class AsyncRuntime(MessageClient):
         params={k:v for k,v in dict(domain=domain,record_id=record_id,category=category,filter=filter if filter is not None else filter_map,limit=limit).items() if v is not None}
         return (await self.request('kernel.storage','StorageQuery',params,{},timeout))['data']
 
-    async def query_logs_async(self,domain=None,domain_id=None,source_domain=None,level=None,layer=None,component=None,phase=None,since_ts=None,limit=200,timeout=30):
+    async def query_logs_async(self,domain=None,domain_id=None,source_domain=None,level=None,layer=None,component=None,phase=None,since_ts=None,limit=200,timeout=30,before_id=None):
         params={'limit':limit}
         d=domain if domain is not None else (domain_id if domain_id is not None else source_domain)
         if d is not None:params['domain_id']=d
@@ -140,6 +140,7 @@ class AsyncRuntime(MessageClient):
         if component is not None:params['component']=component
         if phase is not None:params['phase']=phase
         if since_ts is not None:params['since_ts']=since_ts
+        if before_id is not None:params['before_id']=before_id
         return (await self.request('kernel.logger','QueryLogs',params,{},timeout))['data']
 
     async def query_progress_async(self,timeout=30):

@@ -35,7 +35,7 @@ async def store(msg):
     return [await d.storage_insert_async('id','category',{'n':1}),await d.storage_update_async('id',{'n':2}),await d.storage_query_async(domain='shared',record_id='id',category='category',filter={'n':2},limit=7),await d.storage_delete_async(record_id='id')]
 @d.handler('logs')
 async def logs(msg):
-    return [await d.query_logs_async(limit=10,level='INFO'),await d.query_progress_async()]
+    return [await d.query_logs_async(limit=10,level='INFO',before_id=123),await d.query_progress_async()]
 async def start():
     if mode=='startup': await asyncio.sleep(.15)
 async def end(): d.logger.info(json.dumps({'cleanup':True}))
@@ -58,7 +58,7 @@ d.handler('error',()=>{throw new DomainExecutionFailed({domain_defined:['free',7
 d.handler('echo',msg=>msg.data);
 d.handler('many',async()=>d.waitResults(await d.send(['worker.ok','worker.bad','worker.silent'],'Fanout'),{timeout:.08}));
 d.handler('store',async()=>[await d.storageInsertAsync('id','category',{n:1}),await d.storageUpdateAsync('id',{n:2}),await d.storageQueryAsync({domain:'shared',recordId:'id',category:'category',filter:{n:2},limit:7}),await d.storageDeleteAsync({recordId:'id'})]);
-d.handler('logs',async()=>[await d.queryLogsAsync({limit:10,level:'INFO'}),await d.queryProgressAsync()]);
+d.handler('logs',async()=>[await d.queryLogsAsync({limit:10,level:'INFO',beforeId:123}),await d.queryProgressAsync()]);
 d.runAsync({onStart:async()=>{
  if(mode==='startup')await new Promise(r=>setTimeout(r,150));
  // Model a bridge stuck in its input read on every platform, while the kernel
@@ -181,7 +181,7 @@ for lang in ['python','node']:
                 request=next(f for f in d.requests if f['message_type']=='StorageQuery');assert request['params']['filter']=={'n':2} and request['params']['domain']=='shared' and request['params']['limit']==7
             elif mode=='logs':
                 answer=d.done(d.call('logs'))['data'];assert [x['kind'] for x in answer]==['QueryLogs','QueryProgress']
-                request=next(f for f in d.requests if f['message_type']=='QueryLogs');assert request['targets']==['kernel.logger'] and request['params']['limit']==10 and request['params']['level']=='INFO'
+                request=next(f for f in d.requests if f['message_type']=='QueryLogs');assert request['targets']==['kernel.logger'] and request['params']['limit']==10 and request['params']['level']=='INFO' and request['params']['before_id']==123
                 request2=next(f for f in d.requests if f['message_type']=='QueryProgress');assert request2['targets']==['kernel.logger']
             elif mode=='many':
                 answer=d.done(d.call('many'))['data'];assert [x['target'] for x in answer]==['worker.ok','worker.bad','worker.silent']

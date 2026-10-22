@@ -13,6 +13,8 @@ use crate::protocol::{
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error("invalid log query: {0}")]
+    InvalidLogQuery(String),
     #[error("kernel resource exhausted: {0}")]
     ResourceExhausted(String),
     #[error("log persistence failure: {0}")]

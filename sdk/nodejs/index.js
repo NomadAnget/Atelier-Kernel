@@ -611,6 +611,8 @@ class AtelierDomain {
       if (arg1.sinceTs !== undefined) params.since_ts = arg1.sinceTs;
       if (arg1.since_ts !== undefined) params.since_ts = arg1.since_ts;
       if (arg1.limit !== undefined) params.limit = arg1.limit;
+      if (arg1.beforeId !== undefined) params.before_id = arg1.beforeId;
+      if (arg1.before_id !== undefined) params.before_id = arg1.before_id;
     } else {
       if (arg1 !== undefined) params.domain_id = arg1;
       if (level !== undefined) params.level = level;

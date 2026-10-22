@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 
 KERNEL_REGISTRY_TARGET = "kernel.registry"
 KERNEL_STORAGE_TARGET = "kernel.storage"
@@ -716,6 +716,7 @@ class AtelierDomain(AsyncRuntime):
         phase: Optional[str] = None,
         since_ts: Optional[float] = None,
         limit: int = 200,
+        before_id: Optional[int] = None,
     ):
         """Queries persisted logs via `kernel.logger` (`QueryLogs`)."""
         params: Dict[str, Any] = {"limit": limit}
@@ -731,6 +732,8 @@ class AtelierDomain(AsyncRuntime):
             params["phase"] = phase
         if since_ts is not None:
             params["since_ts"] = since_ts
+        if before_id is not None:
+            params["before_id"] = before_id
         return await self.send(
             targets=KERNEL_LOGGER_TARGET,
             message_type=MSG_QUERY_LOGS,

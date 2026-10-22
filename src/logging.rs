@@ -122,6 +122,86 @@ impl LogFramePayload {
     }
 }
 
+pub const LOG_PAGE_MAX_ROWS: usize = 2000;
+pub const LOG_PAGE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Stateless history selector. Cursor IDs refer to one database and unchanged filters.
+#[derive(Debug)]
+pub struct LogQuery<'a> {
+    pub limit: usize,
+    pub before_id: Option<i64>,
+    pub level: Option<&'a str>,
+    pub layer: Option<&'a str>,
+    pub component: Option<&'a str>,
+    pub phase: Option<&'a str>,
+    pub since_ts: Option<f64>,
+    pub source_domain: Option<&'a str>,
+}
+impl Default for LogQuery<'_> {
+    fn default() -> Self {
+        Self {
+            limit: 200,
+            before_id: None,
+            level: None,
+            layer: None,
+            component: None,
+            phase: None,
+            since_ts: None,
+            source_domain: None,
+        }
+    }
+}
+impl<'a> LogQuery<'a> {
+    pub fn from_params(params: &'a serde_json::Value) -> Result<Self, StorageError> {
+        let invalid =
+            |name| StorageError::InvalidLogQuery(format!("{name} must be a positive integer"));
+        let limit = match params.get("limit") {
+            None => 200,
+            Some(value) => value
+                .as_u64()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| invalid("limit"))?
+                .min(LOG_PAGE_MAX_ROWS as u64) as usize,
+        };
+        let before_id = match params.get("before_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| invalid("before_id"))?,
+            ),
+        };
+        let since_ts = match params.get("since_ts") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_f64().filter(|n| n.is_finite()).ok_or_else(|| {
+                StorageError::InvalidLogQuery("since_ts must be a finite number".into())
+            })?),
+        };
+        Ok(Self {
+            limit,
+            before_id,
+            since_ts,
+            level: params.get("level").and_then(serde_json::Value::as_str),
+            layer: params.get("layer").and_then(serde_json::Value::as_str),
+            component: params.get("component").and_then(serde_json::Value::as_str),
+            phase: params.get("phase").and_then(serde_json::Value::as_str),
+            source_domain: params
+                .get("domain_id")
+                .or_else(|| params.get("domain"))
+                .or_else(|| params.get("source_domain"))
+                .and_then(serde_json::Value::as_str),
+        })
+    }
+}
+#[derive(Debug, Serialize)]
+pub struct LogPage {
+    pub logs: Vec<LogRecord>,
+    pub total: usize,
+    pub has_more: bool,
+    pub next_before_id: Option<i64>,
+}
+
 /// Durable journal with asynchronous, bounded-batch import into `hub_logs`.
 ///
 /// Follows the black-box logging guarantee:
@@ -296,6 +376,41 @@ impl LogStore {
         since_ts: Option<f64>,
         source_domain: Option<&str>,
     ) -> Result<Vec<LogRecord>, StorageError> {
+        Ok(self
+            .query_page(&LogQuery {
+                limit,
+                level,
+                layer,
+                component,
+                phase,
+                since_ts,
+                source_domain,
+                ..LogQuery::default()
+            })?
+            .logs)
+    }
+
+    /// Reads a bounded, stable-ID page directly from SQLite. Does not flush or mix live copies.
+    pub fn query_page(&self, query: &LogQuery<'_>) -> Result<LogPage, StorageError> {
+        let LogQuery {
+            limit,
+            before_id,
+            level,
+            layer,
+            component,
+            phase,
+            since_ts,
+            source_domain,
+        } = *query;
+        if limit == 0
+            || before_id.is_some_and(|id| id <= 0)
+            || since_ts.is_some_and(|ts| !ts.is_finite())
+        {
+            return Err(StorageError::InvalidLogQuery(
+                "invalid limit, before_id or since_ts".into(),
+            ));
+        }
+        let limit = limit.min(LOG_PAGE_MAX_ROWS);
         let _guard = self.query_gate.as_ref().map(|g| g.lock());
         let conn = self.query_conn.lock();
         let mut sql = format!(
@@ -339,8 +454,12 @@ impl LogStore {
             }
         }
 
+        if let Some(id) = before_id {
+            sql.push_str(" AND id < ?");
+            params_vec.push(Box::new(id));
+        }
         sql.push_str(" ORDER BY id DESC LIMIT ?");
-        params_vec.push(Box::new(limit.clamp(1, 2000) as i64));
+        params_vec.push(Box::new((limit + 1) as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
@@ -365,10 +484,41 @@ impl LogStore {
         })?;
 
         let mut records = Vec::new();
-        for r in rows {
-            records.push(r?);
+        // Includes array punctuation and page metadata; leaves ample space below IPC frame limits.
+        let mut bytes = 256;
+        let mut has_more = false;
+        for row in rows {
+            let record = row?;
+            if records.len() == limit {
+                has_more = true;
+                break;
+            }
+            let size = serde_json::to_vec(&record)?.len() + 1;
+            if bytes + size > LOG_PAGE_MAX_BYTES {
+                if records.is_empty() {
+                    return Err(StorageError::ResourceExhausted(format!(
+                        "log record id={} exceeds {} byte history page budget",
+                        record.id.unwrap(),
+                        LOG_PAGE_MAX_BYTES
+                    )));
+                }
+                has_more = true;
+                break;
+            }
+            bytes += size;
+            records.push(record);
         }
-        Ok(records)
+        let next_before_id = if has_more {
+            records.last().and_then(|r| r.id)
+        } else {
+            None
+        };
+        Ok(LogPage {
+            total: records.len(),
+            logs: records,
+            has_more,
+            next_before_id,
+        })
     }
 }
 
@@ -494,7 +644,7 @@ impl KernelLogHub {
         self.active_progress.lock().values().cloned().collect()
     }
 
-    /// Returns a snapshot of recent in-memory structured logs.
+    /// Legacy live snapshot for the built-in console; never merged into persisted history pages.
     pub fn recent_logs(&self) -> Vec<LogRecord> {
         self.recent_logs.lock().clone()
     }
@@ -518,50 +668,7 @@ impl KernelLogHub {
             .query(limit, level, layer, component, phase, since_ts)
     }
 
-    fn matches_filter(
-        r: &LogRecord,
-        level: Option<&str>,
-        layer: Option<&str>,
-        component: Option<&str>,
-        phase: Option<&str>,
-        since_ts: Option<f64>,
-        source_domain: Option<&str>,
-    ) -> bool {
-        if let Some(l) = level {
-            if !r.level.eq_ignore_ascii_case(l) {
-                return false;
-            }
-        }
-        if let Some(ly) = layer {
-            if !r.layer.eq_ignore_ascii_case(ly) {
-                return false;
-            }
-        }
-        if let Some(c) = component {
-            if !r.component.eq_ignore_ascii_case(c) {
-                return false;
-            }
-        }
-        if let Some(p) = phase {
-            if !r.phase.eq_ignore_ascii_case(p) {
-                return false;
-            }
-        }
-        if let Some(ts) = since_ts {
-            if r.ts < ts {
-                return false;
-            }
-        }
-        if let Some(domain) = source_domain {
-            let domain_match = r.source_domain.as_deref() == Some(domain) || r.component == domain;
-            if !domain_match {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Queries logs from SQLite `hub_logs` and in-memory recent buffer with optional source_domain filter.
+    /// Compatibility selector; only stable persisted records participate in history queries.
     pub fn query_logs_filtered(
         &self,
         limit: usize,
@@ -572,7 +679,7 @@ impl KernelLogHub {
         since_ts: Option<f64>,
         source_domain: Option<&str>,
     ) -> Result<Vec<LogRecord>, StorageError> {
-        let mut db_records = self.store.query_with_domain(
+        self.store.query_with_domain(
             limit,
             level,
             layer,
@@ -580,30 +687,11 @@ impl KernelLogHub {
             phase,
             since_ts,
             source_domain,
-        )?;
+        )
+    }
 
-        // Merge any recent in-memory records that have not yet flushed to SQLite
-        let recent = self.recent_logs.lock().clone();
-        for r in recent.into_iter().rev() {
-            if db_records.len() >= limit {
-                break;
-            }
-            if !Self::matches_filter(&r, level, layer, component, phase, since_ts, source_domain) {
-                continue;
-            }
-            let already_present = db_records.iter().any(|d| {
-                (d.ts - r.ts).abs() < 0.001 && d.message == r.message && d.level == r.level
-            });
-            if !already_present {
-                db_records.insert(0, r);
-            }
-        }
-
-        if db_records.len() > limit {
-            db_records.truncate(limit);
-        }
-
-        Ok(db_records)
+    pub fn query_logs_page(&self, query: &LogQuery<'_>) -> Result<LogPage, StorageError> {
+        self.store.query_page(query)
     }
 
     // --- Ergonomic Kernel Logging Helpers ---

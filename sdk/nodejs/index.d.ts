@@ -121,11 +121,16 @@ export interface QueryLogsOptions {
   sinceTs?: number;
   since_ts?: number;
   limit?: number;
+  beforeId?: number;
+  before_id?: number;
 }
 
 export interface QueryLogsResponse {
   logs: Array<Record<string, any>>;
+  /** Number of logs in this page, not the database total. */
   total: number;
+  has_more: boolean;
+  next_before_id: number | null;
 }
 
 export interface QueryProgressResponse {

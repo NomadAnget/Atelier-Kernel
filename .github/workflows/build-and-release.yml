@@ -71,6 +71,7 @@ jobs:
           $PY_BIN tests/sdk_log_slow_test.py
           $PY_BIN tests/sdk_observer_memory_integration.py
           $PY_BIN tests/sdk_self_restart_integration.py
+          $PY_BIN tests/sdk_log_pagination_integration.py
 
   build-sdk-packages:
     name: Build Domain SDKs (Python Wheel & Node.js NPM)

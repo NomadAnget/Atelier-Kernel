@@ -1,5 +1,5 @@
 use crate::outbox::{self, PipeReceiver};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -156,6 +156,9 @@ pub struct DomainProcessSpec {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Per-process overrides of inherited environment; kernel IPC keys are reserved.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default = "default_auto_restart")]
@@ -172,6 +175,7 @@ impl Default for DomainProcessSpec {
             domain_id: String::new(),
             command: String::new(),
             args: Vec::new(),
+            env: BTreeMap::new(),
             working_dir: None,
             auto_restart: default_auto_restart(),
             max_restarts: default_max_restarts(),
@@ -199,6 +203,21 @@ impl DomainProcessSpec {
         {
             return Err("[M6] empty command or NUL in process arguments".into());
         }
+        let mut env_names = HashSet::new();
+        for (key, value) in &self.env {
+            let normalized = key.to_ascii_uppercase();
+            if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
+                return Err("[M6] invalid environment key or NUL in environment value".into());
+            }
+            if normalized.starts_with("ATELIER_IPC_") {
+                return Err(
+                    "[C1] ATELIER_IPC_* environment keys are reserved by the kernel".into(),
+                );
+            }
+            if !env_names.insert(normalized) {
+                return Err("[M6] environment keys must not differ only by ASCII case".into());
+            }
+        }
         if let Some(dir) = &self.working_dir {
             if dir.contains('\0') || !std::path::Path::new(dir).is_dir() {
                 return Err(format!("[M6] working_dir is not a directory: {dir:?}"));
@@ -215,6 +234,7 @@ impl DomainProcessSpec {
             domain_id: domain_id.into(),
             command: command.into(),
             args,
+            env: BTreeMap::new(),
             working_dir: None,
             auto_restart: default_auto_restart(),
             max_restarts: default_max_restarts(),
@@ -620,6 +640,10 @@ impl DomainSupervisorInner {
 
         let configure_cmd = |cmd: &mut Command| {
             cmd.args(&spec.args)
+                .envs(&spec.env)
+                .env_remove("ATELIER_IPC_READ_FD")
+                .env_remove("ATELIER_IPC_WRITE_FD")
+                .env_remove("ATELIER_IPC_HANDLE_MODE")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());

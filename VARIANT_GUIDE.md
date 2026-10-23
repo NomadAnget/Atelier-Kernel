@@ -195,6 +195,33 @@ my-product-variant/
 
 Atelier Kernel 内建了与 `atelier-core` 一脉相承的黑匣子日志基础设施。不仅能跨语言统一接管子进程日志，还原生支持**多状态结构化日志**：
 
+### 域的独立环境变量
+
+域启动项支持可选的 `env` 字符串映射，无需 `/usr/bin/env` 或 shell 包装：
+
+```json
+{
+  "domain_id": "engines",
+  "command": "./.venv/bin/python",
+  "args": ["-m", "domains.engines"],
+  "env": {"GCP_MODELS_DIR": "/home/Architecture/checkpoints/"},
+  "working_dir": "."
+}
+```
+
+未设置 `env` 或设置 `{}` 时保持继承环境的原行为；配置值覆盖继承值，空字符串是有效值。
+这些值按字面传入进程，不做 `$VAR`、`~`、shell 或相对路径展开；相对值由业务进程自行解释。
+手动启动、保存配置的重启、自动重启和候选域更新使用同一套进程启动逻辑；
+传入新 spec 的更新以新 spec 的完整 `env` 为准，省略 `env` 代表空覆盖映射而非合并旧 spec。
+不传 spec 的启动/更新复用已保存 spec，因此保留其环境设置。失败候选不替换旧 spec。
+
+`ATELIER_IPC_*`（不区分 ASCII 大小写）保留给内核，配置拒绝覆盖它。
+环境键不能是空字符串、不能含 `=` 或 NUL；值不能含 NUL；仅大小写不同的键同时出现会被拒绝。
+JSON 的 `env` 必须是字符串到字符串映射，不能用 null、数组或数值代替。
+运行态摘要显示真实 command/args，不返回 env 值；不要从该摘要重建完整 spec。
+对于已装配域，Python 使用 SDK `supervisor.start(domain)` / `restart(domain)`；Node 使用
+`supervisorStartAsync({domain})`（省略 spec）或 `supervisor.restart(domain)` 复用保存配置。
+
 ### 1. 三大出口（Three Sinks）
 
 - **控制台（Console）**：紧凑单行格式 `HH:MM:SS LEVEL [layer/component] message <phase>`，TTY 环境色彩高亮。

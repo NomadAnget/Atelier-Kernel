@@ -511,10 +511,20 @@ impl ManagedProcess {
         for worker in &self.workers {
             cancel_worker(worker);
         }
-        if let Some(mut child) = self.child.take() {
+        if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
-            if let Err(error) = child.wait() {
-                eprintln!("kernel failed to reap pid {}: {error}", self.pid);
+            loop {
+                match child.wait() {
+                    Ok(_) => {
+                        self.child = None;
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => {
+                        eprintln!("kernel failed to reap pid {}: {error}", self.pid);
+                        break; // Keep the Child owner for a later monitor cleanup attempt.
+                    }
+                }
             }
         }
         for worker in self.workers.drain(..) {
@@ -532,10 +542,23 @@ impl Drop for ManagedProcess {
 struct DomainState {
     spec: DomainProcessSpec,
     process: Option<ManagedProcess>,
+    // Ownership moves out during cleanup, but PID visibility must survive until wait/join.
+    cleanup_pid: Option<u32>,
     stopped: bool,
     restart_count: u32,
     last_spawn: Option<Instant>,
     restart_at: Option<Instant>,
+}
+impl DomainState {
+    fn take_for_cleanup(&mut self) -> Option<ManagedProcess> {
+        let process = self.process.take()?;
+        self.cleanup_pid = Some(process.pid);
+        Some(process)
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.process.as_ref().map(|p| p.pid).or(self.cleanup_pid)
+    }
 }
 struct DomainControl {
     operation: Mutex<()>,
@@ -571,6 +594,7 @@ impl DomainSupervisorInner {
                     state: Mutex::new(DomainState {
                         spec: spec.clone(),
                         process: None,
+                        cleanup_pid: None,
                         stopped: false,
                         restart_count: 0,
                         last_spawn: None,
@@ -871,10 +895,25 @@ impl DomainSupervisorInner {
         }
         Ok(process)
     }
-    fn stop_owned(&self, id: &str, mut process: ManagedProcess, reason: &str) {
+    fn stop_owned(
+        &self,
+        id: &str,
+        control: &DomainControl,
+        mut process: ManagedProcess,
+        reason: &str,
+    ) -> bool {
         self.router
             .mark_domain_faulted_for_instance(id, Some(process.instance_id), reason);
         process.terminate();
+        // No state/router locks are held while killing, waiting, or joining workers.
+        let mut state = control.state.lock();
+        if process.child.is_some() {
+            state.process = Some(process);
+            false
+        } else {
+            state.cleanup_pid = None;
+            true
+        }
     }
     fn monitor(&self) {
         for (id, generation, reason) in self.router.failed_output_queues() {
@@ -920,13 +959,15 @@ impl DomainSupervisorInner {
                     .as_mut()
                     .is_some_and(|p| faulted || p.exited())
                 {
-                    state.process.take()
+                    state.take_for_cleanup()
                 } else {
                     None
                 }
             };
             if let Some(process) = failed {
-                self.stop_owned(&id, process, "domain disconnected");
+                if !self.stop_owned(&id, &control, process, "domain disconnected") {
+                    continue;
+                }
                 let mut state = control.state.lock();
                 if state
                     .last_spawn
@@ -1088,10 +1129,18 @@ impl DomainSupervisor {
             state.stopped = false;
             state.restart_count = 0;
             state.restart_at = None;
-            state.process.take()
+            state.take_for_cleanup()
         };
         if let Some(process) = previous {
-            self.inner.stop_owned(&id, process, "domain restarted");
+            if !self
+                .inner
+                .stop_owned(&id, &control, process, "domain restarted")
+            {
+                return Err(SupervisorError::SpawnFailed {
+                    domain: id,
+                    source: std::io::Error::other("previous domain process could not be reaped"),
+                });
+            }
         }
         let process = self.inner.launch(&spec, false)?;
         let pid = process.pid;
@@ -1110,12 +1159,11 @@ impl DomainSupervisor {
             let mut state = control.state.lock();
             state.stopped = true;
             state.restart_at = None;
-            state.process.take()
+            state.take_for_cleanup()
         };
         if let Some(process) = process {
             self.inner
-                .stop_owned(id, process, "domain stopped by kernel supervisor");
-            true
+                .stop_owned(id, &control, process, "domain stopped by kernel supervisor")
         } else {
             false
         }
@@ -1133,9 +1181,7 @@ impl DomainSupervisor {
         }
     }
     pub fn get_pid(&self, id: &str) -> Option<u32> {
-        self.inner
-            .control(id)
-            .and_then(|c| c.state.lock().process.as_ref().map(|p| p.pid))
+        self.inner.control(id).and_then(|c| c.state.lock().pid())
     }
     pub fn update_process_domain(
         &self,
@@ -1545,5 +1591,129 @@ mod bounded_transport_drain_test {
         assert_eq!(lines, ["received", "started", "completed"]);
         // The writer is intentionally still alive: no timeout or EOF was needed to finish.
         drop(inherited_writer);
+    }
+}
+
+#[cfg(test)]
+mod process_reaping_tests {
+    use super::*;
+
+    // Hold a real worker join after kill/wait. This makes the previously racy
+    // process.take -> terminate gap observable without sleeps or test-only hooks.
+    fn check_cleanup(mode: &str) {
+        let kernel = crate::AtelierKernel::new_in_memory().unwrap();
+        let spec: DomainProcessSpec = serde_json::from_value(json!({
+            "domain_id":"reaping", "command":"python3",
+            "args":["-c", "import time; time.sleep(30)"],
+            "auto_restart": mode == "automatic", "restart_delay_ms": 0
+        }))
+        .unwrap();
+        let supervisor = kernel.supervisor().clone();
+        let observer = kernel.attach_domain("observer");
+        let pid = supervisor.spawn_process_domain(spec).unwrap();
+        let control = supervisor.inner.control("reaping").unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        {
+            let mut state = control.state.lock();
+            let process = state.process.as_mut().unwrap();
+            let stop = process.stop.clone();
+            process.workers.push(thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            }));
+        }
+        let action = if mode == "stop" || mode == "restart" {
+            let supervisor = supervisor.clone();
+            let restart = mode == "restart";
+            Some(thread::spawn(move || {
+                if restart {
+                    supervisor.respawn_domain("reaping").map(Some)
+                } else {
+                    assert!(supervisor.stop_process_domain("reaping"));
+                    Ok(None)
+                }
+            }))
+        } else {
+            supervisor.inner.router.mark_domain_faulted_for_instance(
+                "reaping",
+                None,
+                "controlled cleanup regression",
+            );
+            None
+        };
+        let entered = entered_rx.recv_timeout(Duration::from_secs(5));
+        // A stuck query must fail this test rather than trapping it behind a held lifecycle lock.
+        let query = supervisor.clone();
+        let (answer_tx, answer_rx) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let pid = query.get_pid("reaping");
+            let ids = observer.send(
+                vec!["kernel.runtime".into()],
+                "QueryRuntime",
+                json!({}),
+                json!({}),
+            );
+            let runtime_ok = observer.drain_frames().iter().any(|frame| {
+                matches!(frame,
+                KernelToDomainFrame::Receipt(receipt) if receipt.message_id == ids[0]
+                    && receipt.status == crate::protocol::ContractStatus::Completed)
+            });
+            let _ = answer_tx.send((pid, runtime_ok));
+        });
+        let answer = answer_rx.recv_timeout(Duration::from_secs(1));
+        let state_available = control.state.try_lock().is_some();
+        release_tx.send(()).unwrap(); // Release before any assertion, even on the broken implementation.
+        reader.join().unwrap();
+        let new_pid = action.and_then(|a| a.join().unwrap().unwrap());
+        assert!(
+            entered.is_ok(),
+            "cleanup did not reach the controlled worker"
+        );
+        assert_eq!(
+            answer.unwrap(),
+            (Some(pid), true),
+            "PID disappeared before cleanup completed"
+        );
+        assert!(state_available, "cleanup held the public state lock");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor.get_pid("reaping") == Some(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let current = supervisor.get_pid("reaping");
+        assert_ne!(current, Some(pid));
+        if mode == "stop" || mode == "fault" {
+            assert_eq!(current, None);
+        }
+        if let Some(new_pid) = new_pid {
+            assert_eq!(current, Some(new_pid));
+        }
+        if mode == "automatic" {
+            while supervisor.get_pid("reaping").is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(supervisor.get_pid("reaping").is_some());
+        }
+        #[cfg(target_os = "linux")]
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
+    #[test]
+    fn stopped_pid_remains_visible_until_cleanup_completes() {
+        check_cleanup("stop");
+    }
+    #[test]
+    fn restarted_pid_remains_visible_until_cleanup_completes() {
+        check_cleanup("restart");
+    }
+    #[test]
+    fn faulted_pid_remains_visible_until_cleanup_completes() {
+        check_cleanup("fault");
+    }
+    #[test]
+    fn automatic_restart_waits_for_cleanup() {
+        check_cleanup("automatic");
     }
 }

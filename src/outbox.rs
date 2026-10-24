@@ -53,11 +53,14 @@ struct MemoryItem {
 enum Lease {
     Disk(i64, bool),
     Memory(usize, usize),
+    Temporary(i64, usize),
 }
 struct State {
     memory: [VecDeque<MemoryItem>; 3],
     bytes: [usize; 3],
     counts: [usize; 3],
+    temporary: Option<Connection>,
+    temporary_pending: [usize; 2],
     pending: usize,
     sent: [i64; 2],
     pending_receipts: usize,
@@ -97,6 +100,8 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
             memory: std::array::from_fn(|_| VecDeque::new()),
             bytes: [0; 3],
             counts: [0; 3],
+            temporary: None,
+            temporary_pending: [0; 2],
             pending: 0,
             sent: [0; 2],
             pending_receipts: 0,
@@ -133,6 +138,76 @@ fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
         }
     }
 }
+// Temporary transport overflow belongs only to this generation. It is neither a
+// durable ledger nor a replay queue; SQLite deletes its temporary file on close.
+fn enqueue_transient(
+    s: &mut State,
+    frame: KernelToDomainFrame,
+    bytes: usize,
+    lane: usize,
+) -> Result<(), QueueError> {
+    let limit = if lane == 2 { EVENT_BYTES } else { MEMORY_BYTES };
+    let fits = bytes <= limit && s.bytes[lane] <= limit - bytes && s.counts[lane] < MEMORY_ITEMS;
+    if lane == 2 {
+        if !fits {
+            return Err(QueueError("lossy system event omitted".into()));
+        }
+    } else if !fits || s.temporary_pending[lane] != 0 {
+        if s.temporary.is_none() {
+            let db = Connection::open("")
+                .map_err(|e| QueueError(format!("temporary transport open failed: {e}")))?;
+            db.execute_batch("PRAGMA cache_size=-512; CREATE TABLE frames(id INTEGER PRIMARY KEY, lane INTEGER NOT NULL, frame TEXT NOT NULL);")
+                .map_err(|e| QueueError(format!("temporary transport initialize failed: {e}")))?;
+            s.temporary = Some(db);
+        }
+        let db = s.temporary.as_ref().unwrap();
+        db.execute(
+            "INSERT INTO frames(lane,frame) VALUES(?1,?2)",
+            params![
+                lane as i64,
+                serde_json::to_string(&frame).map_err(|e| QueueError(e.to_string()))?
+            ],
+        )
+        .map_err(|e| QueueError(format!("temporary transport write failed: {e}")))?;
+        s.temporary_pending[lane] += 1;
+        return Ok(());
+    }
+    s.bytes[lane] += bytes;
+    s.counts[lane] += 1;
+    s.memory[lane].push_back(MemoryItem { frame, bytes, lane });
+    Ok(())
+}
+fn take_temporary(
+    s: &mut State,
+    lane: usize,
+) -> Result<Option<KernelToDomainFrame>, RecvTimeoutError> {
+    if s.temporary_pending[lane] == 0 {
+        return Ok(None);
+    }
+    let result: Result<KernelToDomainFrame, String> = (|| {
+        let (id, text): (i64, String) = s
+            .temporary
+            .as_ref()
+            .unwrap()
+            .query_row(
+                "SELECT id,frame FROM frames WHERE lane=?1 ORDER BY id LIMIT 1",
+                [lane as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        let frame = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        s.lease = Some(Lease::Temporary(id, lane));
+        Ok(frame)
+    })();
+    match result {
+        Ok(frame) => Ok(Some(frame)),
+        Err(e) => {
+            s.failure = Some(format!("temporary transport read failed: {e}"));
+            s.closed = true;
+            Err(RecvTimeoutError::Disconnected)
+        }
+    }
+}
 impl PipeSender {
     pub(crate) fn accept(
         &self,
@@ -154,24 +229,7 @@ impl PipeSender {
                 let bytes = serde_json::to_string(&frame)
                     .map_err(|e| QueueError(e.to_string()))?
                     .len();
-                if bytes > MEMORY_BYTES
-                    || state.bytes[1] > MEMORY_BYTES - bytes
-                    || state.counts[1] >= MEMORY_ITEMS
-                {
-                    state.closed = true;
-                    state.failure = Some("nonpersistent domain output budget exhausted".into());
-                    self.0.wake.notify_all();
-                    return Err(QueueError(
-                        "nonpersistent domain output budget exhausted".into(),
-                    ));
-                }
-                state.bytes[1] += bytes;
-                state.counts[1] += 1;
-                state.memory[1].push_back(MemoryItem {
-                    frame,
-                    bytes,
-                    lane: 1,
-                });
+                enqueue_transient(&mut state, frame, bytes, 1)?;
                 self.0.wake.notify_one();
             }
         }
@@ -223,27 +281,7 @@ impl PipeSender {
                 s.pending_receipts += 1;
             }
         } else {
-            let limit = if lane == 2 { EVENT_BYTES } else { MEMORY_BYTES };
-            if encoded.len() > limit
-                || s.bytes[lane] > limit - encoded.len()
-                || s.counts[lane] >= MEMORY_ITEMS
-            {
-                if lane == 2 {
-                    return Err(QueueError("lossy system event omitted".into()));
-                }
-                let error = "nonpersistent domain output budget exhausted".to_string();
-                s.failure = Some(error.clone());
-                s.closed = true;
-                self.0.wake.notify_all();
-                return Err(QueueError(error));
-            }
-            s.bytes[lane] += encoded.len();
-            s.counts[lane] += 1;
-            s.memory[lane].push_back(MemoryItem {
-                frame,
-                bytes: encoded.len(),
-                lane,
-            });
+            enqueue_transient(&mut s, frame, encoded.len(), lane)?;
         }
         self.0.wake.notify_one();
         Ok(())
@@ -283,6 +321,9 @@ impl PipeReceiver {
                 s.lease = Some(Lease::Memory(item.lane, item.bytes));
                 return Ok(item.frame);
             }
+            if let Some(frame) = take_temporary(&mut s, 0)? {
+                return Ok(frame);
+            }
             // Rotate persistent business, transient business and live events. A durable flood
             // cannot indefinitely starve status responses or the live diagnostic stream.
             s.turn = (s.turn + 1) % 3;
@@ -292,6 +333,11 @@ impl PipeReceiver {
                     if let Some(item) = s.memory[lane].pop_front() {
                         s.lease = Some(Lease::Memory(item.lane, item.bytes));
                         return Ok(item.frame);
+                    }
+                    if lane == 1 {
+                        if let Some(frame) = take_temporary(&mut s, lane)? {
+                            return Ok(frame);
+                        }
                     }
                 }
             }
@@ -326,6 +372,9 @@ impl PipeReceiver {
                     s.lease = Some(Lease::Memory(item.lane, item.bytes));
                     return Ok(item.frame);
                 }
+            }
+            if let Some(frame) = take_temporary(&mut s, 1)? {
+                return Ok(frame);
             }
             if self.0.senders.load(Ordering::Acquire) == 0 {
                 return Err(RecvTimeoutError::Disconnected);
@@ -374,6 +423,19 @@ impl PipeReceiver {
                     s.pending_receipts -= 1;
                 }
             }
+            Some(Lease::Temporary(id, lane)) => {
+                s.temporary
+                    .as_ref()
+                    .unwrap()
+                    .execute("DELETE FROM frames WHERE id=?1", [id])
+                    .map_err(|e| {
+                        QueueError(format!("temporary transport acknowledgement failed: {e}"))
+                    })?;
+                s.temporary_pending[lane] -= 1;
+                if s.temporary_pending == [0; 2] {
+                    s.temporary = None;
+                }
+            }
             Some(Lease::Memory(lane, bytes)) => {
                 s.bytes[lane] -= bytes;
                 s.counts[lane] -= 1;
@@ -390,13 +452,15 @@ fn close(inner: &Inner) {
     s.bytes = [0; 3];
     s.counts = [0; 3];
     s.lease = None;
+    s.temporary = None;
+    s.temporary_pending = [0; 2];
     // Only already committed terminal envelopes are cleaned here. The ledger closes live
     // deliveries after transport closure and removes their envelopes in the terminal transaction.
     if let Err(e) = inner.db.lock().execute(
         "DELETE FROM kernel_outbox WHERE channel=?1 AND (delivery_id IS NULL OR EXISTS(SELECT 1 FROM kernel_ledger WHERE message_id=delivery_id AND status IN ('completed','execution_failed','contract_invalid','target_invalid')))",
         [&inner.channel],
     ) {
-        s.failure = Some(format!("outbox cleanup failed: {e}"));
+        s.failure.get_or_insert_with(|| format!("outbox cleanup failed: {e}"));
     } else {
         s.pending = 0;
         s.pending_receipts = 0;
@@ -456,10 +520,10 @@ mod tests {
         assert_eq!(tx.counts(), (0, 0));
     }
     #[test]
-    fn transient_limit_is_explicit_and_system_event_overflow_is_lossy() {
+    fn transient_backlog_spills_without_disconnect_and_system_events_remain_lossy() {
         let kernel = AtelierKernel::new_in_memory().unwrap();
         let db = kernel.ledger().db_conn.as_ref().unwrap().clone();
-        let (tx, _rx) = channel(db.clone());
+        let (tx, transient_rx) = channel(db.clone());
         let mut accepted = 0;
         for i in 0..1500 {
             if tx.send(frame("Ephemeral", i)).is_err() {
@@ -467,8 +531,24 @@ mod tests {
             }
             accepted += 1;
         }
-        assert!(accepted > 0 && accepted < 1500);
-        assert!(tx.failure().is_some());
+        assert_eq!(accepted, 1500);
+        assert!(tx.failure().is_none());
+        for i in 0..1500 {
+            match transient_rx.try_recv().unwrap() {
+                KernelToDomainFrame::Deliver(m) => assert_eq!(m.params["index"], i),
+                _ => panic!(),
+            }
+            transient_rx.acknowledge().unwrap();
+        }
+        let mut large = frame("Ephemeral", 1501);
+        if let KernelToDomainFrame::Deliver(ref mut m) = large {
+            m.data = json!({"text":"x".repeat(12*1024*1024)});
+        }
+        tx.send(large).unwrap();
+        transient_rx.try_recv().unwrap();
+        transient_rx.acknowledge().unwrap();
+        assert!(tx.failure().is_none());
+        assert!(tx.0.state.lock().temporary.is_none());
         assert!(tx.counts().1 <= MEMORY_BYTES);
         let (events, rx) = channel(db.clone());
         for i in 0..5000 {
@@ -606,5 +686,20 @@ mod control_and_schema_tests {
             initialize(&conn),
             Err(crate::StorageError::SchemaDrift { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod first_failure_diagnostics_test {
+    use super::*;
+    #[test]
+    fn cleanup_failure_does_not_replace_original_outbox_error() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        initialize(&db.lock()).unwrap();
+        let (tx, _rx) = channel(db.clone());
+        tx.0.state.lock().failure = Some("original output failure".into());
+        db.lock().execute_batch("DROP TABLE kernel_outbox").unwrap();
+        tx.close();
+        assert_eq!(tx.failure().as_deref(), Some("original output failure"));
     }
 }

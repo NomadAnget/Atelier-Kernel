@@ -124,7 +124,7 @@ fn unread_real_process_spools_durable_work_without_blocking_other_domains() {
 }
 
 #[test]
-fn nonpersistent_overload_has_explicit_failure_and_no_automatic_disk_upgrade() {
+fn transient_backlog_preserves_delivery_without_persistent_ledger_upgrade() {
     let k = AtelierKernel::new_in_memory().unwrap();
     let sender = k.attach_domain("sender");
     let slow = k.attach_domain("slow");
@@ -140,26 +140,24 @@ fn nonpersistent_overload_has_explicit_failure_and_no_automatic_disk_upgrade() {
         ));
         sender.drain_frames();
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while k.router().domain_status("slow") == Some(DomainStatus::Active)
-        && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert_eq!(
-        k.router().domain_status("slow"),
-        Some(DomainStatus::Faulted)
-    );
+    assert_eq!(k.router().domain_status("slow"), Some(DomainStatus::Active));
+    let delivered: Vec<_> = slow
+        .drain_frames()
+        .into_iter()
+        .filter_map(|f| match f {
+            Frame::Deliver(m) => Some(m.message_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(delivered, ids);
     for id in ids {
-        let r = k.ledger().get_record(&id, "slow.run").unwrap();
-        assert!(r.status.is_terminal());
         assert!(k.ledger().get_persisted_record(&id).is_none());
     }
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-fn real_nonpersistent_overload_reclaims_exact_process_generation() {
+fn real_transient_backlog_keeps_generation_alive() {
     let k = AtelierKernel::new_in_memory().unwrap();
     slow_domain(&k, "slow_budget");
     struct Stop<'a>(&'a AtelierKernel);
@@ -180,18 +178,20 @@ fn real_nonpersistent_overload_reclaims_exact_process_generation() {
         );
         sender.drain_frames();
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while k.supervisor().get_pid("slow_budget").is_some() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(k.supervisor().get_pid("slow_budget").is_none());
-    while std::path::Path::new(&format!("/proc/{pid}")).exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert_eq!(k.supervisor().get_pid("slow_budget"), Some(pid));
+    assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
     assert_eq!(
         k.router().domain_status("slow_budget"),
-        Some(DomainStatus::Faulted)
+        Some(DomainStatus::Active)
+    );
+    let fast = k.attach_domain("fast");
+    fast.register_handlers(&["run"]);
+    fast.drain_frames();
+    sender.send(vec!["fast.run".into()], "Ephemeral", json!({}), json!({}));
+    assert!(
+        fast.drain_frames()
+            .iter()
+            .any(|f| matches!(f, Frame::Deliver(_)))
     );
 }
 

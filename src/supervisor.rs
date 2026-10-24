@@ -1,4 +1,5 @@
 use crate::outbox::{self, PipeReceiver};
+use crate::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
@@ -450,7 +451,11 @@ fn write_frame(
     if bytes.len() > MAX_IPC_FRAME {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "outbound frame exceeds IPC limit",
+            format!(
+                "outbound frame exceeds IPC limit: {} bytes > {}",
+                bytes.len(),
+                MAX_IPC_FRAME
+            ),
         ));
     }
     let mut offset = 0;
@@ -483,6 +488,8 @@ struct ManagedProcess {
     instance_id: u64,
     pid: u32,
     child: Option<Child>,
+    diagnostics: Arc<ProcessDiagnostics>,
+    exit_status: Option<std::process::ExitStatus>,
     stop: Arc<AtomicBool>,
     drain: Arc<AtomicBool>,
     output: crate::outbox::PipeSender,
@@ -492,19 +499,44 @@ impl ManagedProcess {
     fn exited(&mut self) -> bool {
         // Process exit and writer failure are not proof that the receive pipe is empty.
         // Let its sole reader consume buffered frames before revoking this generation.
+        let exited = self.observe_exit();
+        let output_failure = self.output.failure();
+        if let Some(reason) = &output_failure {
+            self.diagnostics
+                .record("outbox", json!({"message":bounded(reason)}), true);
+        }
         if self.workers.first().is_some_and(|w| w.is_finished())
-            || self.output.failure().is_some()
-            || self
-                .child
-                .as_mut()
-                .is_none_or(|c| c.try_wait().map_or(true, |s| s.is_some()))
+            || output_failure.is_some()
+            || exited
         {
             self.drain.store(true, Ordering::Release);
         }
         self.workers.get(1).is_some_and(|w| w.is_finished())
     }
 
+    fn observe_exit(&mut self) -> bool {
+        if self.exit_status.is_some() {
+            return true;
+        }
+        match self.child.as_mut().map(|c| c.try_wait()) {
+            Some(Ok(Some(status))) => {
+                self.exit_status = Some(status);
+                self.diagnostics.exit(status, false);
+                true
+            }
+            Some(Ok(None)) => false,
+            Some(Err(error)) => {
+                self.diagnostics
+                    .record("child_poll", io_error(&error), true);
+                true
+            }
+            None => true,
+        }
+    }
+
     fn terminate(&mut self) {
+        // Observe natural exit before any administrative kill; cleanup is not the cause.
+        self.observe_exit();
         self.stop.store(true, Ordering::Release);
         self.output.close();
         #[cfg(windows)]
@@ -512,17 +544,28 @@ impl ManagedProcess {
             cancel_worker(worker);
         }
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
+            let cleanup = self.exit_status.is_none();
+            if cleanup {
+                self.diagnostics
+                    .record("cleanup_requested", json!({"action":"kill"}), false);
+                if let Err(error) = child.kill() {
+                    self.diagnostics
+                        .record("child_kill", io_error(&error), false);
+                }
+            }
             loop {
                 match child.wait() {
-                    Ok(_) => {
+                    Ok(status) => {
+                        self.exit_status = Some(status);
+                        self.diagnostics.exit(status, cleanup);
                         self.child = None;
                         break;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        eprintln!("kernel failed to reap pid {}: {error}", self.pid);
-                        break; // Keep the Child owner for a later monitor cleanup attempt.
+                        self.diagnostics
+                            .record("child_wait", io_error(&error), false);
+                        break; // Preserve ownership for the supervisor's next cleanup attempt.
                     }
                 }
             }
@@ -767,6 +810,8 @@ impl DomainSupervisorInner {
             instance_id: generation,
             pid,
             child: Some(child),
+            diagnostics: Arc::new(ProcessDiagnostics::new(id, pid, generation)),
+            exit_status: None,
             stop: Arc::new(AtomicBool::new(false)),
             drain: Arc::new(AtomicBool::new(false)),
             output: sender,
@@ -786,6 +831,8 @@ impl DomainSupervisorInner {
             }
             let stop = process.stop.clone();
             let drain = process.drain.clone();
+            let diagnostics = process.diagnostics.clone();
+            let output = process.output.clone();
             process.workers.push(
                 thread::Builder::new()
                     .name(format!("kernel-tx-{id}-{generation}"))
@@ -793,14 +840,24 @@ impl DomainSupervisorInner {
                         while !stop.load(Ordering::Acquire) {
                             match inbox.recv_timeout(Duration::from_millis(50)) {
                                 Ok(frame) => {
-                                    if write_frame(&mut tx, &frame, &stop).is_err()
-                                        || inbox.acknowledge().is_err()
-                                    {
+                                    if let Err(error) = write_frame(&mut tx, &frame, &stop) {
+                                        if !stop.load(Ordering::Acquire) {
+                                            diagnostics.record("tx_write", io_error(&error), true);
+                                        }
+                                        break;
+                                    }
+                                    if let Err(error) = inbox.acknowledge() {
+                                        diagnostics.record("tx_acknowledge", json!({"message":bounded(error.0)}), true);
                                         break;
                                     }
                                 }
                                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(_) => break,
+                                Err(_) => {
+                                    if !stop.load(Ordering::Acquire) {
+                                        diagnostics.record("outbox", json!({"message":bounded(output.failure().unwrap_or_else(|| "output queue disconnected".into()))}), true);
+                                    }
+                                    break;
+                                }
                             }
                         }
                         if !stop.load(Ordering::Acquire) {
@@ -808,6 +865,7 @@ impl DomainSupervisorInner {
                         }
                     })?,
             );
+            let diagnostics = process.diagnostics.clone();
             let weak = Arc::downgrade(&self.router);
             let stop = process.stop.clone();
             let domain = id.clone();
@@ -822,6 +880,18 @@ impl DomainSupervisorInner {
                             }
                         });
                         if !stop.load(Ordering::Acquire) {
+                            // Only the synthesized drain marker is secondary; retain real
+                            // read/decoding errors even when a concurrent drain has begun.
+                            let draining = matches!(&result, Err(error) if error.to_string() == "domain transport ended after draining buffered frames");
+                            let details = match &result {
+                                Ok(()) => json!({"eof":true,"draining":draining}),
+                                Err(error) => io_error(error),
+                            };
+                            diagnostics.record(
+                                if draining { "rx_drain" } else { "rx_read" },
+                                details,
+                                !draining,
+                            );
                             if let Some(router) = weak.upgrade() {
                                 router.mark_domain_faulted_for_instance(
                                     &domain,
@@ -1546,6 +1616,8 @@ mod exit_drain_regression {
             instance_id: 1,
             pid,
             child: Some(child),
+            diagnostics: Arc::new(ProcessDiagnostics::new("probe", pid, 1)),
+            exit_status: None,
             stop,
             drain: Arc::new(AtomicBool::new(false)),
             output,
@@ -1591,6 +1663,31 @@ mod bounded_transport_drain_test {
         assert_eq!(lines, ["received", "started", "completed"]);
         // The writer is intentionally still alive: no timeout or EOF was needed to finish.
         drop(inherited_writer);
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_pipe_tests {
+    use super::*;
+    #[test]
+    fn broken_pipe_preserves_operating_system_error() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let frame: KernelToDomainFrame = serde_json::from_value(json!({
+            "frame_type":"receipt","message_id":"probe","logical_id":"probe","seq":1,
+            "source_domain":"kernel","target":"probe.ping","message_type":"Durable",
+            "status":"completed","timestamp":0,"data":null
+        }))
+        .unwrap();
+        let error = write_frame(&mut writer, &frame, &AtomicBool::new(false)).unwrap_err();
+        #[cfg(unix)]
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        let details = io_error(&error);
+        assert_eq!(details["raw_os_error"], json!(error.raw_os_error()));
+        assert_ne!(
+            details["message"],
+            "domain transport ended after draining buffered frames"
+        );
     }
 }
 

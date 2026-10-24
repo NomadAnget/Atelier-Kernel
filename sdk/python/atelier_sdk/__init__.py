@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-__version__ = "0.1.12"
+__version__ = "0.1.13"
 
 KERNEL_REGISTRY_TARGET = "kernel.registry"
 KERNEL_STORAGE_TARGET = "kernel.storage"

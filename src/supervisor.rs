@@ -1521,6 +1521,21 @@ impl DomainSupervisor {
             || (!candidate.bindings.is_empty() && !candidate.app_ready.load(Ordering::Acquire))
         {
             self.inner.router.abort_candidate(id, generation);
+            // Process exit may be observed before the receive worker has consumed
+            // the final application-startup error frame already in its pipe.
+            // Give that worker a bounded chance to finish before reporting the
+            // candidate failure; do not stop it or discard its buffered input.
+            if candidate.exit_status.is_some() {
+                let evidence_deadline = Instant::now() + Duration::from_millis(300);
+                while !candidate
+                    .workers
+                    .get(1)
+                    .is_some_and(|worker| worker.is_finished())
+                    && Instant::now() < evidence_deadline
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
             let failure = format!(
                 "pid={}, exit={:?}, first_fault={}, transport={:?}",
                 candidate.pid,

@@ -284,7 +284,7 @@ domain.logger.phase("INFO", "finish", `库存 ${sku} 扣减完毕`);
    构建产物自动输出至 `dist/sdk/` 与 `dist/kernel-runtime/`。
 
 2. **GitHub Actions 自动构建与 Release 发布**：
-   - 每次推送代码到 `main` 分支：GitHub Actions（[`.github/workflows/build-and-release.yml`](./.github/workflows/build-and-release.yml)）自动构建 Python `.whl`、Node.js `.tgz` 以及 Linux / Windows / macOS 三端预编译运行包，并上传至 **Actions -> Artifacts**。
+   - 每次推送代码到 `main` 分支：GitHub Actions（[`.github/workflows/build-and-release.yml`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/.github/workflows/build-and-release.yml)）自动构建 Python `.whl`、Node.js `.tgz` 以及 Linux / Windows / macOS 三端预编译运行包，并上传至 **Actions -> Artifacts**。
    - 推送版本标签时自动发布正式 Release：
      ```bash
      git tag v0.1.0

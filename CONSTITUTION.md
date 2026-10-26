@@ -82,12 +82,12 @@ atelier-kernel --check .
 
 | 编号 | 规则名称 | 核心约束内容 | 静态检查 (`--check`) | 启动期 / 运行时执法 |
 | :--- | :--- | :--- | :--- | :--- |
-| **M1** | **域标识与路由注册律** | `domain_id` 必须为非空 ASCII 字母、数字或 `_`，且在变体内全局唯一；处理器名非空且不含 `.`，注册后生成 `<domain_id>.<handler>` | ✓ 校验 `domain_id`合法性与唯一性 | 运行时 [`KernelRouter`](src/router.rs) 强校验 |
-| **M2** | **管道即身份律（防伪造）** | 一切入站消息、回执、日志的发送域身份由独立双匿名协议管道决定；回执上报的目标 `<domain>.<handler>` 首段必须等于上报管道所属 `domain_id` | — | 运行时 [`KernelLedger`](src/ledger.rs) 越权拒收（`UnauthorizedTarget`） |
-| **M3** | **写权随域走（写隔离、读共享）** | `StorageInsert` / `StorageUpdate` / `StorageDelete` 只能修改本域 `store_<source_domain>`；`StorageQuery` 支持只读跨域查询 | — | 运行时 [`DomainStorageEngine`](src/storage.rs) 拒越域写（`CrossDomainWriteForbidden`） |
+| **M1** | **域标识与路由注册律** | `domain_id` 必须为非空 ASCII 字母、数字或 `_`，且在变体内全局唯一；处理器名非空且不含 `.`，注册后生成 `<domain_id>.<handler>` | ✓ 校验 `domain_id`合法性与唯一性 | 运行时 [`KernelRouter`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/src/router.rs) 强校验 |
+| **M2** | **管道即身份律（防伪造）** | 一切入站消息、回执、日志的发送域身份由独立双匿名协议管道决定；回执上报的目标 `<domain>.<handler>` 首段必须等于上报管道所属 `domain_id` | — | 运行时 [`KernelLedger`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/src/ledger.rs) 越权拒收（`UnauthorizedTarget`） |
+| **M3** | **写权随域走（写隔离、读共享）** | `StorageInsert` / `StorageUpdate` / `StorageDelete` 只能修改本域 `store_<source_domain>`；`StorageQuery` 支持只读跨域查询 | — | 运行时 [`DomainStorageEngine`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/src/storage.rs) 拒越域写（`CrossDomainWriteForbidden`） |
 | **M4** | **进程即边界律（禁跨域私调与直连库）** | 各域为独立子进程，严禁在域源码中跨目录相对 `import` / `require` 其他域的私有文件，严禁业务域绕过 `kernel.storage` 直接读写内核 SQLite 数据库文件 | ✓ AST/源码扫描跨域相对导入与直连 SQLite | OS 独立进程地址空间物理隔离 |
 | **M5** | **协议管道纯净律（独立双匿名管道专管）** | 内核与域通过独立双匿名管道（`ATELIER_IPC_READ_FD` / `ATELIER_IPC_WRITE_FD`）收发 JSON-Lines 协议帧，与 `stdout/stderr` 物理隔离；严禁业务域代码绕过 SDK 私自读取或篡改专用 IPC 描述符 | ✓ 静态扫描业务域源码私自访问 `ATELIER_IPC_*_FD` | SDK 启动即锁定描述符不可继承并擦除环境变量，运行时非法帧立即拦截返回 `ContractInvalid` |
-| **M6** | **配置显式律** | `kernel_boot.json` 严禁包含未知字段（`deny_unknown_fields`），`domain_id` 不得重复，工作目录与入口脚本路径必须真实存在 | ✓ 严格反序列化与入口文件存在性校验 | 启动期 [`KernelBootConfig::load_from_file`](src/supervisor.rs) 即刻报错 |
+| **M6** | **配置显式律** | `kernel_boot.json` 严禁包含未知字段（`deny_unknown_fields`），`domain_id` 不得重复，工作目录与入口脚本路径必须真实存在 | ✓ 严格反序列化与入口文件存在性校验 | 启动期 [`KernelBootConfig::load_from_file`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/src/supervisor.rs) 即刻报错 |
 | **M7** | **两层存储防漂移律** | 内核核心表（`kernel_ledger`、`hub_logs`、`store_<domain>`）固定为上层契约列结构，启动时校验实表列结构完整性；实表结构漂移立即报错，绝不静默改表 | ✓ 若存在数据库文件则校验表结构 | 启动期与建表期 `PRAGMA table_info` 结构防漂移校验 |
 
 ### 第二级 · 行为规范（B1–B6）

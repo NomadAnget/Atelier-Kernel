@@ -12,12 +12,12 @@
 
 ## 核心特性
 
-1. **非分布式、零网络内部通信**：内核与各业务域之间仅通过操作系统**父子进程匿名管道（`stdin` / `stdout` JSON-Lines）**通信，不占用任何内部 TCP/UDP 端口。
-2. **内核接管域生命周期 & 语言无感**：内核读取 `kernel_boot.json` 拉起各域子进程；任何语言（Python、Node.js、Rust、Go、C++ 等）只要能读写标准输入输出 JSON 行即可接入，新增域无需修改或重新编译内核源码。
+1. **非分布式、零网络内部通信**：内核与各业务域之间仅通过操作系统**父子进程匿名管道（`ATELIER_IPC_READ_FD` / `ATELIER_IPC_WRITE_FD` JSON-Lines）**通信，不占用任何内部 TCP/UDP 端口。
+2. **内核接管域生命周期 & 语言无感**：内核读取 `kernel_boot.json` 拉起各域子进程；任何语言（Python、Node.js、Rust、Go、C++ 等）只要能通过内核分配的专用匿名管道读写 JSON 行即可接入，新增域无需修改或重新编译内核源码。
 3. **物理管道级身份绑定 & 代际隔离（`instance_id`）**：域身份由内核持有的子进程管道句柄直接决定，不依赖 JSON 自声明；每次进程重启分配单调代际 `instance_id` 并通过按域互斥门序列化，彻底杜绝身份伪造、跨表越权与旧线程竞态干扰。
 4. **消息 ID 由内核统一生成 & 三级幂等投递保证**：
    - 发送端无需自建全局 ID，消息进入内核瞬间分配共同 `logical_id`，并为每个目标分配独立唯一 `message_id`；
-   - 第一级：按 `(source_domain, seq)` 对发送端重复提交防抖；
+   - 第一级：按 `(source_domain, instance_id, seq)` 对发送端重复提交防抖；
    - 第二级：按 `message_id` 维护逐目标独立状态账本；
    - 第三级：按单调偏序吸收重复或乱序回执。
 5. **`<domain>.<handler>` 自动路由 & `TargetInvalid` 零盲发拦截**：域启动后只需发送 `RegisterHandlers` 报备处理器列表；目标不存在或未就绪时内核绝不发送消息，立即返回 `TargetInvalid`。
@@ -28,7 +28,7 @@
    - 内核将注册、存储、日志、遥测、告警、运行时拓扑、观察者快照与生命周期更新收敛为统一的**内核基础设施方法**，直接挂载在多语言 SDK 的 `domain.*` 实例上；
    - 业务路由列表（`available_handlers`）严格**排除**所有 `kernel.*` 处理器，彻底杜绝域间强耦合与发布订阅反模式；
    - 观察者流、日志流、遥测流、告警流严格采用 `DeliveryPolicy::Ephemeral` 瞬态直推，零回执报账，域崩溃断开时内核自动解绑注销；
-   - 支持平滑滚动更新（`update`）：隔离拉起候选实例进行主动探活（`probe_handler`），探活成功原子切换路由并平滑排干旧实例在途请求；探活失败零感自动回滚。
+   - 支持平滑滚动更新（`update`）：隔离拉起候选并等待处理器注册；声明端口绑定时还需 SDK 应用启动完成握手。成功后切换路由与端口后端，旧连接最多排空30秒；候选失败保留旧实例。`probe_handler` 当前仅保留兼容入参，不执行业务健康探针。
 
 ---
 
@@ -68,8 +68,8 @@
 | **4. 高频遥测** | `kernel.telemetry` | • `domain.telemetry.emit(metric, val, tags)` | • **实时遥测流监听**：<br>  - Py: `@domain.on_telemetry`<br>  - JS: `domain.onTelemetry(fn)`<br>• 接收：`{ metric_name, value, tags, source_domain }` | 高频传感器、性能指标上报；瞬态直推，零回执报账 |
 | **5. 系统告警** | `kernel.notify` | • 同步即发即弃：`domain.notify(...)`<br>• 异步等待确认：`await domain.notify_async(...)` | • **实时告警监听**：<br>  - Py: `@domain.on_notify`<br>  - JS: `domain.onNotify(fn)`<br>• 接收：`{ severity, message, notification_type, details }` | 系统异常广播与跨域告警通知；瞬态直推，零 Receipt |
 | **6. 装配拓扑** | `kernel.runtime` | • `domain.runtime.list_domains()`<br>• `domain.runtime.get_domain(domain_id)`<br>• `domain.runtime.query(...)` | • 返回全系统域装配拓扑数据：<br>  `{ count, domains: [ { domain_id, status, instance_id, routes, process: { pid, command, ... } } ] }` | 拓扑监控、探活与排障，随时获取活跃域与其 OS 进程信息 |
-| **7. 观察者流** | `kernel.observer` | • 快照检索：`domain.observer.query(...)`<br>• 订阅流控制：`subscribe()` / `unsubscribe()` | • **全局生命周期流监听**：<br>  - Py: `@domain.on_observation`<br>  - JS: `domain.onObservation(fn)`<br>• 接收：`{ topic, state, message_id, logical_id, target, source_domain }` | 审计与全链路监控；消息状态瞬态推送；订阅域断开时内核自动清理注销 |
-| **8. 更新与回滚** | `kernel.supervisor` | • `domain.supervisor.start(domain)`<br>• `domain.supervisor.stop(domain)`<br>• `domain.supervisor.restart(domain)`<br>• `domain.supervisor.update(domain, ...)` | • 返回更新与探活结果：<br>  `{ success: true, domain, old_instance_id, new_instance_id }`<br>  或探活失败自动回滚通知：`{ success: false, domain, message }` | 进程受控启停；平滑滚动更新（候选版本隔离探活成功后原子切换，失败自动回滚） |
+| **7. 观察者流** | `kernel.observer` | • 快照检索：`domain.observer.query(...)`<br>• 订阅流控制：`subscribe()` / `unsubscribe()` | • **全局生命周期流监听**：<br>  - Py: `@domain.on_observation`<br>  - JS: `domain.onObservation(fn)`<br>• 接收：`{ event_id, timestamp, status, message_type, message_id, logical_id, target, source_domain, details }` | 审计与全链路监控；消息状态瞬态推送；订阅域断开时内核自动清理注销 |
+| **8. 更新与回滚** | `kernel.supervisor` | • `domain.supervisor.start(domain)`<br>• `domain.supervisor.stop(domain)`<br>• `domain.supervisor.restart(domain)`<br>• `domain.supervisor.update(domain, ...)` | • 返回更新与探活结果：<br>  `{ domain_id, old_pid, new_pid, instance_id, status: "updated" }`<br>  或探活失败自动回滚通知：`DomainRequestError(status="ExecutionFailed", data={ domain_id, status: "rolled_back", error, reason })` | 进程受控启停；平滑滚动更新（候选注册及端口启动握手后切换，失败保留旧实例） |
 
 ---
 
@@ -81,7 +81,7 @@
 | :--- | :--- | :--- |
 | **进程与代码隔离 (`M4`)** | 跨目录直接 import 其他域的代码（如 `from ..billing import xxx` 或 `require('../billing')`） | 域间 100% 物理隔离，仅通过 `domain.send(["billing.charge"], "Durable", params, data)` 通信 |
 | **数据库访问 (`M3`, `M4`, `M7`)** | 域代码中自行 `import sqlite3` 直连内核数据库，或尝试修改他域表、执行 `ALTER TABLE` | 统一调用 `domain.storage.insert / query / ...` 操作本域表；跨表只读查询传 `domain="other_domain"`；业务字段放进 `data` JSON |
-| **日志与标准输出 (`M5`)** | 在域代码中使用裸 `print(...)` 或 `console.log(...)`（会直接污染 `stdout` JSON-Lines 协议管道！） | 统一使用 SDK 提供的日志器：`domain.logger.info("msg")`（或向 `stderr` 输出调试信息） |
+| **日志与标准输出 (`M5`)** | 在域代码中使用裸 `print(...)` 或 `console.log(...)`（缺少 SDK 的结构化组件、级别等信息；stdout/stderr 与 IPC 已物理隔离） | 统一使用 SDK 提供的日志器：`domain.logger.info("msg")`（或向 `stderr` 输出调试信息） |
 | **处理器命名与说明 (`M1`)** | 处理器名包含点号 `.`（如 `@domain.handler("a.b")`） | 处理器名不含 `.`（如 `@domain.handler("calc_order")`），直接在方法上写注释或 Docstring，SDK 自动提取上报给内核 |
 | **异常处理 (`B3`, `B6`)** | 裸 `except: pass` 静默吞掉异常或返回假成功；在处理器里写死循环阻塞管道 | 校验失败或依赖异常时直接抛出异常（让 SDK 自动触发 `ExecutionFailed` 回执）；耗时任务放入引擎域自管队列异步执行 |
 
@@ -96,7 +96,7 @@ domain = AtelierDomain("order_service")
 # ✅ 原生监听全局观察流（零 Receipt 负担，内核管道推流）
 @domain.on_observation
 def on_lifecycle(event):
-    if event.get("state") == "ExecutionFailed":
+    if event.get("status") == "ExecutionFailed":
         domain.logger.warning("Detected failure on %s", event.get("target"))
 
 # ✅ 注册业务处理器（零额外参数，自动提取 Docstring）
@@ -196,8 +196,8 @@ domain.run();
 
 输出产物位于 `dist/`：
 - **SDK 安装包**：
-  - Python Wheel：`dist/sdk/atelier_sdk-0.1.8-py3-none-any.whl`
-  - Node.js NPM 包：`dist/sdk/atelier-sdk-0.1.8.tgz`
+  - Python Wheel：`dist/sdk/atelier_sdk-0.1.14-py3-none-any.whl`
+  - Node.js NPM 包：`dist/sdk/atelier-sdk-0.1.14.tgz`
 - **内核运行包**：
   - 预编译二进制：`dist/kernel-runtime/atelier-kernel`
   - 启动配置模板：`dist/kernel-runtime/kernel_boot.template.json`
@@ -210,8 +210,8 @@ domain.run();
 ./dist/kernel-runtime/atelier-kernel --init ./my-variant
 
 # 2) 安装 Python / Node.js 域 SDK
-pip install ./dist/sdk/atelier_sdk-0.1.8-py3-none-any.whl
-npm install ./dist/sdk/atelier-sdk-0.1.8.tgz
+pip install ./dist/sdk/atelier_sdk-0.1.14-py3-none-any.whl
+npm install ./dist/sdk/atelier-sdk-0.1.14.tgz
 
 # 3) 运行宪法检查 & 启动变体（默认开启 http://127.0.0.1:8787 实时观察台；生产环境可加 --headless）
 ./dist/kernel-runtime/atelier-kernel --check ./my-variant
@@ -242,6 +242,14 @@ cargo run -- --auto
 cargo test
 ```
 
-### 持久日志缓冲（待发布）
+### 持久日志缓冲
 
 文件数据库启动时会创建 `<db_path>.log-spool.sqlite`（及 SQLite WAL/SHM 文件），用于普通日志的可靠接收与批量入库。不要将它当临时缓存删除；迁移、备份和恢复需将主库与日志缓冲作为一组资产一致处理。主库写锁不会使已接收日志被容量策略丢弃；导入失败保留记录并重试，原子游标防止重复。`LogStore.flush(timeout)` 返回确认结果；运行健康的 `logging.persistence_error` 暴露接收/导入故障。接收等待本地 FULL 同步提交，非零等待；瞬态进度、console_only 及实时订阅维持原有语义。
+## 0.1.14 接口与运行约定
+
+- [端口绑定与更新](docs/PORT_BINDINGS.md)：公开地址由内核薄转发进程持有，域通过`domain.bindings`监听内部端点。
+- [域状态观察](docs/DOMAIN_STATE_OBSERVATION.md)：原观察订阅自动获得初始与最新状态镜像，无轮询；active仅表示注册状态。
+- [观察能力使用说明](docs/OBSERVATION_USAGE.md)：消息链路、进度、遥测与告警。
+- [当前文档索引与历史记录范围](docs/INDEX.md)；[0.1.14发布说明](docs/RELEASE_0.1.14.md)。
+
+文件装配的`UpdateDomain`未传spec时由内核重读启动文件；失败保留旧实例。旧连接最多排空30秒，SSE/WebSocket可重连；不保证任意业务请求或会话无损迁移。

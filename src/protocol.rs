@@ -223,6 +223,11 @@ impl ContractStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "frame_type", rename_all = "snake_case")]
 pub enum DomainToKernelFrame {
+    /// SDK startup completion for kernel-owned ingress. Never a business message.
+    Ready {
+        #[serde(default)]
+        error: Option<String>,
+    },
     /// Submit a new message for routing or storage.
     Send(OutboundMessage),
     /// Report execution progress/completion receipt for a delivered message.

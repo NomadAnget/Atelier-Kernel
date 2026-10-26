@@ -1,7 +1,9 @@
 use crate::outbox::{self, PipeReceiver};
+use crate::port_forwarder::{Forwarder, PortBinding};
 use crate::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
+use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +57,9 @@ pub enum SupervisorError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelBootConfig {
+    /// Host-only origin; never part of the boot JSON or domain API.
+    #[serde(skip)]
+    pub source_path: Option<std::path::PathBuf>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
     #[serde(default = "default_web_bind")]
@@ -91,6 +96,16 @@ impl KernelBootConfig {
                 source,
             })?;
 
+        cfg.source_path = Some(if path_ref.is_absolute() {
+            path_ref.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|source| SupervisorError::ConfigReadFailed {
+                    path: path_str.clone(),
+                    source,
+                })?
+                .join(path_ref)
+        });
         if let Some(base_dir) = path_ref
             .parent()
             .filter(|p| !p.as_os_str().is_empty() && *p != std::path::Path::new("."))
@@ -160,6 +175,9 @@ pub struct DomainProcessSpec {
     /// Per-process overrides of inherited environment; kernel IPC keys are reserved.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
+    /// Public ingress bindings owned by the kernel, not by a domain generation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortBinding>,
     #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default = "default_auto_restart")]
@@ -177,6 +195,7 @@ impl Default for DomainProcessSpec {
             command: String::new(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            ports: Vec::new(),
             working_dir: None,
             auto_restart: default_auto_restart(),
             max_restarts: default_max_restarts(),
@@ -204,13 +223,28 @@ impl DomainProcessSpec {
         {
             return Err("[M6] empty command or NUL in process arguments".into());
         }
+        let mut bindings = HashSet::new();
+        for binding in &self.ports {
+            if binding.name.is_empty()
+                || !bindings.insert(&binding.name)
+                || binding.listen.port() == 0
+            {
+                return Err(
+                    "[M6] port bindings require unique nonempty names and nonzero public ports"
+                        .into(),
+                );
+            }
+        }
         let mut env_names = HashSet::new();
         for (key, value) in &self.env {
             let normalized = key.to_ascii_uppercase();
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
                 return Err("[M6] invalid environment key or NUL in environment value".into());
             }
-            if normalized.starts_with("ATELIER_IPC_") {
+            if normalized.starts_with("ATELIER_IPC_")
+                || normalized == "ATELIER_PORT_BINDINGS"
+                || normalized == "ATELIER_MANAGED_READY"
+            {
                 return Err(
                     "[C1] ATELIER_IPC_* environment keys are reserved by the kernel".into(),
                 );
@@ -236,6 +270,7 @@ impl DomainProcessSpec {
             command: command.into(),
             args,
             env: BTreeMap::new(),
+            ports: Vec::new(),
             working_dir: None,
             auto_restart: default_auto_restart(),
             max_restarts: default_max_restarts(),
@@ -494,6 +529,9 @@ struct ManagedProcess {
     drain: Arc<AtomicBool>,
     output: crate::outbox::PipeSender,
     workers: Vec<thread::JoinHandle<()>>,
+    app_ready: Arc<AtomicBool>,
+    bindings: Vec<(Arc<Forwarder>, SocketAddr)>,
+    ingress_active: bool,
 }
 impl ManagedProcess {
     fn exited(&mut self) -> bool {
@@ -607,7 +645,15 @@ struct DomainControl {
     operation: Mutex<()>,
     state: Mutex<DomainState>,
 }
+struct RetiringProcess {
+    domain: String,
+    process: ManagedProcess,
+    deadline: Instant,
+}
 struct DomainSupervisorInner {
+    forwarders: Mutex<HashMap<(String, String), (PortBinding, Arc<Forwarder>)>>,
+    retiring: Mutex<Vec<RetiringProcess>>,
+    boot_config_path: RwLock<Option<std::path::PathBuf>>,
     router: Arc<KernelRouter>,
     domains: RwLock<HashMap<String, Arc<DomainControl>>>,
     shutdown: Arc<AtomicBool>,
@@ -707,6 +753,8 @@ impl DomainSupervisorInner {
 
         let configure_cmd = |cmd: &mut Command| {
             cmd.args(&spec.args)
+                .env_remove("ATELIER_PORT_BINDINGS")
+                .env_remove("ATELIER_MANAGED_READY")
                 .envs(&spec.env)
                 .env_remove("ATELIER_IPC_READ_FD")
                 .env_remove("ATELIER_IPC_WRITE_FD")
@@ -795,7 +843,61 @@ impl DomainSupervisorInner {
         candidate: bool,
     ) -> Result<ManagedProcess, SupervisorError> {
         let id = &spec.domain_id;
-        let (mut child, mut tx, rx) = self.spawn_child_pipes(id, spec)?;
+        let mut child_spec = spec.clone();
+        child_spec.env.remove("ATELIER_PORT_BINDINGS");
+        child_spec.env.remove("ATELIER_MANAGED_READY");
+        let mut bindings = Vec::new();
+        let mut endpoints = serde_json::Map::new();
+        for binding in &spec.ports {
+            let relay = {
+                let mut map = self.forwarders.lock();
+                let key = (id.clone(), binding.name.clone());
+                if let Some((existing, relay)) = map.get(&key) {
+                    if existing != binding {
+                        return Err(SupervisorError::UpdateValidationFailed { domain:id.clone(), reason:"changing an existing public binding requires a separate binding migration".into() });
+                    }
+                    relay.clone()
+                } else {
+                    let relay = Forwarder::spawn(binding.listen).map_err(|source| {
+                        SupervisorError::SpawnFailed {
+                            domain: id.clone(),
+                            source,
+                        }
+                    })?;
+                    map.insert(key, (binding.clone(), relay.clone()));
+                    relay
+                }
+            };
+            let reservation = TcpListener::bind("127.0.0.1:0").map_err(|source| {
+                SupervisorError::SpawnFailed {
+                    domain: id.clone(),
+                    source,
+                }
+            })?;
+            let address =
+                reservation
+                    .local_addr()
+                    .map_err(|source| SupervisorError::SpawnFailed {
+                        domain: id.clone(),
+                        source,
+                    })?;
+            endpoints.insert(
+                binding.name.clone(),
+                json!({"host":address.ip().to_string(),"port":address.port()}),
+            );
+            bindings.push((relay, address));
+            drop(reservation);
+        }
+        if !bindings.is_empty() {
+            child_spec.env.insert(
+                "ATELIER_PORT_BINDINGS".into(),
+                serde_json::Value::Object(endpoints).to_string(),
+            );
+            child_spec
+                .env
+                .insert("ATELIER_MANAGED_READY".into(), "1".into());
+        }
+        let (mut child, mut tx, rx) = self.spawn_child_pipes(id, &child_spec)?;
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -816,6 +918,9 @@ impl DomainSupervisorInner {
             drain: Arc::new(AtomicBool::new(false)),
             output: sender,
             workers: Vec::new(),
+            app_ready: Arc::new(AtomicBool::new(false)),
+            bindings,
+            ingress_active: false,
         };
         let result = (|| -> std::io::Result<()> {
             #[cfg(unix)]
@@ -870,11 +975,23 @@ impl DomainSupervisorInner {
             let stop = process.stop.clone();
             let domain = id.clone();
             let drain = process.drain.clone();
+            let app_ready = process.app_ready.clone();
             process.workers.push(
                 thread::Builder::new()
                     .name(format!("kernel-rx-{id}-{generation}"))
                     .spawn(move || {
                         let result = pump_lines(ipc_reader(rx), &stop, Some(&drain), |line| {
+                            if line.len() < 8192 {
+                                if let Ok(value)=serde_json::from_str::<Value>(line) {
+                                    if value.get("frame_type").and_then(Value::as_str)==Some("ready") {
+                                        if let Some(error)=value.get("error").and_then(Value::as_str) {
+                                            diagnostics.record("application_startup",json!({"message":bounded(error)}),true);
+                                            drain.store(true,Ordering::Release);
+                                        } else { app_ready.store(true,Ordering::Release); }
+                                        return;
+                                    }
+                                }
+                            }
                             if let Some(router) = weak.upgrade() {
                                 router.handle_raw_pipe_line_for_instance(&domain, generation, line);
                             }
@@ -972,8 +1089,16 @@ impl DomainSupervisorInner {
         mut process: ManagedProcess,
         reason: &str,
     ) -> bool {
-        self.router
-            .mark_domain_faulted_for_instance(id, Some(process.instance_id), reason);
+        for (relay, _) in &process.bindings {
+            let _ = relay.switch(None);
+        }
+        if control.state.lock().stopped {
+            self.router
+                .mark_domain_stopped_for_instance(id, Some(process.instance_id), reason);
+        } else {
+            self.router
+                .mark_domain_faulted_for_instance(id, Some(process.instance_id), reason);
+        }
         process.terminate();
         // No state/router locks are held while killing, waiting, or joining workers.
         let mut state = control.state.lock();
@@ -986,6 +1111,35 @@ impl DomainSupervisorInner {
         }
     }
     fn monitor(&self) {
+        let forwarders: Vec<_> = self
+            .forwarders
+            .lock()
+            .values()
+            .map(|(_, p)| p.clone())
+            .collect();
+        for relay in forwarders {
+            if let Err(error) = relay.ensure_alive() {
+                eprintln!("kernel port forwarder recovery failed: {error}");
+            }
+        }
+        let retiring = std::mem::take(&mut *self.retiring.lock());
+        for mut old in retiring {
+            let drained = old
+                .process
+                .bindings
+                .iter()
+                .all(|(relay, backend)| relay.connections(*backend).is_ok_and(|n| n == 0));
+            if drained || Instant::now() >= old.deadline || self.shutdown.load(Ordering::Acquire) {
+                self.router
+                    .cleanup_draining_instance(&old.domain, old.process.instance_id);
+                old.process.terminate();
+                if old.process.child.is_some() {
+                    self.retiring.lock().push(old);
+                }
+            } else {
+                self.retiring.lock().push(old);
+            }
+        }
         for (id, generation, reason) in self.router.failed_output_queues() {
             // A managed receiver owns the drain-before-fault boundary. In-process domains
             // have no reader worker, so their output failures still converge here directly.
@@ -1014,6 +1168,22 @@ impl DomainSupervisorInner {
             .map(|(id, c)| (id.clone(), c.clone()))
             .collect();
         for (id, control) in domains {
+            {
+                let mut state = control.state.lock();
+                if let Some(process) = state.process.as_mut() {
+                    if !process.ingress_active
+                        && !process.bindings.is_empty()
+                        && process.app_ready.load(Ordering::Acquire)
+                    {
+                        let switched = process
+                            .bindings
+                            .iter()
+                            .all(|(relay, backend)| relay.switch(Some(*backend)).is_ok());
+                        process.ingress_active = switched;
+                    }
+                }
+            }
+
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
@@ -1077,6 +1247,7 @@ impl DomainSupervisorInner {
                     }
                     Err(error) => {
                         eprintln!("kernel auto-restart {id} failed: {error}");
+                        self.router.record_spawn_failure(&id, &error.to_string());
                         let mut s = control.state.lock();
                         s.restart_count = s.restart_count.saturating_add(1);
                         if s.spec.max_restarts.is_none_or(|max| s.restart_count <= max) {
@@ -1098,6 +1269,9 @@ pub struct DomainSupervisor {
 impl DomainSupervisor {
     pub fn new(router: Arc<KernelRouter>) -> Self {
         let inner = Arc::new(DomainSupervisorInner {
+            boot_config_path: RwLock::new(None),
+            forwarders: Mutex::new(HashMap::new()),
+            retiring: Mutex::new(Vec::new()),
             router,
             domains: RwLock::new(HashMap::new()),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -1137,6 +1311,11 @@ impl DomainSupervisor {
         for id in ids {
             self.stop_process_domain(&id);
         }
+        let retiring = std::mem::take(&mut *self.inner.retiring.lock());
+        for mut old in retiring {
+            old.process.terminate();
+        }
+        self.inner.forwarders.lock().clear();
     }
     fn require_running(&self, domain: &str) -> Result<(), SupervisorError> {
         if self.is_shutting_down() {
@@ -1164,6 +1343,7 @@ impl DomainSupervisor {
         &self,
         config: &KernelBootConfig,
     ) -> Vec<(String, Result<u32, SupervisorError>)> {
+        *self.inner.boot_config_path.write() = config.source_path.clone();
         config
             .domains
             .iter()
@@ -1212,7 +1392,15 @@ impl DomainSupervisor {
                 });
             }
         }
-        let process = self.inner.launch(&spec, false)?;
+        let process = match self.inner.launch(&spec, false) {
+            Ok(process) => process,
+            Err(error) => {
+                self.inner
+                    .router
+                    .record_spawn_failure(&id, &error.to_string());
+                return Err(error);
+            }
+        };
         let pid = process.pid;
         let mut state = control.state.lock();
         state.spec = spec;
@@ -1235,6 +1423,11 @@ impl DomainSupervisor {
             self.inner
                 .stop_owned(id, &control, process, "domain stopped by kernel supervisor")
         } else {
+            self.inner.router.mark_domain_stopped_for_instance(
+                id,
+                None,
+                "domain stopped by kernel supervisor",
+            );
             false
         }
     }
@@ -1260,9 +1453,23 @@ impl DomainSupervisor {
         _probe_handler: Option<&str>,
         timeout: Duration,
     ) -> Result<DomainUpdateResult, SupervisorError> {
-        let spec = new_spec
-            .or_else(|| self.get_spec(id))
-            .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?;
+        let spec = match new_spec {
+            Some(spec) => spec,
+            None => {
+                let path = self.inner.boot_config_path.read().clone();
+                if let Some(path) = path {
+                    KernelBootConfig::load_from_file(path)?
+                        .domains
+                        .into_iter()
+                        .find(|spec| spec.domain_id == id)
+                        .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?
+                } else {
+                    // Embedded hosts without a file retain their explicit in-memory configuration.
+                    self.get_spec(id)
+                        .ok_or_else(|| SupervisorError::UnknownDomainSpec(id.into()))?
+                }
+            }
+        };
         if spec.domain_id != id {
             return Err(SupervisorError::UpdateValidationFailed {
                 domain: id.into(),
@@ -1273,6 +1480,13 @@ impl DomainSupervisor {
         let control = self.inner.ensure(&spec)?;
         let operation = control.operation.lock();
         self.require_running(id)?;
+        let binding_changed = {
+            let state = control.state.lock();
+            state.process.is_some() && state.spec.ports != spec.ports
+        };
+        if binding_changed {
+            return Err(SupervisorError::UpdateValidationFailed{domain:id.into(),reason:"public binding changes require host binding migration; existing process retained".into()});
+        }
         let old_pid = control.state.lock().process.as_ref().map(|p| p.pid);
         if old_pid.is_none() {
             drop(operation);
@@ -1293,7 +1507,9 @@ impl DomainSupervisor {
             && !candidate.drain.load(Ordering::Acquire)
             && !self.inner.shutdown.load(Ordering::Acquire)
         {
-            if self.inner.router.is_candidate_ready(id, generation) {
+            if self.inner.router.is_candidate_ready(id, generation)
+                && (candidate.bindings.is_empty() || candidate.app_ready.load(Ordering::Acquire))
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1302,15 +1518,56 @@ impl DomainSupervisor {
             || candidate.exited()
             || candidate.drain.load(Ordering::Acquire)
             || !self.inner.router.is_candidate_ready(id, generation)
-            || !self.inner.router.commit_candidate(id, generation)
+            || (!candidate.bindings.is_empty() && !candidate.app_ready.load(Ordering::Acquire))
         {
+            self.inner.router.abort_candidate(id, generation);
+            let failure = format!(
+                "pid={}, exit={:?}, first_fault={}, transport={:?}",
+                candidate.pid,
+                candidate.exit_status,
+                candidate.diagnostics.first_fault().unwrap_or(Value::Null),
+                candidate.output.failure()
+            );
+            candidate.terminate();
+            return Err(SupervisorError::UpdateValidationFailed {
+                domain: id.into(),
+                reason: format!("candidate exited or failed application readiness: {failure}"),
+            });
+        }
+        let previous_bindings = control
+            .state
+            .lock()
+            .process
+            .as_ref()
+            .map(|p| p.bindings.clone())
+            .unwrap_or_default();
+        let switched = candidate
+            .bindings
+            .iter()
+            .try_for_each(|(relay, backend)| relay.switch(Some(*backend)));
+        if let Err(error) = switched {
+            for (relay, backend) in &previous_bindings {
+                let _ = relay.switch(Some(*backend));
+            }
             self.inner.router.abort_candidate(id, generation);
             candidate.terminate();
             return Err(SupervisorError::UpdateValidationFailed {
                 domain: id.into(),
-                reason: "candidate did not register ready before deadline".into(),
+                reason: format!("ingress switch failed: {error}"),
             });
         }
+        if !self.inner.router.commit_candidate(id, generation) {
+            for (relay, backend) in &previous_bindings {
+                let _ = relay.switch(Some(*backend));
+            }
+            self.inner.router.abort_candidate(id, generation);
+            candidate.terminate();
+            return Err(SupervisorError::UpdateValidationFailed {
+                domain: id.into(),
+                reason: "candidate lost readiness before commit".into(),
+            });
+        }
+        candidate.ingress_active = true;
         let pid = candidate.pid;
         let previous = {
             let mut state = control.state.lock();
@@ -1321,11 +1578,19 @@ impl DomainSupervisor {
             state.process.replace(candidate)
         };
         if let Some(mut old) = previous {
-            thread::sleep(Duration::from_millis(600));
-            self.inner
-                .router
-                .cleanup_draining_instance(id, old.instance_id);
-            old.terminate();
+            if old.bindings.is_empty() {
+                thread::sleep(Duration::from_millis(600));
+                self.inner
+                    .router
+                    .cleanup_draining_instance(id, old.instance_id);
+                old.terminate();
+            } else {
+                self.inner.retiring.lock().push(RetiringProcess {
+                    domain: id.into(),
+                    process: old,
+                    deadline: Instant::now() + Duration::from_secs(30),
+                });
+            }
         }
         Ok(DomainUpdateResult {
             domain_id: id.into(),
@@ -1622,6 +1887,9 @@ mod exit_drain_regression {
             drain: Arc::new(AtomicBool::new(false)),
             output,
             workers: vec![thread::spawn(|| {}), rx],
+            app_ready: Arc::new(AtomicBool::new(false)),
+            bindings: Vec::new(),
+            ingress_active: false,
         };
         let premature = process.exited();
         release.send(()).unwrap(); // Always release before assertion, including on the old code.

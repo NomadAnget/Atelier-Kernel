@@ -1,7 +1,7 @@
 """
 Atelier Kernel Official Python Domain SDK (`atelier_sdk`).
 
-Encapsulates OS Stdio JSON-Lines pipe framing, sequence numbering, handler
+Encapsulates dedicated OS anonymous-pipe JSON-Lines framing, sequence numbering, handler
 registration (`kernel.registry`), 4-stage receipt reporting (`Received` ->
 `Started` -> `Completed` / `ExecutionFailed`), and `kernel.storage` CRUD helpers
 so business domains only need to import `AtelierDomain` and declare handlers.
@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-__version__ = "0.1.13"
+__version__ = "0.1.14"
 
 KERNEL_REGISTRY_TARGET = "kernel.registry"
 KERNEL_STORAGE_TARGET = "kernel.storage"
@@ -401,6 +401,12 @@ class DomainObserverClient:
 
     def __init__(self, domain: "AtelierDomain"):
         self._domain = domain
+
+    @property
+    def domain_states(self):
+        """Latest full domain-state image from on_observation; None until subscribed."""
+        import copy
+        return copy.deepcopy(getattr(self._domain,'_domain_state_snapshot',None))
 
     async def query(
         self,

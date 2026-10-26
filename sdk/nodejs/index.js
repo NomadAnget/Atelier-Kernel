@@ -325,6 +325,8 @@ class DomainObserverClient {
     this._domain = domain;
   }
 
+  get domainStates(){return this._domain._domainStateSnapshot?structuredClone(this._domain._domainStateSnapshot):null;}
+
   async query(options = {}) {
     const res = await this._domain.queryObserverAsync(options);
     return res?.events || [];

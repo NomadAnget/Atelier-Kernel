@@ -1,3 +1,5 @@
+> 历史记录：以下结论、版本、计数和部署状态对应记录当时的基线，不代表当前发布状态。当前接口以[文档索引](INDEX.md)及宪法为准；旧证据保留，不作当前保证。
+
 # Per-generation process failure diagnostics (local patch)
 
 Baseline: 1efd851. This patch does not recover historical process exits and does

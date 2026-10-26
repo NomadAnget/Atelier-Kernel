@@ -1,3 +1,5 @@
+> 历史记录：以下结论、版本、计数和部署状态对应记录当时的基线，不代表当前发布状态。当前接口以[文档索引](docs/INDEX.md)及宪法为准；旧证据保留，不作当前保证。
+
 # Atelier Kernel v0.1.8 发版说明
 
 Atelier Kernel **v0.1.8** 正式发布！本版本确立了微内核架构下的 **8 大内核原生基础设施能力（8 Native Infrastructure Facilities）**，将内核内置处理器全面跃升为具备完备「发送 (Send) 与接收 (Receive)」语义的原生服务门面；同时新增候选实例平滑更新（Candidate Rolling Update）与回滚机制，全面升级 Python 与 Node.js 领域 SDK，并对 CI/CD 构建流水线进行了 Node 24 现代化与权限加固。

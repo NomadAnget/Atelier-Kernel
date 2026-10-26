@@ -2,8 +2,9 @@
 
 The kernel owns domain lifecycle, registered routes, authenticated source identity,
 global receipt state, persistence, and process supervision. RegisterHandlers makes
-the domain Active according to the kernel protocol. The SDK does not introduce a
-second readiness gate or health endpoint.
+the domain Active according to the kernel protocol. For port-bound domains only, the SDK reports application startup completion after
+on_start/onStart has successfully opened its assigned endpoint. This is a transport
+readiness handshake, not a business health endpoint or engine capability check.
 
 The SDK is a protocol client: JSON-lines transport, handler invocation and protocol
 receipts, asynchronous receipt correlation, awaitable kernel storage messages, and
@@ -25,7 +26,7 @@ The SDK exposes 8 native infrastructure clients and listeners directly on the do
 5. `domain.notify`: Alert dispatching (`domain.notify`). Listen via `@domain.on_notify` / `domain.onNotify`.
 6. `domain.runtime`: Runtime topology and process inspection (`list_domains`, `get_domain`, `query`).
 7. `domain.observer`: Lifecycle snapshot queries (`query`) and global event stream listening via `@domain.on_observation` / `domain.onObservation`.
-8. `domain.supervisor`: Process lifecycle control (`start`, `stop`, `restart`) and smooth rolling update with isolated candidate probing and automatic zero-gap rollback (`update`).
+8. `domain.supervisor`: Process lifecycle control (`start`, `stop`, `restart`) and smooth rolling update with isolated candidate registration/startup handshake and failure rollback (`update`).
 
 ## Event Stream Delivery Contract
 
@@ -73,3 +74,9 @@ and connection cleanup. Runtime integration is tested with the installed package
 Python/Node 的现有调用保持不变。SDK 同时执行的入站业务调用有独立的内部上限（1024），不与出站请求额度关联；达到上限时经标准 ExecutionFailed 回执报告 `sdk_execution_capacity_exhausted`，不创建无限等待任务。该额度不代表业务调度或自动重试。同步阻塞或不响应取消的业务代码由进程停止隔离，SDK 不承诺能强制终止语言运行时中的任意函数。
 
 观察与实时日志订阅仍为尽力副本，内核历史、每个订阅和进程出口均有内部资源上限。慢订阅、超大事件、订阅资源不足或断开可能产生缺口；不提供持久重放保证，不新增队列/背压/重连参数。普通日志的持久接收独立于这些副本，主库写入落后可由独立 WAL 缓冲及游标恢复。
+
+## Port bindings and domain state (0.1.14)
+
+`domain.bindings` exposes the kernel-assigned private endpoint for each configured public port binding. See [PORT_BINDINGS.md](docs/PORT_BINDINGS.md). `probe_handler` is compatibility-only and does not execute a health probe. Updates without explicit spec reread the source boot file.
+
+`on_observation` / `onObservation` also receives DomainStatusChanged and DomainStateSnapshot. The former is best-effort; the latter retains the latest current-state image and coalesces slow delivery. Cache: Python `domain.observer.domain_states`, Node `domain.observer.domainStates`. No polling, persistent replay, or subscriber queue settings. See [DOMAIN_STATE_OBSERVATION.md](docs/DOMAIN_STATE_OBSERVATION.md). The snapshot does not make ordinary lifecycle observations lossless.

@@ -179,6 +179,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
       this.close();await this._runPromise;
     }
     run(){this.runAsync().catch(()=>{process.exitCode=1;});}
+    get bindings(){return JSON.parse(process.env.ATELIER_PORT_BINDINGS||'{}');}
     runAsync({onStart,onClose}={}) {
       if(this._state!=='new')throw new Error('domain receive session already started or closed');
       this._ensureIpcStreams();
@@ -200,7 +201,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
       if(this._telemetryListeners&&this._telemetryListeners.length){this._submit(['kernel.telemetry'],'SubscribeTelemetry',{},{});}
       if(this._notifyListeners&&this._notifyListeners.length){this._submit(['kernel.notify'],'SubscribeNotify',{},{});}
       if(this._observationListeners&&this._observationListeners.length){this._submit(['kernel.observer'],'SubscribeObserver',{},{});}
-      this._startup=Promise.resolve().then(async()=>{if(onStart)await onStart();}).catch(error=>{this._startupError=error;this._diagnostic(`SDK startup failed: ${error}`);this.close();});
+      this._startup=Promise.resolve().then(async()=>{if(onStart)await onStart();if(process.env.ATELIER_MANAGED_READY==='1')this._writeFrame({frame_type:'ready'});}).catch(async error=>{if(process.env.ATELIER_MANAGED_READY==='1'){try{await new Promise(resolve=>this._ensureIpcOutput().write(JSON.stringify({frame_type:'ready',error:String(error).slice(0,1024)})+'\n',resolve));}catch(_){}}this._startupError=error;this._diagnostic(`SDK startup failed: ${error}`);this.close();});
       return this._runPromise;
     }
     _replyError(frame,code,reason){this.reportReceipt(frame.message_id,frame.target,'execution_failed',{code,error:code,reason});}
@@ -259,13 +260,24 @@ function enhance(Base,RequestError,ExecutionFailed) {
       }
     }
     _dispatchSystemObserver(frame){
+      const event=frame.data||{};
+      if(event.message_type==='DomainStateSnapshot'){
+        const snapshot=event.details||{};const previous=this._domainStateSnapshot;
+        if(previous&&snapshot.stream_id===previous.stream_id&&snapshot.revision<previous.revision)return;
+        this._domainStateSnapshot=structuredClone(snapshot);
+      }
       for(const callback of (this._observationListeners||[])){
         this._invokeLossyEventListener(callback,frame.data||{},'_observationBusy');
       }
     }
     _invokeLossyEventListener(callback,payload,busyKey){
       const busy=this[busyKey]||(this[busyKey]=new Set());
-      if(busy.has(callback))return;
+      if(busy.has(callback)){
+        if(busyKey==='_observationBusy'&&payload.message_type==='DomainStateSnapshot'){
+          const pending=this._observationLatest||(this._observationLatest=new Map());pending.set(callback,structuredClone(payload));
+        }
+        return;
+      }
       try{
         const result=callback(payload);
         if(result&&typeof result.then==='function'){
@@ -273,7 +285,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
           const task=Promise.resolve(result);
           this._callbacks.add(task);
           task.catch(error=>this._diagnostic(`SDK lossy listener error: ${error}`))
-            .finally(()=>{busy.delete(callback);this._callbacks.delete(task);});
+            .finally(()=>{busy.delete(callback);this._callbacks.delete(task);const pending=this._observationLatest?.get(callback);this._observationLatest?.delete(callback);if(pending&&!this._closed)this._invokeLossyEventListener(callback,pending,busyKey);});
         }
       }catch(error){this._diagnostic(`SDK lossy listener error: ${error}`);}
     }

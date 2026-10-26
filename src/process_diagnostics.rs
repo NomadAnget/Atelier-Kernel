@@ -17,6 +17,13 @@ pub(crate) struct ProcessDiagnostics {
     evidence: Mutex<Evidence>,
 }
 impl ProcessDiagnostics {
+    pub(crate) fn first_fault(&self) -> Option<Value> {
+        let evidence = self.evidence.lock();
+        Some(
+            json!({"first_fault":evidence.first_fault,"application_startup":evidence.stages.get("application_startup")}),
+        )
+    }
+
     pub(crate) fn new(domain: &str, pid: u32, generation: u64) -> Self {
         Self {
             domain: domain.into(),

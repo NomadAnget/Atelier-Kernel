@@ -251,3 +251,59 @@ fn stale_parent_ipc_mode_is_not_inherited_by_unix_domain() {
     assert_ne!(row["read_fd"], "12345");
     assert_ne!(row["write_fd"], "12346");
 }
+
+#[test]
+fn rolling_update_rereads_boot_file_and_rejects_invalid_or_missing_entry_without_stopping_old() {
+    let root = work();
+    let path = root.join("kernel_boot.json");
+    let original = spec(&root);
+    let write_config = |s: &DomainProcessSpec| {
+        std::fs::write(&path, serde_json::to_vec(&json!({"domains":[s]})).unwrap()).unwrap();
+    };
+    write_config(&original);
+    let cfg = KernelBootConfig::load_from_file(&path).unwrap();
+    let k = AtelierKernel::new_in_memory().unwrap();
+    for (_, result) in k.supervisor().boot_from_config(&cfg) {
+        result.unwrap();
+    }
+    ready(&k);
+    let old = k.supervisor().get_pid("env_probe").unwrap();
+    let mut changed = original.clone();
+    changed
+        .env
+        .insert("ENV_PROBE_VALUE".into(), "from latest boot file".into());
+    write_config(&changed);
+    let result = k
+        .supervisor()
+        .update_process_domain("env_probe", None, None, Duration::from_secs(5))
+        .unwrap();
+    assert_ne!(old, result.new_pid);
+    assert_eq!(
+        report(&root, result.new_pid)["custom"],
+        "from latest boot file"
+    );
+    let current = result.new_pid;
+    for content in ["{invalid", "{\"domains\":[]}"] {
+        std::fs::write(&path, content).unwrap();
+        assert!(
+            k.supervisor()
+                .update_process_domain("env_probe", None, None, Duration::from_secs(5))
+                .is_err()
+        );
+        assert_eq!(k.supervisor().get_pid("env_probe"), Some(current));
+    }
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        k.supervisor()
+            .update_process_domain("env_probe", None, None, Duration::from_secs(5))
+            .is_err()
+    );
+    assert_eq!(k.supervisor().get_pid("env_probe"), Some(current));
+    // Explicit caller specifications still override the file, including when it is absent.
+    let explicit = k
+        .supervisor()
+        .update_process_domain("env_probe", Some(original), None, Duration::from_secs(5))
+        .unwrap();
+    assert_ne!(explicit.new_pid, current);
+    k.supervisor().stop_process_domain("env_probe");
+}

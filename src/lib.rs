@@ -5,6 +5,7 @@ mod log_spool;
 pub mod logging;
 pub mod observer;
 pub mod outbox;
+pub mod port_forwarder;
 pub mod protocol;
 pub mod router;
 pub mod storage;

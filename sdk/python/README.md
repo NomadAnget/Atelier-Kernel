@@ -5,7 +5,7 @@ Official zero-dependency Python SDK for building **Atelier Kernel** domains.
 ## Installation
 
 ```bash
-pip install atelier_sdk-0.1.12-py3-none-any.whl
+pip install atelier_sdk-0.1.14-py3-none-any.whl
 ```
 
 ---
@@ -81,7 +81,7 @@ For each facility below, both the **Sending / Invocations (How to Send)** and th
 
 - **发送 / 日志与进度上报 (How to Send / Emit)**:
   ```python
-  # 1. 常规分级日志（走专用日志管道，杜绝 stdout 协议帧污染）
+  # 1. 常规分级日志（走专用日志管道，与 stdout/stderr 诊断输出物理隔离）
   domain.logger.info("Order created", order_id="ORD-1001")
   domain.logger.warning("High payment latency", latency_ms=450)
   domain.logger.error("Database connection dropped")
@@ -212,8 +212,8 @@ Durable 持久化故障通过现有 ExecutionFailed/SDK 标准异常反馈，业
   # 原生监听全系统消息四阶段（Sent -> Received -> Started -> Completed）生命周期流
   @domain.on_observation
   def on_lifecycle_event(event):
-      # event 包含: topic, state, message_id, logical_id, source_domain, target, timestamp
-      if event.get("state") == "ExecutionFailed":
+      # event 包含: event_id, status, message_type, message_id, logical_id, source_domain, target, timestamp, details
+      if event.get("status") == "ExecutionFailed":
           print(f"消息执行失败: {event.get('message_id')} -> {event.get('target')}")
   ```
 
@@ -228,21 +228,20 @@ Durable 持久化故障通过现有 ExecutionFailed/SDK 标准异常反馈，业
   await domain.supervisor.stop("worker_service")
   await domain.supervisor.restart("worker_service")
 
-  # 平滑滚动更新：隔离拉起候选进程 -> 探活探针验证 -> 原子路由切换与排干旧实例 / 自动回滚
+  # 平滑滚动更新：隔离候选 -> 注册及托管端口应用启动握手 -> 切换 / 失败保留旧实例
   res = await domain.supervisor.update(
       domain="worker_service",
-      probe_handler="health_check",     # 候选版本主动探活处理器
-      timeout_ms=5000,                  # 探活验证窗口
+      timeout_ms=5000,                  # 候选启动窗口
   )
   ```
 - **接收 / 更新执行结果 (How to Receive / Response)**:
-  - **成功（零服务间隙）**：
+  - **成功（切换至新实例）**：
     ```python
-    {"success": True, "domain": "worker_service", "old_instance_id": 1, "new_instance_id": 2, "message": "Domain updated smoothly"}
+    {"domain_id": "worker_service", "old_pid": 100, "new_pid": 101, "instance_id": 2, "status": "updated"}
     ```
   - **失败（自动回滚）**：
     ```python
-    {"success": False, "domain": "worker_service", "instance_id": 1, "message": "Candidate probe check failed, automatically rolled back"}
+    # SDK raises DomainRequestError: status=ExecutionFailed; data contains domain_id, status="rolled_back", error="update_failed", reason
     ```
 
 ---
@@ -260,7 +259,7 @@ domain = AtelierDomain(domain="order_service")
 @domain.handler("create_order")
 async def handle_create_order(msg):
     # 单目标请求并等待返回结果（综合 send + wait 并在同一个超时窗口释放资源）
-    receipt = await domain.request("billing.charge", "Charge", data={"amount": 100}, timeout=10)
+    receipt = await domain.request("billing.charge", "Durable", data={"amount": 100}, timeout=10)
 
     # 多目标并发投递（返回内核分配的 message_id 列表）
     mids = await domain.send(
@@ -306,3 +305,9 @@ active, not successful. QueryProgress refreshes active entries, not past outcome
 Older kernels discard state; paired kernel/SDK upgrades are required for failure
 semantics. Old UIs must not interpret done as success. Process-crash cleanup is
 outside this change. No subscriber queue or retry management API is added.
+
+域状态推送复用`on_observation`；`DomainStateSnapshot`的details为完整当前状态，`domain.observer.domain_states`提供只读缓存。无需状态轮询。契约见 ../../docs/DOMAIN_STATE_OBSERVATION.md。
+
+## 0.1.14 托管端口与启动回调
+
+启动配置的`ports`声明公开地址；域通过`domain.bindings`取得各绑定的`{host, port}`内部端点。Python在`run_async(on_start=...)`、Node在`runAsync({onStart})`回调内等待监听成功。SDK随后报告应用启动完成；无ports域不增加业务健康门槛。`probe_handler`/`probeHandler`仍可接受但不执行健康探针。文件启动的update不传spec时由内核重读配置，读取或候选启动失败保留旧实例。见[端口绑定](../../docs/PORT_BINDINGS.md)。

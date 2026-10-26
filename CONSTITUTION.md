@@ -23,7 +23,7 @@
   1. **跨域业务消息投递策略（`target = "<domain>.<handler>"`，严格 4-stage 回执闭环）**：
      - `Durable`：写入 SQLite 持久投递账本（`kernel_ledger`）；内存仅保留有界在途身份与故障反馈元信息，支持跨重启状态恢复与审计（未显式指定时默认按 `Durable` 处理）；
      - `Volatile`：仅进入内存账本与实时观察器（`KernelObserver`），**不写持久业务账本**；
-     - `Ephemeral`：瞬态流式投递，不落盘，仅在途（In-Flight）驻留内存账本以完成四阶段回执，到达终态后立即自动从内存账本驱逐（不随已完成数量增长）。
+     - `Ephemeral`：瞬态流式投递，不写持久业务账本，仅在途（In-Flight）驻留内存账本以完成四阶段回执，到达终态后立即自动从内存账本驱逐（不随已完成数量增长）。
   2. **内核 8 大内置基础设施（`target = "kernel.*"`，SDK 原生方法调用，不对外作为业务路由暴露）**：
      - `kernel.registry`：`RegisterHandlers`、`UnregisterHandlers`、`QueryHandlers`（元数据发现，严格排除 `kernel.*`）；
      - `kernel.storage`：`StorageInsert`、`StorageQuery`、`StorageUpdate`、`StorageDelete`（按域隔离存储）；
@@ -32,7 +32,7 @@
      - `kernel.notify`：`SubscribeNotify`、`UnsubscribeNotify`（系统告警通知广播）；
      - `kernel.runtime`：`QueryRuntime`、`QueryDomainAssembly`（域运行态拓扑与装配查询）；
      - `kernel.observer`：`QueryObserver`、`SubscribeObserver`、`UnsubscribeObserver`（生命周期观察与快照检索）；
-     - `kernel.supervisor`：`StartDomain`、`StopDomain`、`RestartDomain`、`UpdateDomain`（域进程管控与带探活的平滑滚动更新）。
+     - `kernel.supervisor`：`StartDomain`、`StopDomain`、`RestartDomain`、`UpdateDomain`（域进程管控与候选注册/端口启动握手后的滚动更新）。
   3. **系统事件推流与零发布订阅约束**：
      - 域与域之间**严禁发布订阅强绑定**，只允许精准单目标 RPC 通信；
      - 仅有内核流（`LogEvent`、`TelemetryEvent`、`NotifyEvent`、`ObservationEvent`）由 SDK 原生方法监听，并强制采用 `DeliveryPolicy::Ephemeral` 瞬态直推（**零 Receipt 确认帧产生**，域断开或崩溃时内核自动解绑注销）。
@@ -123,3 +123,15 @@ atelier-kernel --check .
 ### 临时传输溢出（2026-10-24）
 
 非观察帧超过出口内存窗口时允许内核临时磁盘暂存；该规则明确取代先前对 Volatile/Ephemeral 传输的绝对零磁盘承诺，不改变其非持久业务语义。SDK 无需拆包或分页。观察事件仍为有界、允许丢失的内存副本。单帧编解码仍需要与该帧大小相应的内存，不能宣称任意大消息恒定内存。
+
+### 启动配置与滚动更新
+
+文件装配的域执行无 spec 滚动更新时，必须由内核重新读取启动文件并采用目标域最新规格。读取或校验失败时保留旧代际，返回明确失败，不向业务域要求自行读取文件、拼装路径或处理回退。显式 spec 的更新继续使用调用者提供的规格。
+
+### 内核托管端口绑定
+
+用户于2026-10-25确定：公开端口为域与内核的绑定属性，由启动配置显式声明；内核自动维护独立薄转发进程和代际内部端点。转发仅处理字节，不包含HTTP/业务协议。SDK封装端点分配和应用启动完成握手；有端口绑定的滚动更新必须等待应用就绪，失败保留旧代际，成功后切换新连接、排空旧连接。跨域消息仍走专用IPC，不通过这些TCP入口建立域间业务旁路。
+
+### 域状态观察与无轮询恢复
+
+域状态变化由内核真实状态写入生成观察事件，不由Web推断命令意图。原观察通道同时提供订阅初始全量状态和可合并最新状态镜像，使用启动stream_id和状态revision排序；慢观察者不得影响业务投递，最终状态不能因普通观察队列丢失而永久失联。镜像仅保留当前状态，不持久化或重放所有转换，不升级为持久事件系统。SDK封装镜像缓存和慢回调合并，业务调用仍使用原onObservation，Web重连从缓存发送初始镜像，无轮询兜底。

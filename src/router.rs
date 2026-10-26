@@ -256,6 +256,8 @@ impl KernelRouter {
             .expect("cannot start kernel stream fanout");
 
         let obs_rx = observer.subscribe();
+        let state_rx = observer.subscribe_domain_states();
+        let state_observer = observer.clone();
         let obs_subs_worker = Arc::clone(&observer_subscribers);
         let obs_domains_worker = Arc::clone(&domains);
         let obs_stop_flag = Arc::clone(&stop_log_pump);
@@ -264,6 +266,26 @@ impl KernelRouter {
             .name("kernel-observer-fanout".to_string())
             .spawn(move || {
                 while !obs_stop_flag.load(Ordering::Relaxed) {
+                    if state_rx.try_recv().is_ok() {
+                        let event = state_observer.domain_state_snapshot();
+                        let data = serde_json::to_value(&event).unwrap();
+                        let subscribers = obs_subs_worker.read().clone();
+                        for subscriber in subscribers {
+                            if let Some(tx) = generation_pipe(&obs_domains_worker, &subscriber) {
+                                let _ = tx.send(KernelToDomainFrame::Deliver(KernelMessage {
+                                    logical_id: String::new(),
+                                    message_id: format!("state_{}", data["details"]["revision"]),
+                                    source_domain: "kernel".into(),
+                                    target: KERNEL_OBSERVER_TARGET.into(),
+                                    targets: vec![KERNEL_OBSERVER_TARGET.into()],
+                                    message_type: MSG_SYSTEM_OBSERVER_EVENT.into(),
+                                    params: json!({}),
+                                    timestamp: event.timestamp,
+                                    data: data.clone(),
+                                }));
+                            }
+                        }
+                    }
                     match obs_rx.recv_timeout(Duration::from_millis(50)) {
                         Ok(event) => {
                             let subs = obs_subs_worker.read().clone();
@@ -453,6 +475,8 @@ impl KernelRouter {
         entry.instance_id = instance_id;
         entry.status = DomainStatus::Spawning;
         entry.pipe_tx = Some(pipe_tx);
+        self.observer
+            .record_domain_state(domain_id, instance_id, DomainStatus::Spawning, None);
 
         self.remove_subscriptions(domain_id, instance_id);
 
@@ -527,6 +551,12 @@ impl KernelRouter {
                     entry.pipe_tx = Some(candidate.pipe_tx);
                     entry.handlers = candidate.handlers;
                     entry.status = DomainStatus::Active;
+                    self.observer.record_domain_state(
+                        domain_id,
+                        candidate_instance_id,
+                        DomainStatus::Active,
+                        Some("rolling_update_committed"),
+                    );
                     for h in entry.handlers.keys() {
                         routes.insert(format!("{domain_id}.{h}"), domain_id.to_string());
                     }
@@ -840,6 +870,7 @@ impl KernelRouter {
         frame: DomainToKernelFrame,
     ) -> Option<Vec<String>> {
         match frame {
+            DomainToKernelFrame::Ready { .. } => None,
             DomainToKernelFrame::Send(outbound) => Some(self.handle_outbound_message_inner(
                 authenticated_domain,
                 instance_id,
@@ -1227,6 +1258,12 @@ impl KernelRouter {
                         return;
                     }
                     entry.status = DomainStatus::Active;
+                    self.observer.record_domain_state(
+                        source_domain,
+                        entry.instance_id,
+                        DomainStatus::Active,
+                        None,
+                    );
 
                     for (h, desc) in handlers {
                         let full_route = format!("{source_domain}.{h}");
@@ -1710,6 +1747,7 @@ impl KernelRouter {
                         "command": spec.command,
                         "args": spec.args,
                         "working_dir": spec.working_dir,
+                        "ports": spec.ports,
                         "auto_restart": spec.auto_restart,
                         "max_restarts": spec.max_restarts,
                         "restart_delay_ms": spec.restart_delay_ms,
@@ -1772,6 +1810,25 @@ impl KernelRouter {
                 self.observer_subscribers
                     .write()
                     .insert(self.subscription_key(source_domain, msg));
+                let event = self.observer.domain_state_snapshot();
+                self.send_to_instance(
+                    source_domain,
+                    self.ledger.source_instance(&msg.message_id),
+                    KernelToDomainFrame::Deliver(KernelMessage {
+                        logical_id: String::new(),
+                        message_id: format!(
+                            "state_{}",
+                            event.details.as_ref().unwrap()["revision"]
+                        ),
+                        source_domain: "kernel".into(),
+                        target: KERNEL_OBSERVER_TARGET.into(),
+                        targets: vec![KERNEL_OBSERVER_TARGET.into()],
+                        message_type: MSG_SYSTEM_OBSERVER_EVENT.into(),
+                        params: json!({}),
+                        timestamp: event.timestamp,
+                        data: serde_json::to_value(event).unwrap(),
+                    }),
+                );
                 self.complete_kernel_internal_target(
                     source_domain,
                     msg,
@@ -2427,11 +2484,57 @@ impl KernelRouter {
         let _domain_guard = gate.lock();
         self.mark_domain_faulted_locked(domain_id, expected_instance_id, reason)
     }
+    pub(crate) fn record_spawn_failure(&self, domain_id: &str, reason: &str) {
+        let gate = self.domain_gate(domain_id);
+        let _guard = gate.lock();
+        let mut domains = self.domains.write();
+        let entry = domains
+            .entry(domain_id.into())
+            .or_insert_with(|| DomainEntry {
+                instance_id: 0,
+                status: DomainStatus::Faulted,
+                pipe_tx: None,
+                handlers: HashMap::new(),
+                candidate: None,
+                draining: Vec::new(),
+            });
+        entry.status = DomainStatus::Faulted;
+        self.observer.record_domain_state(
+            domain_id,
+            entry.instance_id,
+            DomainStatus::Faulted,
+            Some(reason),
+        );
+    }
+    pub(crate) fn mark_domain_stopped_for_instance(
+        &self,
+        domain_id: &str,
+        generation: Option<u64>,
+        reason: &str,
+    ) -> bool {
+        let gate = self.domain_gate(domain_id);
+        let _guard = gate.lock();
+        self.mark_domain_disconnected_locked(domain_id, generation, reason, DomainStatus::Stopped)
+    }
     fn mark_domain_faulted_locked(
         &self,
         domain_id: &str,
         expected_instance_id: Option<u64>,
         reason: &str,
+    ) -> bool {
+        self.mark_domain_disconnected_locked(
+            domain_id,
+            expected_instance_id,
+            reason,
+            DomainStatus::Faulted,
+        )
+    }
+    fn mark_domain_disconnected_locked(
+        &self,
+        domain_id: &str,
+        expected_instance_id: Option<u64>,
+        reason: &str,
+        final_status: DomainStatus,
     ) -> bool {
         if let Some(expected) = expected_instance_id {
             let inactive = {
@@ -2493,12 +2596,17 @@ impl KernelRouter {
                 // Stale fault notification from an older process instance; ignore safely.
                 return false;
             }
+            if entry.status == DomainStatus::Stopped && final_status == DomainStatus::Faulted {
+                return true;
+            }
             generation = entry.instance_id;
             eprintln!(
                 "kernel domain {domain_id} generation {} disconnected: {reason}",
                 entry.instance_id
             );
-            entry.status = DomainStatus::Faulted;
+            entry.status = final_status;
+            self.observer
+                .record_domain_state(domain_id, generation, final_status, Some(reason));
             old_pipe = entry.pipe_tx.take();
 
             for h in entry.handlers.keys() {

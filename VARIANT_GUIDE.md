@@ -14,8 +14,8 @@ atelier-kernel-runtime-<os>-<arch>/
 ├── kernel_boot.template.json             # 2. 默认多域启动配置模板
 ├── VARIANT_GUIDE.md                      # 3. 本使用说明文档
 └── sdk/
-    ├── atelier_sdk-0.1.0-py3-none-any.whl # 4. Python 域官方 SDK 安装包 (Wheel)
-    └── atelier-sdk-0.1.0.tgz              # 5. Node.js / TypeScript 域官方 SDK 安装包 (NPM Tarball)
+    ├── atelier_sdk-0.1.14-py3-none-any.whl # 4. Python 域官方 SDK 安装包 (Wheel)
+    └── atelier-sdk-0.1.14.tgz              # 5. Node.js / TypeScript 域官方 SDK 安装包 (NPM Tarball)
 ```
 
 ---
@@ -46,11 +46,11 @@ my-product-variant/
 
 1. **安装 Python Wheel 包**：
    ```bash
-   pip install ./sdk/atelier_sdk-0.1.0-py3-none-any.whl
+   pip install ./sdk/atelier_sdk-0.1.14-py3-none-any.whl
    ```
 
 2. **编写业务域代码（例如 `domains/billing_domain.py`）**：
-   只需导入 `AtelierDomain`，用 `@domain.handler(...)` 注册处理器，无需关心底层 `stdin/stdout` 管道与四阶段回执细节：
+   只需导入 `AtelierDomain`，用 `@domain.handler(...)` 注册处理器，无需关心底层专用匿名管道与四阶段回执细节：
    ```python
    #!/usr/bin/env python3
    from atelier_sdk import AtelierDomain, DomainExecutionFailed
@@ -96,7 +96,7 @@ my-product-variant/
 
 1. **安装 Node.js NPM 包（自带 TypeScript `.d.ts` 类型声明）**：
    ```bash
-   npm install ./sdk/atelier-sdk-0.1.0.tgz
+   npm install ./sdk/atelier-sdk-0.1.14.tgz
    ```
 
 2. **编写业务域代码（例如 `domains/notify_domain.js`）**：
@@ -298,7 +298,13 @@ Each external domain accepts `auto_restart` (default true), `max_restarts` (defa
 
 # Async SDK contract
 
-Python `await domain.run_async(on_start=...)` and Node `await domain.runAsync({onStart})` keep receiving frames while asynchronous handlers await other domains. `run` and receipt callbacks remain available. `send` and storage submission helpers now require await and return kernel IDs instead of local sequences. Both SDKs add single-target `request(target, message_type, params, data, timeout)` (Node takes `{timeout, signal}` as its last options argument); timeout is in seconds, default 30. A successful request returns the full completed receipt. Intermediate receipts never resolve it. Failed terminal receipts raise `DomainRequestError` with `status`, `data`, `message_id`; local timeout and disconnected transport use `timeout` and `connection_closed`. Pending entries are removed on terminal result, timeout, cancellation, write failure or EOF. Python cancellation propagates `CancelledError`; Node AbortSignal raises a request error with status `cancelled`. Local cancellation does not cancel remote business work. Local sequence numbers are private transport details. The explicit default frame limit is 16MiB, replacing the accidental 64KiB limit. Blocking Python business work must run via asyncio.to_thread to keep the event loop responsive.
+Python `await domain.run_async(on_start=...)` and Node `await domain.runAsync({onStart})` keep receiving frames while asynchronous handlers await other domains. `run` and receipt callbacks remain available. `send` and storage submission helpers now require await and return kernel IDs instead of local sequences. Both SDKs add single-target `request(target, message_type, params, data, timeout)` (Node takes `{timeout, signal}` as its last options argument); timeout is in seconds, default 30. A successful request returns the full completed receipt. Intermediate receipts never resolve it. Failed terminal receipts raise `DomainRequestError` with `status`, `data`, `message_id`; local timeout and disconnected transport use `timeout` and `connection_closed`. Timeout/cancellation stops local waiting but preserves public result slots for later wait-by-ID; consuming or explicitly forgetting a result releases its slot. Transport close ends pending waits. Python cancellation propagates `CancelledError`; Node AbortSignal raises a request error with status `cancelled`. Local cancellation does not cancel remote business work. Local sequence numbers are private transport details. The SDK default frame limit is 16MiB, replacing the accidental 64KiB limit; it remains a transport safeguard, not a claim of unlimited frame size. Blocking Python business work must run via asyncio.to_thread to keep the event loop responsive.
 
 
 See [SDK_CONTRACT.md](SDK_CONTRACT.md): send returns one ID for a string target or ordered IDs for a target list. wait_result/waitResult and wait_results/waitResults consume results by ID; request_many/requestMany only waits existing IDs. A timed-out or cancelled public wait can be retried by ID; unread slots are bounded and can be explicitly forgotten.
+
+### 滚动更新重读启动配置
+
+从文件加载的 KernelBootConfig 会携带仅供内核使用、不会写入 JSON 的来源路径。监督器启动装配时记住该路径。UpdateDomain 未提供 spec 时重新读取和校验该文件，采用目标域最新 command、args、working_dir、env 及监督配置；不会修改其他域或重开数据库。文件不可读、解析/校验失败、目标域缺失时返回错误，保留旧域运行，不静默回退旧配置。显式 spec 优先；没有文件来源的嵌入式宿主继续使用内存规格。自动重启及普通重启行为不因本项修改而改变。
+
+域端口托管配置与SDK启动示例见 [PORT_BINDINGS.md](docs/PORT_BINDINGS.md)。公开端口只在启动配置的ports绑定中声明，域使用SDK分配的内部端点。

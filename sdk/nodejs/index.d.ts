@@ -193,6 +193,7 @@ export interface QueryObserverOptions {
 }
 
 export class DomainObserverClient {
+  readonly domainStates: {stream_id:string; revision:number; domains:Array<{domain_id:string;instance_id:number;generation:number;status:string;revision:number;timestamp:number;reason:string|null}>}|null;
   constructor(domain: AtelierDomain);
   query(options?: QueryObserverOptions, requestOptions?: RequestOptions): Promise<Array<Record<string, any>>>;
   subscribe(requestOptions?: RequestOptions): Promise<Record<string, any>>;
@@ -217,6 +218,7 @@ export class DomainSupervisorClient {
 }
 
 export class AtelierDomain {
+  readonly bindings: Record<string, {host: string; port: number}>;
   readonly context:DomainContext;
   readonly logger: DomainLogger;
   readonly telemetry: DomainTelemetry;

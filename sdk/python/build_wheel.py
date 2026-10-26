@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Zero-dependency PEP 427 Wheel Builder for `atelier-sdk`.
-Builds a standard `atelier_sdk-0.1.13-py3-none-any.whl` package using only the
+Builds a standard `atelier_sdk-0.1.14-py3-none-any.whl` package using only the
 Python standard library (`zipfile`, `hashlib`, `base64`), so automated builds
 succeed in both offline/sandboxed environments and CI/CD runners.
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 PKG_NAME = "atelier_sdk"
 DIST_NAME = "atelier-sdk"
-VERSION = "0.1.13"
+VERSION = "0.1.14"
 TAG = "py3-none-any"
 
 
@@ -45,7 +45,7 @@ def build_wheel(out_dir: Path) -> Path:
 
     wheel_content = (
         "Wheel-Version: 1.0\n"
-        "Generator: atelier-sdk-wheel-builder (0.1.13)\n"
+        "Generator: atelier-sdk-wheel-builder (0.1.14)\n"
         "Root-Is-Purelib: true\n"
         f"Tag: {TAG}\n"
     ).encode("utf-8")

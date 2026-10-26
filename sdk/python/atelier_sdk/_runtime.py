@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from concurrent.futures import TimeoutError as ThreadTimeout
 from contextvars import ContextVar
 import inspect
@@ -94,6 +95,11 @@ class AsyncRuntime(MessageClient):
         self._limits={k:(v if k=='shutdown_grace' else int(v)) for k,v in defaults.items()};self._state='new';self._active={}
         self._results={};self._pending={};self._closed=False;self._async_loop=None;self._inbox=None;self._startup=None;self._session_done=None
         self._outbox=None;self._writer_stop=threading.Event();self._writer_error=False;self._shutdown_task=None;self._drain_deadline=None;self._callbacks=set();self._startup_error=None
+
+    @property
+    def bindings(self):
+        """Internal listening endpoints assigned by the kernel; public ports stay in boot config."""
+        return json.loads(os.environ.get('ATELIER_PORT_BINDINGS', '{}'))
 
     @property
     def context(self):return dict(_context.get() or {})
@@ -341,6 +347,12 @@ class AsyncRuntime(MessageClient):
             self._invoke_event_listener(listener, alert)
 
     def _dispatch_system_observer(self, frame):
+        event=frame.get('data') or {}
+        if event.get('message_type')=='DomainStateSnapshot':
+            snapshot=event.get('details') or {}
+            previous=getattr(self,'_domain_state_snapshot',None)
+            if previous and snapshot.get('stream_id')==previous.get('stream_id') and snapshot.get('revision',0)<previous.get('revision',0):return
+            self._domain_state_snapshot=copy.deepcopy(snapshot)
         for listener in getattr(self, '_observation_listeners', []):
             self._invoke_lossy_event_listener(listener, frame.get('data') or {}, '_observation_busy')
 
@@ -351,6 +363,10 @@ class AsyncRuntime(MessageClient):
             setattr(self, busy_attribute, busy)
         key = id(listener)
         if key in busy:
+            if busy_attribute=='_observation_busy' and payload.get('message_type')=='DomainStateSnapshot':
+                pending=getattr(self,'_observation_latest',None)
+                if pending is None:pending={};self._observation_latest=pending
+                pending[key]=copy.deepcopy(payload)
             return
         try:
             result = listener(payload)
@@ -363,6 +379,8 @@ class AsyncRuntime(MessageClient):
                     self._callbacks.discard(done)
                     if not done.cancelled() and done.exception() is not None:
                         self._diagnostic('SDK lossy listener error: %s', done.exception())
+                    pending=getattr(self,'_observation_latest',{}).pop(key,None)
+                    if pending is not None and not self._closed:self._invoke_lossy_event_listener(listener,pending,busy_attribute)
                 task.add_done_callback(finished)
         except Exception as error:
             self._diagnostic('SDK lossy listener error: %s', error)
@@ -408,7 +426,11 @@ class AsyncRuntime(MessageClient):
                 if on_start:
                     result=on_start()
                     if inspect.isawaitable(result):await result
+                if os.environ.get('ATELIER_MANAGED_READY') == '1':
+                    self._write_line(json.dumps({'frame_type':'ready'})+'\n')
             except Exception as error:
+                if os.environ.get('ATELIER_MANAGED_READY') == '1':
+                    self._write_line(json.dumps({'frame_type':'ready','error':str(error)[:1024]})+'\n')
                 self._startup_error=error;self._diagnostic('SDK startup failed: %s',error);self.close()
         threading.Thread(target=writer,name='atelier-sdk-ipc-tx',daemon=True).start()
         if self._handlers:self._submit(['kernel.registry'],'RegisterHandlers',{'handlers':list(self._handlers),'descriptions':dict(getattr(self,'_handler_docs',{}))},{})

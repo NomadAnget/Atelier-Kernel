@@ -53,12 +53,16 @@ struct MemoryItem {
 enum Lease {
     Disk(i64, bool),
     Memory(usize, usize),
+    StateSnapshot,
     Temporary(i64, usize),
 }
 struct State {
     memory: [VecDeque<MemoryItem>; 3],
     bytes: [usize; 3],
     counts: [usize; 3],
+    domain_snapshot: Option<KernelToDomainFrame>,
+    snapshot_bytes: usize,
+    snapshot_inflight: usize,
     temporary: Option<Connection>,
     temporary_pending: [usize; 2],
     pending: usize,
@@ -100,6 +104,9 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
             memory: std::array::from_fn(|_| VecDeque::new()),
             bytes: [0; 3],
             counts: [0; 3],
+            domain_snapshot: None,
+            snapshot_bytes: 0,
+            snapshot_inflight: 0,
             temporary: None,
             temporary_pending: [0; 2],
             pending: 0,
@@ -146,7 +153,11 @@ fn enqueue_transient(
     bytes: usize,
     lane: usize,
 ) -> Result<(), QueueError> {
-    let limit = if lane == 2 { EVENT_BYTES } else { MEMORY_BYTES };
+    let limit = if lane == 2 {
+        EVENT_BYTES.saturating_sub(s.snapshot_bytes.saturating_add(s.snapshot_inflight))
+    } else {
+        MEMORY_BYTES
+    };
     let fits = bytes <= limit && s.bytes[lane] <= limit - bytes && s.counts[lane] < MEMORY_ITEMS;
     if lane == 2 {
         if !fits {
@@ -256,6 +267,37 @@ impl PipeSender {
                     .unwrap_or_else(|| "domain output disconnected".into()),
             ));
         }
+        // Current domain state is a replaceable state image, not a durable event queue.
+        if let KernelToDomainFrame::Deliver(message) = &frame {
+            if message.target == "kernel.observer"
+                && message.message_type == "ObservationEvent"
+                && message.data["message_type"] == "DomainStateSnapshot"
+            {
+                let revision = message.data["details"]["revision"].as_u64().unwrap_or(0);
+                let existing = s.domain_snapshot.as_ref().and_then(|f| match f {
+                    KernelToDomainFrame::Deliver(m) => m.data["details"]["revision"].as_u64(),
+                    _ => None,
+                });
+                if existing.is_none_or(|old| revision >= old) {
+                    s.snapshot_bytes = encoded.len();
+                    s.domain_snapshot = Some(frame);
+                    // Reserve room for the authoritative image by evicting lossy events,
+                    // rather than adding an unaccounted second observation backlog.
+                    let budget = EVENT_BYTES
+                        .saturating_sub(s.snapshot_bytes.saturating_add(s.snapshot_inflight));
+                    while s.bytes[2] > budget {
+                        if let Some(item) = s.memory[2].pop_back() {
+                            s.bytes[2] -= item.bytes;
+                            s.counts[2] -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    self.0.wake.notify_one();
+                }
+                return Ok(());
+            }
+        }
         // Receipt state/results are already authoritative in the ledger. Keep the ordinary
         // control path independent from SQLite; only backlog beyond its reserved window spools.
         if durable
@@ -301,7 +343,10 @@ impl PipeSender {
     #[cfg(test)]
     fn counts(&self) -> (usize, usize) {
         let s = self.0.state.lock();
-        (s.pending, s.bytes.iter().sum())
+        (
+            s.pending,
+            s.bytes.iter().sum::<usize>() + s.snapshot_bytes + s.snapshot_inflight,
+        )
     }
 }
 impl PipeReceiver {
@@ -322,6 +367,12 @@ impl PipeReceiver {
                 return Ok(item.frame);
             }
             if let Some(frame) = take_temporary(&mut s, 0)? {
+                return Ok(frame);
+            }
+            if let Some(frame) = s.domain_snapshot.take() {
+                s.snapshot_inflight = s.snapshot_bytes;
+                s.snapshot_bytes = 0;
+                s.lease = Some(Lease::StateSnapshot);
                 return Ok(frame);
             }
             // Rotate persistent business, transient business and live events. A durable flood
@@ -436,6 +487,9 @@ impl PipeReceiver {
                     s.temporary = None;
                 }
             }
+            Some(Lease::StateSnapshot) => {
+                s.snapshot_inflight = 0;
+            }
             Some(Lease::Memory(lane, bytes)) => {
                 s.bytes[lane] -= bytes;
                 s.counts[lane] -= 1;
@@ -452,6 +506,9 @@ fn close(inner: &Inner) {
     s.bytes = [0; 3];
     s.counts = [0; 3];
     s.lease = None;
+    s.domain_snapshot = None;
+    s.snapshot_bytes = 0;
+    s.snapshot_inflight = 0;
     s.temporary = None;
     s.temporary_pending = [0; 2];
     // Only already committed terminal envelopes are cleaned here. The ledger closes live
@@ -701,5 +758,110 @@ mod first_failure_diagnostics_test {
         db.lock().execute_batch("DROP TABLE kernel_outbox").unwrap();
         tx.close();
         assert_eq!(tx.failure().as_deref(), Some("original output failure"));
+    }
+}
+
+#[cfg(test)]
+mod domain_state_slot_tests {
+    use super::*;
+    #[test]
+    fn latest_domain_state_survives_lossy_event_saturation_without_persistence() {
+        let k = crate::AtelierKernel::new_in_memory().unwrap();
+        let db = k.ledger().db_conn.as_ref().unwrap().clone();
+        let (tx, rx) = channel(db.clone());
+        for i in 0..1000 {
+            let message = crate::protocol::KernelMessage {
+                logical_id: String::new(),
+                message_id: format!("event_{i}"),
+                source_domain: "kernel".into(),
+                target: "kernel.observer".into(),
+                targets: vec!["kernel.observer".into()],
+                message_type: "ObservationEvent".into(),
+                params: serde_json::json!({}),
+                timestamp: 0,
+                data: serde_json::json!({"padding":"x".repeat(8192)}),
+            };
+            let _ = tx.send(KernelToDomainFrame::Deliver(message));
+        }
+        for revision in 0..500 {
+            let event = k.observer().domain_state_snapshot();
+            let mut value = serde_json::to_value(event).unwrap();
+            value["details"]["revision"] = revision.into();
+            tx.send(KernelToDomainFrame::Deliver(
+                crate::protocol::KernelMessage {
+                    logical_id: String::new(),
+                    message_id: String::new(),
+                    source_domain: "kernel".into(),
+                    target: "kernel.observer".into(),
+                    targets: vec!["kernel.observer".into()],
+                    message_type: "ObservationEvent".into(),
+                    params: serde_json::json!({}),
+                    timestamp: 0,
+                    data: value,
+                },
+            ))
+            .unwrap();
+        }
+        match rx.try_recv().unwrap() {
+            KernelToDomainFrame::Deliver(m) => assert_eq!(m.data["details"]["revision"], 499),
+            _ => panic!(),
+        };
+        rx.acknowledge().unwrap();
+        assert!(tx.failure().is_none());
+        let persisted: i64 = db
+            .lock()
+            .query_row("SELECT count(*) FROM kernel_outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(persisted, 0);
+    }
+}
+
+#[cfg(test)]
+mod domain_state_reservation_tests {
+    use super::*;
+    use serde_json::json;
+    fn event(data: serde_json::Value) -> KernelToDomainFrame {
+        KernelToDomainFrame::Deliver(crate::protocol::KernelMessage {
+            logical_id: String::new(),
+            message_id: String::new(),
+            source_domain: "kernel".into(),
+            target: "kernel.observer".into(),
+            targets: vec!["kernel.observer".into()],
+            message_type: "ObservationEvent".into(),
+            params: json!({}),
+            timestamp: 0,
+            data,
+        })
+    }
+    #[test]
+    fn pending_and_inflight_snapshot_reserve_space_before_live_events_arrive() {
+        for inflight in [false, true] {
+            let k = crate::AtelierKernel::new_in_memory().unwrap();
+            let (tx, rx) = channel(k.ledger().db_conn.as_ref().unwrap().clone());
+            tx.send(event(
+                json!({"message_type":"DomainStateSnapshot","details":{"revision":1,"domains":[]}}),
+            ))
+            .unwrap();
+            if inflight {
+                rx.try_recv().unwrap();
+            }
+            for _ in 0..1000 {
+                let _ = tx.send(event(json!({"payload":"x".repeat(8192)})));
+            }
+            assert!(
+                tx.counts().1 <= EVENT_BYTES,
+                "inflight={inflight}, bytes={}",
+                tx.counts().1
+            );
+            if inflight {
+                rx.acknowledge().unwrap();
+            } else {
+                match rx.try_recv().unwrap() {
+                    KernelToDomainFrame::Deliver(m) => assert_eq!(m.data["details"]["revision"], 1),
+                    _ => panic!(),
+                };
+                rx.acknowledge().unwrap();
+            }
+        }
     }
 }

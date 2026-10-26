@@ -5,11 +5,20 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
     path::PathBuf,
+    sync::Mutex,
     time::{Duration, Instant},
 };
-fn free_port() -> String {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().to_string()
+static PORT_TEST_LOCK: Mutex<()> = Mutex::new(());
+fn free_ports() -> (String, String) {
+    // Keep both reservations alive until both addresses are chosen. The tests
+    // themselves run serially so their relay processes cannot claim each
+    // other's just-released ephemeral ports on Windows.
+    let first = TcpListener::bind("127.0.0.1:0").unwrap();
+    let second = TcpListener::bind("127.0.0.1:0").unwrap();
+    (
+        first.local_addr().unwrap().to_string(),
+        second.local_addr().unwrap().to_string(),
+    )
 }
 fn line(stream: &mut TcpStream) -> String {
     stream.write_all(b"ping\n").unwrap();
@@ -42,9 +51,9 @@ fn connect(address: &str, expected: &str) -> TcpStream {
     }
 }
 fn exercise(node: bool) {
+    let _port_test_guard = PORT_TEST_LOCK.lock().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let public = free_port();
-    let second = free_port();
+    let (public, second) = free_ports();
     let py = r#"import asyncio,socketserver,threading,sys
 from atelier_sdk import AtelierDomain
 d=AtelierDomain(domain='service')

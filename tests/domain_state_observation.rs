@@ -13,7 +13,11 @@ fn wait_snapshot(path: &Path, check: impl Fn(&Value) -> bool) -> Value {
     let until = Instant::now() + Duration::from_secs(12);
     loop {
         if let Ok(s) = std::fs::read(path) {
-            if let Ok(v) = serde_json::from_slice::<Value>(&s) {
+            if let Some(v) = s
+                .split(|b| *b == b'\n')
+                .rev()
+                .find_map(|line| serde_json::from_slice::<Value>(line).ok())
+            {
                 if check(&v) {
                     return v;
                 }
@@ -50,10 +54,10 @@ async def observe(event):
  if event.get('message_type')=='DomainStateSnapshot':
   await asyncio.sleep(.03)
   assert d.observer.domain_states is not None
-  p=Path(sys.argv[1]);tmp=p.with_suffix('.tmp');tmp.write_text(json.dumps(event['details']));tmp.replace(p)
+  with Path(sys.argv[1]).open('a', encoding='utf-8') as report: report.write(json.dumps(event['details'])+'\n')
 d.run()
 "#;
-    let js = r#"const {AtelierDomain}=require(process.argv[1]);const fs=require('node:fs');const d=new AtelierDomain({domain:'watcher'});d.handler('ping',()=>({ok:true}));d.onObservation(async event=>{if(event.message_type==='DomainStateSnapshot'){await new Promise(r=>setTimeout(r,30));if(!d.observer.domainStates)throw Error('cache missing');fs.writeFileSync(process.argv[2]+'.tmp',JSON.stringify(event.details));fs.renameSync(process.argv[2]+'.tmp',process.argv[2]);}});d.run();"#;
+    let js = r#"const {AtelierDomain}=require(process.argv[1]);const fs=require('node:fs');const d=new AtelierDomain({domain:'watcher'});d.handler('ping',()=>({ok:true}));d.onObservation(async event=>{if(event.message_type==='DomainStateSnapshot'){await new Promise(r=>setTimeout(r,30));if(!d.observer.domainStates)throw Error('cache missing');fs.appendFileSync(process.argv[2],JSON.stringify(event.details)+'\n');}});d.run();"#;
     let args: Vec<String> = if node {
         vec![
             "-e".into(),

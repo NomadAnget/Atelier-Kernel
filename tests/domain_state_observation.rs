@@ -105,14 +105,20 @@ d.run()
         state(v, "worker").is_some_and(|s| s["status"] == "active")
             && v["revision"] != active["revision"]
     });
-    #[cfg(unix)]
     {
         let pid = k.supervisor().get_pid("worker").unwrap();
         assert_ne!(pid, _first);
-        std::process::Command::new("kill")
+        #[cfg(unix)]
+        let exit = std::process::Command::new("kill")
             .args(["-9", &pid.to_string()])
             .status()
             .unwrap();
+        #[cfg(windows)]
+        let exit = std::process::Command::new("taskkill")
+            .args(["/F", "/PID", &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(exit.success(), "failed to terminate test worker");
         let end = Instant::now() + Duration::from_secs(10);
         while k.supervisor().get_pid("worker").is_none_or(|p| p == pid) {
             assert!(Instant::now() < end);

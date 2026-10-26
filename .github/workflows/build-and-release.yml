@@ -95,6 +95,7 @@ jobs:
       - name: Build Python Wheel (.whl) & Node.js Package (.tgz)
         run: |
           mkdir -p dist/sdk
+          cp docs/RELEASE_0.1.14.md dist/sdk/RELEASE_0.1.14.md
           python3 sdk/python/build_wheel.py dist/sdk
           cd sdk/nodejs && npm pack --pack-destination ../../dist/sdk
 
@@ -181,6 +182,8 @@ jobs:
           cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
           cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
           cp VARIANT_GUIDE.md dist/kernel-runtime-${{ matrix.target_label }}/VARIANT_GUIDE.md
+          cp README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDENTITY.md ADVERSARIAL_AUDIT.md RELEASE_NOTES_v0.1.8.md dist/kernel-runtime-${{ matrix.target_label }}/
+          cp -R docs dist/kernel-runtime-${{ matrix.target_label }}/docs
           $PY_BIN sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
           (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
           tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}
@@ -225,4 +228,5 @@ jobs:
             release-assets/*.whl
             release-assets/*.tgz
             release-assets/*.tar.gz
+          body_path: release-assets/RELEASE_0.1.14.md
           generate_release_notes: true

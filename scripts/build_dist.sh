@@ -36,6 +36,10 @@ cp "${ROOT_DIR}/target/release/atelier-kernel" "${RUNTIME_OUT}/atelier-kernel"
 chmod +x "${RUNTIME_OUT}/atelier-kernel"
 cp "${ROOT_DIR}/kernel_boot.json" "${RUNTIME_OUT}/kernel_boot.template.json"
 cp "${ROOT_DIR}/VARIANT_GUIDE.md" "${RUNTIME_OUT}/VARIANT_GUIDE.md"
+for doc in README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDENTITY.md ADVERSARIAL_AUDIT.md RELEASE_NOTES_v0.1.8.md; do
+  cp "${ROOT_DIR}/${doc}" "${RUNTIME_OUT}/"
+done
+cp -R "${ROOT_DIR}/docs" "${RUNTIME_OUT}/docs"
 
 VERSION="$(grep -m1 '^version = ' "${ROOT_DIR}/Cargo.toml" | cut -d '"' -f2)"
 

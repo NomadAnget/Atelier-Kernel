@@ -40,6 +40,9 @@ for doc in README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDE
   cp "${ROOT_DIR}/${doc}" "${RUNTIME_OUT}/"
 done
 cp -R "${ROOT_DIR}/docs" "${RUNTIME_OUT}/docs"
+mkdir -p "${RUNTIME_OUT}/sdk/python" "${RUNTIME_OUT}/sdk/nodejs"
+cp "${ROOT_DIR}/sdk/python/README.md" "${RUNTIME_OUT}/sdk/python/README.md"
+cp "${ROOT_DIR}/sdk/nodejs/README.md" "${RUNTIME_OUT}/sdk/nodejs/README.md"
 
 VERSION="$(grep -m1 '^version = ' "${ROOT_DIR}/Cargo.toml" | cut -d '"' -f2)"
 

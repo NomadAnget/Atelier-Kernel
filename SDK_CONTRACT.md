@@ -65,7 +65,7 @@ correlation fields to logs. New outbound messages receive their identity from th
 kernel. Local Future/Promise receipt correlation remains client plumbing.
 
 Paired tests cover wire receipts, async RPC, large frames, resource bounds,
-storage messages, opaque business payloads/errors, startup without a second gate,
+storage messages, opaque business payloads/errors, startup without a business health gate (port-bound domains require startup completion),
 and connection cleanup. Runtime integration is tested with the installed packages.
 
 

@@ -184,6 +184,9 @@ jobs:
           cp VARIANT_GUIDE.md dist/kernel-runtime-${{ matrix.target_label }}/VARIANT_GUIDE.md
           cp README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDENTITY.md ADVERSARIAL_AUDIT.md RELEASE_NOTES_v0.1.8.md dist/kernel-runtime-${{ matrix.target_label }}/
           cp -R docs dist/kernel-runtime-${{ matrix.target_label }}/docs
+          mkdir -p dist/kernel-runtime-${{ matrix.target_label }}/sdk/python dist/kernel-runtime-${{ matrix.target_label }}/sdk/nodejs
+          cp sdk/python/README.md dist/kernel-runtime-${{ matrix.target_label }}/sdk/python/README.md
+          cp sdk/nodejs/README.md dist/kernel-runtime-${{ matrix.target_label }}/sdk/nodejs/README.md
           $PY_BIN sdk/python/build_wheel.py dist/kernel-runtime-${{ matrix.target_label }}/sdk
           (cd sdk/nodejs && npm pack --pack-destination ../../dist/kernel-runtime-${{ matrix.target_label }}/sdk)
           tar -C dist -czf dist/atelier-kernel-runtime-${{ matrix.target_label }}.tar.gz kernel-runtime-${{ matrix.target_label }}

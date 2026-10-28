@@ -66,6 +66,8 @@ jobs:
           $PY_BIN tests/sdk_portable_features_test.py
           $PY_BIN tests/sdk_transport_bounds_test.py
           $PY_BIN tests/sdk_message_ids_test.py
+          $PY_BIN tests/sdk_terminal_wait_test.py
+          node --test tests/sdk_terminal_wait_test.cjs
           $PY_BIN tests/sdk_observer_slow_test.py
           $PY_BIN tests/sdk_log_slow_test.py
           $PY_BIN tests/sdk_observer_memory_integration.py
@@ -112,6 +114,8 @@ jobs:
           python3 tests/sdk_portable_features_test.py
           python3 tests/sdk_transport_bounds_test.py
           python3 tests/sdk_message_ids_test.py
+          python3 tests/sdk_terminal_wait_test.py
+          node --test tests/sdk_terminal_wait_test.cjs
           python3 tests/sdk_observer_slow_test.py
           python3 tests/sdk_log_slow_test.py
           python3 tests/sdk_progress_state_test.py

@@ -305,3 +305,8 @@ outside this change. No subscriber queue or retry management API is added.
 ## 0.1.14 托管端口与启动回调
 
 启动配置的`ports`声明公开地址；域通过`domain.bindings`取得各绑定的`{host, port}`内部端点。Python在`run_async(on_start=...)`、Node在`runAsync({onStart})`回调内等待监听成功。SDK随后报告应用启动完成；无ports域不增加业务健康门槛。`probe_handler`/`probeHandler`仍可接受但不执行健康探针。文件启动的update不传spec时由内核重读配置，读取或候选启动失败保留旧实例。见[端口绑定](../../docs/PORT_BINDINGS.md)。
+
+
+### Terminal waits without an execution deadline
+
+Use `request(target, type, params, data, {timeout: null, signal})` or `waitResult(messageId, {timeout: null, signal})` for long-running handlers. Message acceptance remains bounded (30 seconds for request); terminal waiting continues until a final receipt, cancellation, or disconnection. Intermediate receipts do not restart a timer. Omitting timeout retains the existing 30-second behavior. Cancelling the local wait does not itself cancel remote work: use the owner domain's cancellation contract.

@@ -20,11 +20,11 @@ module.exports=function messageMethods(RequestError){
    }finally{this._pending.delete(seq);if(!accepted)for(const id of entry.ids.values())this._results.delete(id);}
   },
   _awaitMessage(promise,timeout,signal,messageId=null){
-   if(!Number.isFinite(timeout)||timeout<=0)return Promise.reject(Error('invalid timeout'));
+   if(timeout!==null&&(!Number.isFinite(timeout)||timeout<=0))return Promise.reject(Error('invalid timeout'));
    return new Promise((resolve,reject)=>{
     let timer;const abort=()=>finish(new RequestError('cancelled',null,messageId));
     const finish=(error,result)=>{clearTimeout(timer);signal?.removeEventListener('abort',abort);error?reject(error):resolve(result);};
-    timer=setTimeout(()=>finish(new RequestError('timeout',null,messageId)),timeout*1000);
+    if(timeout!==null)timer=setTimeout(()=>finish(new RequestError('timeout',null,messageId)),timeout*1000);
     signal?.addEventListener('abort',abort,{once:true});if(signal?.aborted)abort();
     promise.then(value=>finish(null,value),error=>finish(error));
    });
@@ -44,7 +44,7 @@ module.exports=function messageMethods(RequestError){
    if(result&&result.target===target&&!result.done&&terminal.includes(status)){result.done=true;result.resolve(frame);}
   },
   async waitResult(messageId,{timeout=30,signal=this._currentSignal()}={}){
-   if(!Number.isFinite(timeout)||timeout<=0)throw Error('invalid timeout');
+   if(timeout!==null&&(!Number.isFinite(timeout)||timeout<=0))throw Error('invalid timeout');
    const entry=this._results.get(messageId);if(!entry)throw new RequestError('unknown_message',null,messageId);
    entry.waiters++;let observed=false;
    try{const frame=await this._awaitMessage(entry.promise,timeout,signal,messageId);observed=true;if(frame.status!=='completed')throw new RequestError(frame.status,frame.data,messageId);return frame;}
@@ -57,8 +57,8 @@ module.exports=function messageMethods(RequestError){
   forgetResult(mid){const entry=this._results.get(mid);if(entry?.waiters)throw new RequestError('busy',null,mid);return this._results.delete(mid);},
   requestMany(messageIds,options={}){return this.waitResults(messageIds,options);},
   async request(target,type,params={},data={},options={}){
-   if(typeof target!=='string')throw Error('request requires one target');const start=Date.now(),timeout=options.timeout??30;let mid;
-   try{mid=await this.send(target,type,params,data,{...options,timeout});const remaining=timeout-(Date.now()-start)/1000;if(remaining<=0)throw new RequestError('timeout',null,mid);return await this.waitResult(mid,{...options,timeout:remaining});}
+   if(typeof target!=='string')throw Error('request requires one target');const start=Date.now(),timeout=options.timeout===undefined?30:options.timeout;let mid;
+   try{mid=await this.send(target,type,params,data,{...options,timeout:timeout===null?30:timeout});const remaining=timeout===null?null:timeout-(Date.now()-start)/1000;if(remaining!==null&&remaining<=0)throw new RequestError('timeout',null,mid);return await this.waitResult(mid,{...options,timeout:remaining});}
    finally{if(mid!==undefined)this.forgetResult(mid);}
   },
   _failMessageWaits(){for(const e of this._pending.values())e.reject(new RequestError('connection_closed'));this._pending.clear();for(const [mid,e] of this._results)if(!e.done){e.done=true;e.resolve({status:'connection_closed',message_id:mid,data:null});}}

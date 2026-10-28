@@ -1,4 +1,4 @@
-"""Client-side ID assignment and bounded, consumable receipt waits; no execution ledger."""
+"""Consumable receipt waits; timeout=None waits until terminal/cancel/disconnect. No execution ledger."""
 import asyncio
 import math
 import time
@@ -7,6 +7,16 @@ from ._errors import DomainRequestError
 TERMINAL=('completed','execution_failed','target_invalid','contract_invalid')
 
 class MessageClient:
+    async def _await_receipt(self, future, timeout):
+        # Python wait_for can return a ready result while external cancellation
+        # races admission. Do not lose that cancellation at the send/wait boundary.
+        task=asyncio.current_task()
+        cancelling=getattr(task,'cancelling',lambda:0)
+        before=cancelling()
+        result=await asyncio.wait_for(asyncio.shield(future),timeout)
+        if cancelling()>before:raise asyncio.CancelledError()
+        return result
+
     async def send(self,targets,message_type,params=None,data=None,*,timeout=30):
         single=isinstance(targets,str)
         names=[targets] if single else targets
@@ -24,7 +34,7 @@ class MessageClient:
             try:self._submit(names,message_type,params,data,seq=seq)
             except DomainRequestError:raise
             except Exception as error:raise DomainRequestError('connection_closed',{'reason':str(error)}) from error
-            try:ids=await asyncio.wait_for(asyncio.shield(future),timeout)
+            try:ids=await self._await_receipt(future,timeout)
             except asyncio.TimeoutError as error:raise DomainRequestError('timeout') from error
             accepted=True
             return ids[0] if single else ids
@@ -50,14 +60,14 @@ class MessageClient:
         if result and result['target']==target and not result['future'].done() and status in TERMINAL:result['future'].set_result(frame)
 
     async def wait_result(self,message_id,timeout=30):
-        if not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or timeout<=0:raise ValueError('invalid timeout')
+        if timeout is not None and (not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or timeout<=0):raise ValueError('invalid timeout')
         entry=self._results.get(message_id)
         if entry is None:raise DomainRequestError('unknown_message',message_id=message_id)
         entry['waiters']+=1
         observed=False
         try:
             await asyncio.sleep(0)
-            try:frame=await asyncio.wait_for(asyncio.shield(entry['future']),timeout)
+            try:frame=await self._await_receipt(entry['future'],timeout)
             except asyncio.TimeoutError as error:raise DomainRequestError('timeout',message_id=message_id) from error
             observed=True
             if frame['status']!='completed':raise DomainRequestError(frame['status'],frame.get('data'),message_id)
@@ -83,9 +93,9 @@ class MessageClient:
         if not isinstance(target,str):raise ValueError('request requires one target')
         start=time.monotonic();mid=None
         try:
-            mid=await self.send(target,message_type,params,data,timeout=timeout)
-            remaining=timeout-(time.monotonic()-start)
-            if remaining<=0:raise DomainRequestError('timeout',message_id=mid)
+            mid=await self.send(target,message_type,params,data,timeout=30 if timeout is None else timeout)
+            remaining=None if timeout is None else timeout-(time.monotonic()-start)
+            if remaining is not None and remaining<=0:raise DomainRequestError('timeout',message_id=mid)
             return await self.wait_result(mid,remaining)
         finally:
             if mid is not None:self.forget_result(mid)

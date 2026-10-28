@@ -196,8 +196,8 @@ domain.run();
 
 输出产物位于 `dist/`：
 - **SDK 安装包**：
-  - Python Wheel：`dist/sdk/atelier_sdk-0.1.14-py3-none-any.whl`
-  - Node.js NPM 包：`dist/sdk/atelier-sdk-0.1.14.tgz`
+  - Python Wheel：`dist/sdk/atelier_sdk-0.1.15-py3-none-any.whl`
+  - Node.js NPM 包：`dist/sdk/atelier-sdk-0.1.15.tgz`
 - **内核运行包**：
   - 预编译二进制：`dist/kernel-runtime/atelier-kernel`
   - 启动配置模板：`dist/kernel-runtime/kernel_boot.template.json`
@@ -210,8 +210,8 @@ domain.run();
 ./dist/kernel-runtime/atelier-kernel --init ./my-variant
 
 # 2) 安装 Python / Node.js 域 SDK
-pip install ./dist/sdk/atelier_sdk-0.1.14-py3-none-any.whl
-npm install ./dist/sdk/atelier-sdk-0.1.14.tgz
+pip install ./dist/sdk/atelier_sdk-0.1.15-py3-none-any.whl
+npm install ./dist/sdk/atelier-sdk-0.1.15.tgz
 
 # 3) 运行宪法检查 & 启动变体（默认开启 http://127.0.0.1:8787 实时观察台；生产环境可加 --headless）
 ./dist/kernel-runtime/atelier-kernel --check ./my-variant
@@ -253,3 +253,8 @@ cargo test
 - [当前文档索引与历史记录范围](docs/INDEX.md)；[0.1.14发布说明](docs/RELEASE_0.1.14.md)。
 
 文件装配的`UpdateDomain`未传spec时由内核重读启动文件；失败保留旧实例。旧连接最多排空30秒，SSE/WebSocket可重连；不保证任意业务请求或会话无损迁移。
+
+
+## 0.1.15 终态等待
+
+[0.1.15 发布说明](docs/RELEASE_0.1.15.md)。包含0.1.14全部功能；双SDK新增无执行总时限、可取消的终态等待，发送确认仍有界。

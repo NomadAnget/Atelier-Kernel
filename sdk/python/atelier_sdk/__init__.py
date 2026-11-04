@@ -8,6 +8,7 @@ so business domains only need to import `AtelierDomain` and declare handlers.
 """
 from ._runtime import AsyncRuntime
 from ._errors import DomainRequestError, DomainExecutionFailed
+from . import logger as logger   # 模块级日志器：调用方只写 logger.info(...)
 import asyncio
 import inspect
 import json
@@ -18,7 +19,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-__version__ = "0.1.15"
+__version__ = "0.1.16"
 
 KERNEL_REGISTRY_TARGET = "kernel.registry"
 KERNEL_STORAGE_TARGET = "kernel.storage"
@@ -494,6 +495,9 @@ class AtelierDomain(AsyncRuntime):
             default_layer="DOMAIN",
             default_component=domain,
         )
+        # 模块级日志器（``from atelier_sdk import logger``）在本进程的角色：域主进程。
+        # worker 子进程不走这里，而由 worker 引导调用 ``logger.attach_worker_sink``。
+        logger.register_domain(self)
         self.telemetry = DomainTelemetry(self)
         self.storage = DomainStorageClient(self)
         self.registry = DomainRegistryClient(self)

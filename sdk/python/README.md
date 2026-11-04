@@ -5,8 +5,29 @@ Official zero-dependency Python SDK for building **Atelier Kernel** domains.
 ## Installation
 
 ```bash
-pip install atelier_sdk-0.1.15-py3-none-any.whl
+pip install atelier_sdk-0.1.16-py3-none-any.whl
 ```
+
+## Module-level logger (`from atelier_sdk import logger`)
+
+One call contract for every process role; the SDK decides where records go:
+
+```python
+from atelier_sdk import logger
+
+logger.info("载入开始", component="FaraEngine", phase=f"load:start:{call_id}")
+logger.progress("批量 1/2", key=f"call:{call_id}", frac=0.5)
+```
+
+- **Domain host**: `AtelierDomain` registers itself automatically → records go to `domain._emit_log` (kernel `hub_logs`/SSE).
+- **Worker subprocess** (no domain object): worker bootstrap calls
+  `logger.attach_worker_sink(send)` and later `logger.set_identity("FaraEngine")`; records are relayed to
+  the parent, and any record without an explicit `component` is attributed to that engine
+  (e.g. `engines / FaraEngine`).
+- **No role registered**: falls back to the console (bootstrap, scripts, unit tests) and never raises.
+
+`push_scope/pop_scope` fill `phase="scope:<kind>:<id>"` for inner log lines; `reinject(record)` replays a
+child-process record in the parent. `source_domain` is always assigned by the kernel from the process pipe.
 
 ---
 

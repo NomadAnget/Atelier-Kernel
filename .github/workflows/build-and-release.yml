@@ -74,6 +74,7 @@ jobs:
           $PY_BIN tests/sdk_self_restart_integration.py
           $PY_BIN tests/sdk_log_pagination_integration.py
           $PY_BIN tests/sdk_progress_state_test.py
+          $PY_BIN sdk/python/tests/test_module_logger.py
 
   build-sdk-packages:
     needs: [ci-test]

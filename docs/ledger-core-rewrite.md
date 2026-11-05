@@ -120,6 +120,8 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 
 ## 5. 换骨顺序（已更新：不是"重写 ledger.rs"，是"路由器级重接 + 删旧四表"）
 
+> **已完成**（`0d5dfde`）：`src/ledger.rs` 已改写为 nucleus 门面——`Nucleus` 持有活跃/审计/提交去重唯一权威，SQLite 只镜像 Durable 子集为 `messages`（活）+ `audit`（终态，只增）；`identities` / `highwater` / `kernel_sessions` / 旧 `kernel_ledger` 四表删除。下列 §1–§4 的三表设计即该实现的出处。
+
 > 上面 §1–§4 的三表设计，已由 `src/nucleus.rs` + `src/transport.rs` + `src/object_hub.rs` + `src/observer_proj.rs` + `src/routing.rs` 独立实现并验证。换骨 = 把这些模块接进 router/outbox/supervisor，删掉旧四表。
 
 1. **路由器入口** `handle_outbound_message_inner`：`allocate_submission + bind_origin + record_initial(逐 target)` 改为一次 `nucleus.admit(...)` + `routing.bind` + `transport.enqueue_delivers`；

@@ -1,6 +1,7 @@
 # 内核收敛重构基线（Kernel Convergence）
 
-> 状态：规划中。目标：**内部全面收敛重构，对外 SDK / handler 契约不变**。
+> 状态：**核心收敛已落地**（M1–M8 完成：三表一入口 + C4 对象索引 + outbox 每通道单调 seq），全量回归绿；M9 的版本 bump / tag / 发版按项目边界待明确授权后再做。
+> 目标：**内部全面收敛重构，对外 SDK / handler 契约不变**。
 > 验证标准：宪法（V4.0 + C4）派生出的**不变量**，而非旧测试脚本所固化的实现事故。
 > 关联宪法：CONSTITUTION.md（C1 管道身份 / C2 消息结构与投递策略 / C3 四阶段回执 / **C4 存储枢纽对象索引**）、M1–M7、B1–B6。
 
@@ -105,6 +106,8 @@ objects(object_id, owner_domain, path, size, checksum, ref_count, created_at)
 | M7 | Durable 终态转存 `audit`，与状态解耦 | I1 唯一性成立 |
 | M8 | C4 存储枢纽对象索引：协议 + SDK + 内核 | 大文件不进管道 |
 | M9 | 全量回归 + 版本发版 | 对外契约不变 |
+
+> **落地状态**：M1–M8 已完成并提交——`0d5dfde`（四表六出口 → 三表一入口，nucleus 派生）、`f66995d`（C4 内核：`kernel.storage` 对象接口 + `objects` 表持久化，传输机制=内核复制域本地文件）、`061db2c`（C4 SDK：Python/Node 对象接口）、`outbox` 每通道单调 seq（跨策略 FIFO 由 `cross_policy_business_fifo_is_preserved` 证明）。全量 `cargo test` 绿；M9 的版本 bump / tag / 发版按项目边界「不主动发版」待明确授权。
 
 ---
 

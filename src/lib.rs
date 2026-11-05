@@ -6,6 +6,7 @@ pub mod logging;
 pub mod nucleus;
 pub mod object_hub;
 pub mod observer;
+pub mod observer_proj;
 pub mod outbox;
 pub mod port_forwarder;
 pub mod protocol;

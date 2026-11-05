@@ -147,6 +147,9 @@ mod imp {
         handle: *mut c_void,
     }
 
+    // accept 在独立线程里进行，句柄本身由内核独占。
+    unsafe impl Send for EndpointListener {}
+
     pub struct EndpointStream {
         shared: Arc<SharedHandle>,
     }

@@ -855,6 +855,95 @@ impl DomainSupervisorInner {
         Ok((child, k2d_tx, d2k_rx))
     }
 
+    /// 命名端点版 spawn：内核 bind 端点 → spawn 域 → accept → 拆成读/写两半。
+    /// 端口由内核创建、域主动 connect，不再传 fd/HANDLE。
+    #[allow(dead_code)]
+    fn spawn_child_endpoint(
+        &self,
+        domain_id: &str,
+        spec: &DomainProcessSpec,
+    ) -> Result<(Child, crate::endpoint::EndpointWriter, crate::endpoint::EndpointReader), SupervisorError>
+    {
+        let path = crate::endpoint::endpoint_path(
+            domain_id,
+            &uuid::Uuid::new_v4().simple().to_string(),
+        );
+        let listener = crate::endpoint::bind(&path).map_err(|source| SupervisorError::SpawnFailed {
+            domain: domain_id.to_string(),
+            source,
+        })?;
+
+        let configure_cmd = |cmd: &mut Command| {
+            cmd.args(&spec.args)
+                .env_remove("ATELIER_PORT_BINDINGS")
+                .env_remove("ATELIER_MANAGED_READY")
+                .envs(&spec.env)
+                .env_remove("ATELIER_IPC_READ_FD")
+                .env_remove("ATELIER_IPC_WRITE_FD")
+                .env_remove("ATELIER_IPC_HANDLE_MODE")
+                .env("ATELIER_IPC_PIPE", &path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            if let Some(root) = self.files_root.read().as_ref() {
+                let domain_root = root.join(&spec.domain_id);
+                let _ = std::fs::create_dir_all(&domain_root);
+                cmd.env("ATELIER_FILES_ROOT", domain_root.to_string_lossy().to_string());
+            }
+            if let Some(dir) = &spec.working_dir {
+                cmd.current_dir(dir);
+            }
+        };
+
+        let command_str = if cfg!(windows) && spec.command == "python3" {
+            "python"
+        } else {
+            &spec.command
+        };
+        let mut cmd = Command::new(command_str);
+        configure_cmd(&mut cmd);
+        let mut child = cmd.spawn().map_err(|source| SupervisorError::SpawnFailed {
+            domain: domain_id.to_string(),
+            source,
+        })?;
+
+        let mut listener = listener;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(format!("kernel-accept-{domain_id}"))
+            .spawn(move || {
+                let _ = sender.send(listener.accept());
+            })
+            .map_err(|source| SupervisorError::SpawnFailed {
+                domain: domain_id.to_string(),
+                source,
+            })?;
+
+        let stream = match receiver.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(source)) => {
+                let _ = child.kill();
+                return Err(SupervisorError::SpawnFailed {
+                    domain: domain_id.to_string(),
+                    source,
+                });
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return Err(SupervisorError::SpawnFailed {
+                    domain: domain_id.to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "domain did not connect to the IPC endpoint",
+                    ),
+                });
+            }
+        };
+
+        let (reader, writer) = stream.into_split();
+        Ok((child, writer, reader))
+    }
+
     fn launch(
         &self,
         spec: &DomainProcessSpec,

@@ -379,7 +379,7 @@ fn cancel_worker(handle: &thread::JoinHandle<()>) {
 }
 // IPC reads must be interruptible on every supported OS. Unlike diagnostic readers,
 // this endpoint drains bytes already in the pipe before transport failure is published.
-fn ipc_reader(input: crate::endpoint::EndpointReader) -> impl std::io::Read {
+fn ipc_reader<R: std::io::Read>(input: R) -> impl std::io::Read {
     // 端点 reader 已内建 PeekNamedPipe 轮询（Windows）与非阻塞语义（Unix）。
     input
 }
@@ -439,8 +439,8 @@ fn pump_lines<R: std::io::Read>(
     }
     Ok(())
 }
-fn write_frame(
-    output: &mut crate::endpoint::EndpointWriter,
+fn write_frame<W: std::io::Write>(
+    output: &mut W,
     frame: &KernelToDomainFrame,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
@@ -1999,6 +1999,9 @@ mod exit_drain_regression {
 #[cfg(test)]
 mod bounded_transport_drain_test {
     use super::*;
+    // Windows 上的 std pipe 需要 PeekNamedPipe 轮询；该轮询已内建到端点 reader，
+    // 此测试的旧 std-pipe 路径只在 Unix 上仍可非阻塞地验证 drain 行为。
+    #[cfg(unix)]
     #[test]
     fn failed_transport_drains_available_frames_without_waiting_for_inherited_writer() {
         use std::io::Write;
@@ -2057,7 +2060,7 @@ mod process_reaping_tests {
         let kernel = crate::AtelierKernel::new_in_memory().unwrap();
         let spec: DomainProcessSpec = serde_json::from_value(json!({
             "domain_id":"reaping", "command":"python3",
-            "args":["-c", "import time; time.sleep(30)"],
+            "args":["-c", "import os,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); time.sleep(30)"],
             "auto_restart": mode == "automatic", "restart_delay_ms": 0
         }))
         .unwrap();

@@ -11,7 +11,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::services::storage::StorageError;
-use crate::core::protocol::{LogFramePayload, LogRecord, ProgressState, now_secs_f64};
+use crate::core::protocol::{LogRecord, ProgressState, now_secs_f64};
 
 pub const LOGS_TABLE: &str = "hub_logs";
 

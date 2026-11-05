@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::services::ledger::{AUDIT_COLUMNS, AUDIT_TABLE, KERNEL_LEDGER_COLUMNS, KERNEL_LEDGER_TABLE};
 use crate::services::storage::{DOMAIN_TABLE_COLUMNS, verify_sqlite_table_columns};
-use crate::supervisor::{KernelBootConfig, SupervisorError};
+use crate::supervisor::config::{KernelBootConfig, SupervisorError};
 
 /// Single machine-constitution violation detected by `check_constitution`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

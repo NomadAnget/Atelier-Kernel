@@ -37,9 +37,10 @@ pub use core::protocol::{
 };
 pub use router::{CandidateEntry, DrainingEntry, KernelRouter};
 pub use services::storage::{DomainStorageEngine, StorageError, StoredRecord};
-pub use supervisor::{
-    DomainPipeClient, DomainProcessSpec, DomainSupervisor, DomainUpdateResult, KernelBootConfig,
-    SupervisorError,
+pub use supervisor::DomainSupervisor;
+pub use supervisor::client::DomainPipeClient;
+pub use supervisor::config::{
+    DomainProcessSpec, DomainUpdateResult, KernelBootConfig, SupervisorError,
 };
 pub use frontend::web::WebFrontendDomain;
 

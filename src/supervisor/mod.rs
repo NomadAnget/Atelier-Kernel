@@ -391,7 +391,6 @@ impl DomainSupervisorInner {
     }
     /// 命名端点版 spawn：两条单向管道，`in`（内核→域，域只读）、`out`（域→内核，域只写）。
     /// 单向管道避免 Windows 上「同一句柄并发阻塞读 + 写」的串行化死锁。
-    #[allow(dead_code)]
     fn spawn_child_endpoint(
         &self,
         domain_id: &str,

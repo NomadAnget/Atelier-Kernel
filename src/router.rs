@@ -974,10 +974,26 @@ impl KernelRouter {
                 let _guard = gate.lock();
                 let receipts = self.ledger.receipts_for_message(id);
                 if receipts.is_empty() {
-                    // 重放的提交已终结且结果被回收：必须给出明确结论，不能让发送端干等超时。
+                    // 结果已随终态回收：从观察器还原真实终态，而不是一律报告失败。
                     let delivery = outbound.delivery.unwrap_or_else(|| {
                         crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
                     });
+                    let observed = self
+                        .observer
+                        .events_for_message(id)
+                        .into_iter()
+                        .find(|e| e.status.is_terminal());
+                    let (status, data) = match observed {
+                        Some(e) => (e.status, e.details),
+                        None => (
+                            ContractStatus::ExecutionFailed,
+                            Some(json!({
+                                "error": "kernel_result_expired",
+                                "reason": "replayed submission already completed; its result was reclaimed",
+                                "persisted": false
+                            })),
+                        ),
+                    };
                     self.send_to_instance(
                         authenticated_domain,
                         Some(instance_id),
@@ -988,12 +1004,8 @@ impl KernelRouter {
                             target: target.clone(),
                             message_type: outbound.message_type.clone(),
                             policy: delivery,
-                            status: ContractStatus::ExecutionFailed,
-                            data: Some(json!({
-                                "error": "kernel_result_expired",
-                                "reason": "replayed submission already completed; its result was reclaimed",
-                                "persisted": false
-                            })),
+                            status,
+                            data,
                             timestamp: now_millis(),
                         }),
                     );
@@ -2856,6 +2868,7 @@ mod generation_acceptance_tests {
                     seq: 1,
                     targets: vec![KERNEL_REGISTRY_TARGET.into()],
                     message_type: MSG_REGISTER_HANDLERS.into(),
+                    delivery: None,
                     params: json!({"handlers":[name]}),
                     data: json!({}),
                 }),

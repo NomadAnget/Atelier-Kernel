@@ -598,27 +598,22 @@ impl KernelLedger {
         let mut volatile = 0;
         let mut ephemeral = 0;
         let mut statement = mem
-            .prepare("SELECT target,message_type,status FROM kernel_ledger")
+            .prepare("SELECT policy,status FROM kernel_ledger")
             .expect("resident policy query");
         for row in statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
             .expect("resident policies")
         {
-            let (target, kind, status) = row.expect("resident policy metadata");
-            match DeliveryPolicy::resolve(&target, &kind) {
-                DeliveryPolicy::Durable => durable += 1,
-                DeliveryPolicy::Volatile => volatile += 1,
-                DeliveryPolicy::Ephemeral => {
+            let (policy, status) = row.expect("resident policy metadata");
+            match policy.as_str() {
+                "durable" => durable += 1,
+                "volatile" => volatile += 1,
+                "ephemeral" => {
                     if matches!(status.as_str(), "sent" | "received" | "started") {
                         ephemeral += 1;
                     }
                 }
+                _ => {}
             }
         }
         json!({"resident_records":records,"record_capacity":records,"durable_records":durable,"volatile_records":volatile,"ephemeral_inflight":ephemeral,"nonpersistent_evicted":self.evicted.load(Ordering::Relaxed),
@@ -772,10 +767,10 @@ impl KernelLedger {
                 // 非持久账本容量是软上限：先淘汰最旧的已终结记录，绝不因为容量拒绝新消息。
                 let size = r.data.as_ref().map_or(0, |v| v.to_string().len() as i64);
                 let mut need = bytes + size - MAX_TRANSIENT_BYTES;
-                let victims: Vec<(String, i64, String, String)> = {
+                let victims: Vec<(String, i64, String)> = {
                     let mut stmt = mem
                         .prepare(
-                            "SELECT message_id, coalesce(length(data),0), target, message_type FROM kernel_ledger \
+                            "SELECT message_id, coalesce(length(data),0), policy FROM kernel_ledger \
                              ORDER BY created_at ASC",
                         )
                         .expect("quota victim query");
@@ -785,18 +780,17 @@ impl KernelLedger {
                                 row.get::<_, String>(0)?,
                                 row.get::<_, i64>(1)?,
                                 row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
                             ))
                         })
                         .expect("quota victim rows");
                     rows.filter_map(Result::ok).collect()
                 };
-                for (id, len, target, kind) in victims {
+                for (id, len, policy) in victims {
                     if need <= 0 {
                         break;
                     }
                     // 非持久（Ephemeral）是尽力而为：终态与在途都可以丢；Durable/Volatile 一律不动。
-                    if DeliveryPolicy::resolve(&target, &kind) != DeliveryPolicy::Ephemeral {
+                    if policy != "ephemeral" {
                         continue;
                     }
                     let victim_logical = Self::read(&mem, &id).ok().flatten().map(|v| v.logical_id);

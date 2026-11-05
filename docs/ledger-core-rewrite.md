@@ -118,15 +118,33 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 
 ---
 
-## 5. 换骨顺序（一次完成，不做逐列迁移）
+## 5. 换骨顺序（已更新：不是"重写 ledger.rs"，是"路由器级重接 + 删旧四表"）
 
-1. 新建 `fn commit_terminal` 与三表 schema（同一文件内替换，不新建模块，避免两套并存）；
-2. 把 6 个出口逐个改为调 `commit_terminal`，删除旧的 `identities`/`highwater`/`kernel_sessions` SQL；
-3. 公共方法签名保持不变，只改内部实现；
-4. 用 I1/I2/I3 + 全量测试验收；
-5. 删除 `DeliveryRecord.policy` 之外任何残留的 `identities.record`/`json_extract` 逻辑。
+> 上面 §1–§4 的三表设计，已由 `src/nucleus.rs` + `src/transport.rs` + `src/object_hub.rs` + `src/observer_proj.rs` + `src/routing.rs` 独立实现并验证。换骨 = 把这些模块接进 router/outbox/supervisor，删掉旧四表。
 
-> 注意：第 2 步是"一次删六处、一次建一处"，不是"改一处跑一次"——后者就是之前偏掉的补丁路径。
+1. **路由器入口** `handle_outbound_message_inner`：`allocate_submission + bind_origin + record_initial(逐 target)` 改为一次 `nucleus.admit(...)` + `routing.bind` + `transport.enqueue_delivers`；
+2. **路由器回执** `handle_inbound_receipt_inner`：改为 `nucleus.advance` + `transport.enqueue_receipt` + `routing.accepts` 校验；
+3. **代际退役**：`mark_domain_faulted` / `clear_session_dedup` 改为 `nucleus.retire_source` + `routing.retire`；
+4. **outbox**：删旧 SQLite spool + 内存 spool，用 `transport`；
+5. **删除** `ledger.rs` 四表 SQL、`identities`/`highwater`/`kernel_sessions`；
+6. 全量 `cargo test` + `tests/constitution_invariants.rs` + `tests/kernel_assembly.rs` 验收。
+
+### 关键断点：核的粒度（换骨前必须想清）
+
+旧 `KernelLedger` 的公共接口有一个与核不兼容的分裂：
+
+```
+allocate_submission(source, seq, count) → (logical_id, [ids], replayed)   // 分配身份，无 target
+record_initial_target_state(id, seq, source, target, kind, status, data)   // 每 target 记录状态
+```
+
+核的 `admit` 把"分配身份 + 建活跃行"合并成一次。**这个"先分配、再逐 target 记录"的分裂本身是四表结构的产物**（id 与状态曾分属 `identities` 与 `kernel_ledger`），无法无损映射到 `admit`。
+
+正确解法（二选一）：
+- **A**：核保持提交级 `admit`，路由器入口重构成"先校验全部 target，再一次 admit，再对入口即终态的 target 逐条 advance"；
+- **B**：核下沉到**消息级** `put` + `advance`（一条消息一行），提交身份/去重/多 target 变成核外的 `SubmissionCache` 推导——这样旧 API 的 `allocate`（→ SubmissionCache）与 `record`（→ put）自然对应。
+
+**B 更符合"极简核"**：核只懂"一条消息的状态机"，提交（多 target、去重、重放）是派生。换骨时优先按 B 重构路由器入口。
 
 ---
 

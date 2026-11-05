@@ -17,7 +17,7 @@ class MessageClient:
         if cancelling()>before:raise asyncio.CancelledError()
         return result
 
-    async def send(self,targets,message_type,params=None,data=None,*,timeout=30):
+    async def send(self,targets,message_type,params=None,data=None,*,timeout=30,delivery=None):
         single=isinstance(targets,str)
         names=[targets] if single else targets
         if not isinstance(names,list) or not names or not all(isinstance(t,str) and t for t in names):raise ValueError('targets must be a name or non-empty name list')
@@ -31,7 +31,7 @@ class MessageClient:
         future=loop.create_future();entry={'targets':names,'ids':{},'future':future};self._pending[seq]=entry
         accepted=False
         try:
-            try:self._submit(names,message_type,params,data,seq=seq)
+            try:self._submit(names,message_type,params,data,seq=seq,delivery=delivery)
             except DomainRequestError:raise
             except Exception as error:raise DomainRequestError('connection_closed',{'reason':str(error)}) from error
             try:ids=await self._await_receipt(future,timeout)

@@ -40,7 +40,7 @@ export interface DomainContext {
   message_id?:string; source_domain?:string; target?:string; message_type?:string;
 }
 /** null waits for a terminal receipt until cancellation/disconnect; send admission remains bounded. */
-export interface RequestOptions { timeout?:number|null; signal?:AbortSignal; }
+export interface RequestOptions { timeout?:number|null; signal?:AbortSignal; delivery?: 'durable'|'volatile'|'ephemeral'; }
 export interface TargetResult {
   message_id:string;
   target:string|null;status:string;receipt:Record<string,any>|null;

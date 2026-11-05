@@ -5,7 +5,7 @@ module.exports=function messageMethods(RequestError){
   async send(targets,type,params={},data={},options={}){
    const single=typeof targets==='string',names=single?[targets]:targets;
    if(!Array.isArray(names)||!names.length||names.some(t=>typeof t!=='string'||!t))throw Error('targets must be a name or non-empty name list');
-   const unique=[...new Set(names)],{timeout=30,signal=this._currentSignal()}=options;
+   const unique=[...new Set(names)],{timeout=30,signal=this._currentSignal(),delivery=null}=options;
    if(this._closed||this._state==='new')throw new RequestError('connection_closed');
    if(!Number.isFinite(timeout)||timeout<=0)throw Error('invalid timeout');
    if(signal?.aborted)throw new RequestError('cancelled');
@@ -15,7 +15,7 @@ module.exports=function messageMethods(RequestError){
    const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});promise.catch(()=>{});
    const entry={targets:unique,ids:new Map(),resolve,reject};this._pending.set(seq,entry);let accepted=false;
    try{
-    try{this._submit(unique,type,params,data,seq);}catch(e){throw e instanceof RequestError?e:new RequestError('connection_closed',{reason:String(e)});}
+    try{this._submit(unique,type,params,data,seq,delivery);}catch(e){throw e instanceof RequestError?e:new RequestError('connection_closed',{reason:String(e)});}
     const ids=await this._awaitMessage(promise,timeout,signal);accepted=true;return single?ids[0]:ids;
    }finally{this._pending.delete(seq);if(!accepted)for(const id of entry.ids.values())this._results.delete(id);}
   },

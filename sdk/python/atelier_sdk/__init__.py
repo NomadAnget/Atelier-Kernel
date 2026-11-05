@@ -631,6 +631,7 @@ class AtelierDomain(AsyncRuntime):
         params: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
         seq: Optional[int] = None,
+        delivery: Optional[str] = None,
     ) -> int:
         """Sends a two-layer message to one or more `<domain>.<handler>` targets."""
         with self._write_lock:
@@ -640,14 +641,17 @@ class AtelierDomain(AsyncRuntime):
             else:
                 assigned_seq = seq
                 self._seq_counter = max(self._seq_counter, assigned_seq + 1)
-            self._write_frame_unlocked({
+            frame = {
                 "frame_type": "send",
                 "seq": assigned_seq,
                 "targets": targets,
                 "message_type": message_type,
                 "params": params if params is not None else {},
                 "data": data if data is not None else {},
-            })
+            }
+            if delivery is not None:
+                frame["delivery"] = delivery
+            self._write_frame_unlocked(frame)
             return assigned_seq
 
     async def storage_insert(

@@ -524,17 +524,19 @@ class AtelierDomain {
   /**
    * Sends a two-layer message to one or more `<domain>.<handler>` targets.
    */
-  _submit(targets, messageType, params = {}, data = {}, seq = null) {
+  _submit(targets, messageType, params = {}, data = {}, seq = null, delivery = null) {
     const assignedSeq = seq && seq > 0 ? seq : this._seqCounter++;
     this._seqCounter = Math.max(this._seqCounter, assignedSeq + 1);
-    this._writeFrame({
+    const frame = {
       frame_type: "send",
       seq: assignedSeq,
       targets,
       message_type: messageType,
       params: params ?? {},
       data: data ?? {},
-    });
+    };
+    if (delivery != null) frame.delivery = delivery;
+    this._writeFrame(frame);
     return assignedSeq;
   }
 

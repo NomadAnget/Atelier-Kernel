@@ -2397,7 +2397,7 @@ for line in ipc_in:
 
     // 4. Test candidate failure and automatic rollback
     // Script that intentionally fails validation (immediate exit / crash)
-    let bad_script = "import sys; sys.exit(42)";
+    let bad_script = "import sys,os; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); sys.exit(42)";
     let bad_spec = json!({
         "domain_id": "worker_roll",
         "command": python_cmd(),

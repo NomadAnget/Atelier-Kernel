@@ -47,6 +47,13 @@ async def file_handler(msg):
         decoded = await domain._decode_files(encoded)
     return {"content": decoded["f"].read().decode(), "encoded": "__atelier_file__" in encoded["f"]}
 
+@domain.handler("storage")
+async def storage_handler(msg):
+    record_id = "e2e-" + msg.message_id
+    await domain.storage_insert(record_id, "e2e", {"value": 7})
+    query = await domain.storage_query(record_id=record_id)
+    return {"rows": len(query.get("items") or []), "count": query.get("count")}
+
 domain.run()
 "#;
 
@@ -110,6 +117,12 @@ fn sdk_v2_round_trip() {
     let file_data = file_result.data.unwrap();
     assert_eq!(file_data["content"], "v2-file-object");
     assert_eq!(file_data["encoded"], true);
+
+    verifier.send(vec!["v2test.storage".into()], "Storage", json!({}), json!({}));
+    let stored = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(stored.status, atelier_kernel::ContractStatus::Completed, "{:?}", stored.data);
+    let stored_data = stored.data.unwrap();
+    assert!(stored_data["rows"].as_u64().unwrap_or(0) >= 1, "{stored_data}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

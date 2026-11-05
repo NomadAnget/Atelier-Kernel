@@ -80,6 +80,18 @@ mod imp {
         }
     }
 
+    impl EndpointReader {
+        pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.0.set_nonblocking(nonblocking)
+        }
+    }
+
+    impl EndpointWriter {
+        pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.0.set_nonblocking(nonblocking)
+        }
+    }
+
     impl io::Write for EndpointWriter {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             self.0.write(buf)
@@ -232,8 +244,28 @@ mod imp {
     }
 
     impl Read for EndpointReader {
+        /// 与旧 `ipc_reader` 一致：无数据返回 `WouldBlock`，由上层轮询 `stop`。
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            read_handle(self.0.0, buf)
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let mut available = 0u32;
+            let ok = unsafe {
+                PeekNamedPipe(self.0.0, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut available, std::ptr::null_mut())
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                return if matches!(error.raw_os_error(), Some(109 | 232)) {
+                    Ok(0)
+                } else {
+                    Err(error)
+                };
+            }
+            if available == 0 {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let count = buf.len().min(available as usize);
+            read_handle(self.0.0, &mut buf[..count])
         }
     }
 

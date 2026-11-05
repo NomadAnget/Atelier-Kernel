@@ -1,6 +1,6 @@
 use crate::services::outbox::{self, PipeReceiver};
 use crate::services::ports::{Forwarder, PortBinding};
-use crate::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
+use crate::diag::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
@@ -386,8 +386,8 @@ fn ipc_reader<R: std::io::Read>(input: R) -> impl std::io::Read {
 /// 在工作线程里接受端点并取出内核侧的一半（`in` 取写端、`out` 取读端）。
 /// accept 放在这里而不是 spawn 路径，避免「域没连上」阻塞 supervisor。
 fn accept_writer(
-    mut listener: crate::endpoint::EndpointListener,
-) -> std::io::Result<crate::endpoint::EndpointWriter> {
+    mut listener: crate::edge::endpoint::EndpointListener,
+) -> std::io::Result<crate::edge::endpoint::EndpointWriter> {
     let (_reader, writer) = listener.accept()?.into_split();
     #[cfg(unix)]
     writer.set_nonblocking(true)?;
@@ -395,8 +395,8 @@ fn accept_writer(
 }
 
 fn accept_reader(
-    mut listener: crate::endpoint::EndpointListener,
-) -> std::io::Result<crate::endpoint::EndpointReader> {
+    mut listener: crate::edge::endpoint::EndpointListener,
+) -> std::io::Result<crate::edge::endpoint::EndpointReader> {
     let (reader, _writer) = listener.accept()?.into_split();
     #[cfg(unix)]
     reader.set_nonblocking(true)?;
@@ -837,20 +837,20 @@ impl DomainSupervisorInner {
     ) -> Result<
         (
             Child,
-            crate::endpoint::EndpointListener,
-            crate::endpoint::EndpointListener,
+            crate::edge::endpoint::EndpointListener,
+            crate::edge::endpoint::EndpointListener,
         ),
         SupervisorError,
     > {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let nonce = &nonce[..8];
-        let in_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-in"));
-        let out_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-out"));
-        let in_listener = crate::endpoint::bind(&in_path).map_err(|source| SupervisorError::SpawnFailed {
+        let in_path = crate::edge::endpoint::endpoint_path(domain_id, &format!("{nonce}-in"));
+        let out_path = crate::edge::endpoint::endpoint_path(domain_id, &format!("{nonce}-out"));
+        let in_listener = crate::edge::endpoint::bind(&in_path).map_err(|source| SupervisorError::SpawnFailed {
             domain: domain_id.to_string(),
             source,
         })?;
-        let out_listener = crate::endpoint::bind(&out_path).map_err(|source| SupervisorError::SpawnFailed {
+        let out_listener = crate::edge::endpoint::bind(&out_path).map_err(|source| SupervisorError::SpawnFailed {
             domain: domain_id.to_string(),
             source,
         })?;

@@ -1,6 +1,6 @@
 //! 诊断：Python 能否用 open() 直接连接内核的命名管道端点。
 
-use atelier_kernel::endpoint;
+use atelier_kernel::edge::endpoint;
 use std::io::Read;
 use std::time::{Duration, Instant};
 

@@ -1,6 +1,6 @@
 //! 端点传输往返：内核侧 listener/handler 与客户端连接能否双向通信。
 
-use atelier_kernel::endpoint;
+use atelier_kernel::edge::endpoint;
 use std::io::{Read, Write};
 
 #[test]

@@ -1,19 +1,18 @@
 pub mod core;
-pub mod discipline;
-pub mod endpoint;
+pub mod diag;
+pub mod edge;
 pub mod services;
 pub mod frontend;
 pub mod router;
 pub mod supervisor;
-pub mod web_frontend;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
-pub use frontend::InteractiveFrontendDomain;
+pub use diag::discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
+pub use frontend::interactive::InteractiveFrontendDomain;
 pub use services::ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
 pub use services::objects::{DeleteOutcome, Object, ObjectHub, ObjectRef};
 pub use core::protocol::{LogFramePayload, LogRecord, ProgressState};
@@ -42,7 +41,7 @@ pub use supervisor::{
     DomainPipeClient, DomainProcessSpec, DomainSupervisor, DomainUpdateResult, KernelBootConfig,
     SupervisorError,
 };
-pub use web_frontend::WebFrontendDomain;
+pub use frontend::web::WebFrontendDomain;
 
 /// Top-level Atelier Kernel host combining:
 /// 1. Domain Supervisor (OS child process `Stdio` pipe lifecycle & physical identity binding)
@@ -182,5 +181,3 @@ impl Drop for AtelierKernel {
         self.router.finish_shutdown();
     }
 }
-
-mod process_diagnostics;

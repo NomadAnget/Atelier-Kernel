@@ -287,6 +287,9 @@ export class AtelierDomain {
   storageDelete(recordId?:string,category?:string):Promise<string>;
   storageQuery(options?:StorageQueryOptions):Promise<string>;
   storageQuery(domain?:string,recordId?:string,category?:string,filter?:Record<string,any>,limit?:number):Promise<string>;
+  putObject(path:string):Promise<string>;
+  getObject(objectId:string):Promise<string>;
+  deleteObject(objectId:string):Promise<string>;
   reportReceipt(
     messageId: string,
     target: string,

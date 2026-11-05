@@ -728,6 +728,37 @@ class AtelierDomain(AsyncRuntime):
             data={},
         )
 
+    async def put_object(self, path: str):
+        """Writes a domain-local file as a kernel-managed object via `kernel.storage` (C4).
+
+        The kernel copies the file into its own object directory, computes the checksum,
+        and returns `{"object_id","size","checksum"}`. The domain only ever holds `object_id`.
+        """
+        return await self.send(
+            targets="kernel.storage",
+            message_type="StorageObjectPut",
+            params={"path": path},
+            data={},
+        )
+
+    async def get_object(self, object_id: str):
+        """Resolves an `object_id` to a kernel-provided read-only file handle (C4)."""
+        return await self.send(
+            targets="kernel.storage",
+            message_type="StorageObjectGet",
+            params={"object_id": object_id},
+            data={},
+        )
+
+    async def delete_object(self, object_id: str):
+        """Deletes this domain's object (index + physical file) via `kernel.storage` (C4)."""
+        return await self.send(
+            targets="kernel.storage",
+            message_type="StorageObjectDelete",
+            params={"object_id": object_id},
+            data={},
+        )
+
     async def query_logs(
         self,
         domain: Optional[str] = None,

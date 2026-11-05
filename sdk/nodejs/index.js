@@ -605,6 +605,29 @@ class AtelierDomain {
   }
 
   /**
+   * Writes a domain-local file as a kernel-managed object via `kernel.storage` (C4).
+   * The kernel copies the file into its own object directory, computes the checksum,
+   * and returns `{ object_id, size, checksum }`. The domain only ever holds `object_id`.
+   */
+  putObject(path) {
+    return this.send("kernel.storage", "StorageObjectPut", { path }, {});
+  }
+
+  /**
+   * Resolves an `object_id` to a kernel-provided read-only file handle (C4).
+   */
+  getObject(objectId) {
+    return this.send("kernel.storage", "StorageObjectGet", { object_id: objectId }, {});
+  }
+
+  /**
+   * Deletes this domain's object (index + physical file) via `kernel.storage` (C4).
+   */
+  deleteObject(objectId) {
+    return this.send("kernel.storage", "StorageObjectDelete", { object_id: objectId }, {});
+  }
+
+  /**
    * Queries persisted logs from SQLite `hub_logs` via `kernel.logger` (`QueryLogs`).
    */
   queryLogs(arg1 = {}, level, layer, component, phase, sinceTs, limit = 200) {

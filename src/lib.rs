@@ -11,6 +11,7 @@ pub mod protocol;
 pub mod router;
 pub mod storage;
 pub mod supervisor;
+pub mod transport;
 pub mod web_frontend;
 
 use std::path::Path;

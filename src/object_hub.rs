@@ -1,20 +1,24 @@
-//! ObjectHub —— C4 存储枢纽对象索引：核外的一个有界索引物。
+//! ObjectHub —— C4 存储枢纽对象索引：一个「绝对路径索引」。
 //!
-//! 大文件不进管道，消息 `data` 里只放 `object_id` 引用；对象索引与消息生命周期正交
-//! （消息删除 ≠ 对象删除，反之亦然）。契约（见 CONSTITUTION.md C4）：
-//!   - 写权随域（M3）：只有归属域能删除；跨域读取只读；
-//!   - 无 TTL、无硬配额；删除时机由业务域显式决定；
-//!   - `checksum` 由内核计算；
-//!   - 引用未清零前不得删除；
-//!   - 对象字节传输机制（已定案）：**内核复制域本地文件**——SDK `put_object(本地路径)`，
-//!     内核把文件复制进自己拥有的对象目录、算 checksum 并索引，域只拿到 `object_id`。
+//! 大文件不进管道；对象就是域自己磁盘上的一个文件。内核**不复制、不移动、不接管**物理文件，
+//! 只把文件的绝对路径 + size + checksum 记进 `objects` 索引表，并把「文件对象」（即该绝对路径）
+//! 交给接收域当普通文件使用（Python 的 `open(path)`、Node 的 `fs.createReadStream(path)`）。
+//! 消息 `data` 里只带 `object_id` 引用，字节不进管道。
+//!
+//! 契约（见 CONSTITUTION.md C4）：
+//!   - 写权随域（M3）：只有归属域能删索引行；跨域读取只读；
+//!   - 无 TTL、无硬配额；索引删除时机由业务域显式决定；
+//!   - `checksum` 由内核流式计算（SHA-256，常数内存）；
+//!   - 引用未清零前不得删索引；
+//!   - 物理文件的生命周期归业务域：内核删索引不删文件。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
+use sha2::{Digest, Sha256};
 
 use crate::storage::StorageError;
 
@@ -27,6 +31,7 @@ const OBJECTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS objects(
 pub struct Object {
     pub object_id: String,
     pub owner: String,
+    /// 域文件系统中的绝对路径；内核只索引，不拥有该文件。
     pub path: String,
     pub size: u64,
     pub checksum: String,
@@ -51,7 +56,6 @@ pub enum DeleteOutcome {
 pub struct ObjectHub {
     objects: BTreeMap<String, Object>,
     next_id: u64,
-    root: PathBuf,
     db: Option<Arc<Mutex<Connection>>>,
 }
 
@@ -66,18 +70,16 @@ impl ObjectHub {
         ObjectHub {
             objects: BTreeMap::new(),
             next_id: 1,
-            root: std::env::temp_dir().join(format!("atelier-objects-{}", uuid::Uuid::new_v4())),
             db: None,
         }
     }
 
-    /// 从 SQLite 载入对象索引（跨重启存在）。对象目录归内核所有，按域隔离写权。
-    pub fn with_db(root: PathBuf, db: Arc<Mutex<Connection>>) -> Result<Self, StorageError> {
+    /// 从 SQLite 载入对象索引（跨重启存在）。
+    pub fn with_db(db: Arc<Mutex<Connection>>) -> Result<Self, StorageError> {
         db.lock().execute_batch(OBJECTS_SCHEMA)?;
         let mut hub = ObjectHub {
             objects: BTreeMap::new(),
             next_id: 1,
-            root,
             db: Some(db.clone()),
         };
         let rows = {
@@ -115,22 +117,18 @@ impl ObjectHub {
         object_id
     }
 
-    /// 把域本地文件复制进内核对象目录，计算 checksum，索引并持久化。
-    /// 这是 C4 已定案的对象字节传输机制：域只提供本地文件，内核拥有对象目录，域只拿 object_id。
+    /// 登记一个域文件：只索引绝对路径，不复制、不移动；checksum 流式计算（常数内存）。
+    /// 返回的 `object_id` 就是域可当作普通文件使用的「文件对象」引用。
     pub fn register_file(&mut self, owner: &str, source_path: &Path) -> Result<ObjectRef, String> {
-        let bytes = std::fs::read(source_path).map_err(|e| e.to_string())?;
-        let checksum = checksum(&bytes);
-        let size = bytes.len() as u64;
+        let absolute = source_path
+            .canonicalize()
+            .map_err(|e| format!("object path must exist and be addressable: {e}"))?;
+        let (size, checksum) = hash_file(&absolute)?;
         let object_id = self.alloc_id();
-        let dest = self.root.join(&object_id);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
         let obj = Object {
             object_id: object_id.clone(),
             owner: owner.to_string(),
-            path: dest.to_string_lossy().to_string(),
+            path: absolute.to_string_lossy().to_string(),
             size,
             checksum: checksum.clone(),
             ref_count: 0,
@@ -210,16 +208,15 @@ impl ObjectHub {
         ok
     }
 
-    /// 显式删除：只有归属域能删；引用未清零不得删。删除会同时移除物理文件与索引行。
+    /// 显式删除：只有归属域能删；引用未清零不得删。
+    /// 只移除索引行——物理文件归业务域所有，内核不删除、不移动它。
     pub fn delete(&mut self, object_id: &str, by_domain: &str) -> DeleteOutcome {
         match self.objects.get(object_id) {
             None => DeleteOutcome::Unknown,
             Some(o) if o.owner != by_domain => DeleteOutcome::Forbidden,
             Some(o) if o.ref_count > 0 => DeleteOutcome::Referenced,
-            Some(o) => {
-                let path = o.path.clone();
+            Some(_) => {
                 self.objects.remove(object_id);
-                let _ = std::fs::remove_file(&path);
                 if let Some(db) = &self.db {
                     let _ = db
                         .lock()
@@ -235,14 +232,29 @@ impl ObjectHub {
     }
 }
 
-/// 内核计算的确定性校验和（结构证明用 FNV-1a；真实实现换 SHA-256）。
+/// 内核计算的确定性校验和：SHA-256（十六进制）。
 fn checksum(bytes: &[u8]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// 流式计算文件 checksum（常数内存，不把整个文件读进内存）。
+fn hash_file(path: &Path) -> Result<(u64, String), String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
     }
-    format!("{h:016x}")
+    Ok((size, format!("{:x}", hasher.finalize())))
 }
 
 #[cfg(test)]
@@ -265,7 +277,7 @@ mod tests {
         let bytes = b"hello object hub";
         let r = hub.register("engines", "/o".into(), bytes);
         assert_eq!(r.size, bytes.len() as u64);
-        assert!(!r.checksum.is_empty());
+        assert_eq!(r.checksum, checksum(bytes));
         assert_eq!(hub.resolve(&r.object_id).unwrap().checksum, r.checksum);
     }
 
@@ -293,30 +305,32 @@ mod tests {
     }
 
     #[test]
-    fn register_file_copies_and_persists_across_restart() {
+    fn register_file_indexes_absolute_path_and_persists_across_restart() {
         let dir = std::env::temp_dir().join(format!("atelier-obj-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("source.bin");
         std::fs::write(&src, b"persisted object bytes").unwrap();
+        let canonical = src.canonicalize().unwrap();
 
         let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let mut hub = ObjectHub::with_db(dir.join("objects"), db.clone()).unwrap();
+        let mut hub = ObjectHub::with_db(db.clone()).unwrap();
         let r = hub.register_file("engines", &src).unwrap();
         assert_eq!(r.size, 22);
-        // 物理文件已复制进内核对象目录，域只拿 object_id
-        assert!(hub.resolve(&r.object_id).unwrap().path.starts_with(&dir.join("objects").to_string_lossy().to_string()));
+        let obj = hub.resolve(&r.object_id).unwrap();
+        // 内核只记绝对路径，不复制、不移动：源文件原地保留
+        assert_eq!(Path::new(&obj.path), canonical.as_path());
+        assert!(src.exists(), "kernel must not move or delete the domain file");
 
         // 跨重启：重新从 SQLite 载入
-        let hub2 = ObjectHub::with_db(dir.join("objects"), db).unwrap();
-        let obj_path = {
-            let obj = hub2.resolve(&r.object_id).expect("object index survives restart");
-            assert_eq!(obj.owner, "engines");
-            assert_eq!(obj.checksum, r.checksum);
-            obj.path.clone()
-        };
-        // 删除后物理文件与索引一起清掉
+        let hub2 = ObjectHub::with_db(db).unwrap();
+        let obj2 = hub2.resolve(&r.object_id).expect("object index survives restart");
+        assert_eq!(obj2.owner, "engines");
+        assert_eq!(obj2.checksum, r.checksum);
+
+        // 删除只移除索引，不删物理文件
         let mut hub2 = hub2;
         assert_eq!(hub2.delete(&r.object_id, "engines"), DeleteOutcome::Deleted);
-        assert!(!std::path::Path::new(&obj_path).exists());
+        assert!(src.exists(), "index delete must not remove the domain file");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

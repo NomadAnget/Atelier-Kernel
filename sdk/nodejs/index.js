@@ -605,12 +605,13 @@ class AtelierDomain {
   }
 
   /**
-   * Writes a domain-local file as a kernel-managed object via `kernel.storage` (C4).
-   * The kernel copies the file into its own object directory, computes the checksum,
-   * and returns `{ object_id, size, checksum }`. The domain only ever holds `object_id`.
+   * Registers a domain file as a kernel-indexed object via `kernel.storage` (C4).
+   * The kernel only indexes the absolute path (no copy, no move) and returns
+   * `{ object_id, size, checksum }`. The domain keeps using its path as a normal file.
    */
-  putObject(path) {
-    return this.send("kernel.storage", "StorageObjectPut", { path }, {});
+  putObject(filePath) {
+    const absolute = require("path").resolve(filePath);
+    return this.send("kernel.storage", "StorageObjectPut", { path: absolute }, {});
   }
 
   /**

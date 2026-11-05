@@ -87,13 +87,7 @@ impl AtelierKernel {
         let path = ledger.database_path().expect("file-backed database path");
         let storage = Arc::new(DomainStorageEngine::open_file(&path)?);
         let logger = Arc::new(KernelLogHub::new(Some(&path))?);
-        let object_root = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("objects");
         let object_hub = Arc::new(Mutex::new(ObjectHub::with_db(
-            object_root,
             ledger.db_conn.as_ref().unwrap().clone(),
         )?));
         Ok(Self::from_components(ledger, storage, logger, object_hub))

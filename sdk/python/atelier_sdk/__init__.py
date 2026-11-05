@@ -729,15 +729,18 @@ class AtelierDomain(AsyncRuntime):
         )
 
     async def put_object(self, path: str):
-        """Writes a domain-local file as a kernel-managed object via `kernel.storage` (C4).
+        """Registers a domain file as a kernel-indexed object via `kernel.storage` (C4).
 
-        The kernel copies the file into its own object directory, computes the checksum,
-        and returns `{"object_id","size","checksum"}`. The domain only ever holds `object_id`.
+        The kernel only indexes the file's absolute path (no copy, no move) and returns
+        `{"object_id","size","checksum"}`. The domain keeps using its file as a normal
+        file object; the `object_id` is what messages carry.
         """
+        import os
+
         return await self.send(
             targets="kernel.storage",
             message_type="StorageObjectPut",
-            params={"path": path},
+            params={"path": os.path.abspath(path)},
             data={},
         )
 

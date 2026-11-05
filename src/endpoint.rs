@@ -37,7 +37,17 @@ mod imp {
     use std::io;
     use std::os::unix::net::{UnixListener, UnixStream};
 
-    pub struct EndpointListener(UnixListener);
+    pub struct EndpointListener {
+        listener: UnixListener,
+        path: String,
+    }
+
+    // 命名管道由内核对象自动回收；Unix socket 是真实文件，必须显式 unlink。
+    impl Drop for EndpointListener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 
     pub struct EndpointStream(UnixStream);
 
@@ -47,12 +57,15 @@ mod imp {
 
     pub fn bind(path: &str) -> io::Result<EndpointListener> {
         let _ = std::fs::remove_file(path);
-        Ok(EndpointListener(UnixListener::bind(path)?))
+        Ok(EndpointListener {
+            listener: UnixListener::bind(path)?,
+            path: path.to_string(),
+        })
     }
 
     impl EndpointListener {
         pub fn accept(&mut self) -> io::Result<EndpointStream> {
-            Ok(EndpointStream(self.0.accept()?.0))
+            Ok(EndpointStream(self.listener.accept()?.0))
         }
     }
 

@@ -14,7 +14,7 @@ from pathlib import Path
 
 PKG_NAME = "atelier_sdk"
 DIST_NAME = "atelier-sdk"
-VERSION = "0.1.16"
+VERSION = "0.1.18"
 TAG = "py3-none-any"
 
 

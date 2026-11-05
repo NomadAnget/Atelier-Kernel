@@ -34,12 +34,14 @@ fn slow_domain(k: &AtelierKernel, id: &str) {
         "message_type":"RegisterHandlers","params":{"handlers":["run"]},"data":{}}),
     )
     .unwrap();
-    let script = format!(
-        "printf '%s\\n' '{}' > \"/proc/self/fd/$ATELIER_IPC_WRITE_FD\"; exec /bin/sleep 60",
-        register
-    );
+    let script = r#"
+import os,sys,socket,time
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ['ATELIER_IPC_OUT'])
+s.sendall((sys.argv[1]+'\n').encode())
+time.sleep(60)
+"#;
     let spec: DomainProcessSpec = serde_json::from_value(
-        json!({"domain_id":id,"command":"/bin/sh","args":["-c",script],"auto_restart":false}),
+        json!({"domain_id":id,"command":"python3","args":["-c",script,register],"auto_restart":false}),
     )
     .unwrap();
     k.supervisor().spawn_process_domain(spec).unwrap();

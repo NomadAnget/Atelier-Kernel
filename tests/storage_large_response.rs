@@ -9,11 +9,13 @@ fn large_checkpoint_query_returns_over_real_pipe_without_replacing_domain() {
         uuid::Uuid::new_v4()
     ));
     let script = r#"
-import os,json,sys
-r=os.fdopen(int(os.environ['ATELIER_IPC_READ_FD']),'r')
-w=os.fdopen(int(os.environ['ATELIER_IPC_WRITE_FD']),'w')
+import os,json,sys,socket
+def _o(n,m):
+ s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ[n]); return s.makefile(m,buffering=0)
+r=_o('ATELIER_IPC_IN','rb')
+w=_o('ATELIER_IPC_OUT','wb')
 def call(seq,kind,params,data):
- w.write(json.dumps(dict(frame_type='send',seq=seq,targets=['kernel.storage'],message_type=kind,params=params,data=data))+'\n');w.flush()
+ w.write((json.dumps(dict(frame_type='send',seq=seq,targets=['kernel.storage'],message_type=kind,params=params,data=data))+'\n').encode());w.flush()
  while True:
   f=json.loads(r.readline())
   if f.get('seq')==seq and f.get('status')=='completed':return f

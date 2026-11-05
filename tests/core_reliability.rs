@@ -250,7 +250,7 @@ fn late_target_result_is_not_delivered_to_replacement_source_process() {
 #[test]
 fn eof_with_live_process_is_reaped_without_waiting_for_natural_exit() {
     let k = AtelierKernel::new_in_memory().unwrap();
-    let spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"eof_probe","command":"python3","args":["-c","import os,time; os.close(int(os.environ['ATELIER_IPC_WRITE_FD'])); time.sleep(5)"],"auto_restart":false})).unwrap();
+    let spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"eof_probe","command":"python3","args":["-c","import os,socket,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ['ATELIER_IPC_OUT']); s.close(); time.sleep(5)"],"auto_restart":false})).unwrap();
     let pid = k.spawn_process_domain(spec).unwrap();
     let until = Instant::now() + Duration::from_secs(2);
     while k.router().domain_status("eof_probe") != Some(DomainStatus::Faulted)
@@ -307,7 +307,7 @@ fn corrupt_persisted_transport_is_rejected_before_startup_cleanup() {
 fn overlong_unterminated_ipc_frame_is_bounded_and_terminates_only_its_owner() {
     let k = AtelierKernel::new_in_memory().unwrap();
     let query = k.attach_domain("query");
-    let spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"oversized","command":"python3","args":["-c","import os,time; fd=int(os.environ['ATELIER_IPC_WRITE_FD']); b=b'x'*8192\ntry:\n for _ in range(2050): os.write(fd,b)\nexcept BrokenPipeError: pass\ntime.sleep(5)"],"auto_restart":false})).unwrap();
+    let spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"oversized","command":"python3","args":["-c","import os,socket,time; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ['ATELIER_IPC_OUT']); b=b'x'*8192\ntry:\n for _ in range(2050): s.sendall(b)\nexcept OSError: pass\ntime.sleep(5)"],"auto_restart":false})).unwrap();
     let pid = k.spawn_process_domain(spec).unwrap();
     let deadline = Instant::now() + Duration::from_secs(4);
     while k.supervisor().get_pid("oversized").is_some() && Instant::now() < deadline {
@@ -327,7 +327,7 @@ fn overlong_unterminated_ipc_frame_is_bounded_and_terminates_only_its_owner() {
 #[test]
 fn concurrent_stop_and_failed_update_reclaim_both_children_without_global_query_lock() {
     let k = Arc::new(AtelierKernel::new_in_memory().unwrap());
-    let old_spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"managed","command":"python3","args":["-c","import os,json,time; os.write(int(os.environ['ATELIER_IPC_WRITE_FD']),(json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['run']},'data':{}})+'\\n').encode()); time.sleep(30)"],"auto_restart":false})).unwrap();
+    let old_spec:DomainProcessSpec=serde_json::from_value(json!({"domain_id":"managed","command":"python3","args":["-c","import os,json,time,socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ['ATELIER_IPC_OUT']); s.sendall((json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['run']},'data':{}})+'\\n').encode()); time.sleep(30)"],"auto_restart":false})).unwrap();
     let old_pid = k.spawn_process_domain(old_spec).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while k.router().domain_status("managed") != Some(DomainStatus::Active)

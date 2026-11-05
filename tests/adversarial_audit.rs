@@ -354,12 +354,14 @@ fn real_process_not_reading_observer_pipe_does_not_block_other_domains() {
     let frame = serde_json::to_string(&json!({"frame_type":"send","seq":1,
         "targets":["kernel.observer"],"message_type":"SubscribeObserver","params":{},"data":{}}))
     .unwrap();
-    let script = format!(
-        "printf '%s\\n' '{}' > \"/proc/self/fd/$ATELIER_IPC_WRITE_FD\"; exec /bin/sleep 15",
-        frame
-    );
+    let script = r#"
+import os,sys,socket,time
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ['ATELIER_IPC_OUT'])
+s.sendall((sys.argv[1]+'\n').encode())
+time.sleep(15)
+"#;
     let spec: DomainProcessSpec = serde_json::from_value(json!({"domain_id":"slow_os",
-        "command":"/bin/sh","args":["-c",script],"auto_restart":false}))
+        "command":"python3","args":["-c",script,frame],"auto_restart":false}))
     .unwrap();
     kernel.supervisor().spawn_process_domain(spec).unwrap();
     let deadline = Instant::now() + std::time::Duration::from_secs(3);

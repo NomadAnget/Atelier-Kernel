@@ -608,22 +608,22 @@ class AtelierDomain {
    * Allocates a virtual path to a flat unique-id file (C4).
    * Returns `{ object_id, virtual_path, physical_path, size }`.
    */
-  putObject(virtualPath) {
-    return this.send("kernel.storage", "StorageObjectPut", { virtual_path: virtualPath }, {});
+  async putObject(virtualPath) {
+    return (await this.request("kernel.storage", "StorageObjectPut", { virtual_path: virtualPath }, {})).data;
   }
 
   /**
-   * Resolves an `object_id` to a kernel-provided read-only file handle (C4).
+   * Resolves an `object_id` to its object ref (C4).
    */
-  getObject(objectId) {
-    return this.send("kernel.storage", "StorageObjectGet", { object_id: objectId }, {});
+  async getObject(objectId) {
+    return (await this.request("kernel.storage", "StorageObjectGet", { object_id: objectId }, {})).data;
   }
 
   /**
    * Deletes this domain's object (index + physical file) via `kernel.storage` (C4).
    */
-  deleteObject(objectId) {
-    return this.send("kernel.storage", "StorageObjectDelete", { object_id: objectId }, {});
+  async deleteObject(objectId) {
+    return (await this.request("kernel.storage", "StorageObjectDelete", { object_id: objectId }, {})).data;
   }
 
   /**

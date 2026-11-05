@@ -10,7 +10,10 @@
     "README.md",
     "runtime.js",
     "messages.js",
-    "files.js"
+    "files.js",
+    "vfs-loader.mjs",
+    "vfs-hooks.mjs",
+    "vfs-shim.mjs"
   ],
   "keywords": [
     "atelier-kernel",

@@ -69,6 +69,7 @@ class FileNamespace {
 
 /** 包装 fs 的常见文件操作：只改 vfs:// 路径，其余原样。 */
 function install(namespace) {
+  globalThis.__atelierVfs = namespace;
   const wrap = (name, forWrite, argIndexes = [0]) => {
     const original = fs[name];
     if (typeof original !== "function") return;

@@ -2062,13 +2062,29 @@ mod diagnostic_pipe_tests {
 mod process_reaping_tests {
     use super::*;
 
+    /// Windows 命名管道可用文件 API 打开；Unix domain socket 必须 connect()。
+    const IPC_HOLD: &str = r#"import os,sys,time
+if sys.platform == "win32":
+    r = open(os.environ["ATELIER_IPC_IN"], "rb", buffering=0)
+    w = open(os.environ["ATELIER_IPC_OUT"], "wb", buffering=0)
+else:
+    import socket
+    def _o(n, m):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(os.environ[n])
+        return s.makefile(m, buffering=0)
+    r = _o("ATELIER_IPC_IN", "rb")
+    w = _o("ATELIER_IPC_OUT", "wb")
+time.sleep(30)
+"#;
+
     // Hold a real worker join after kill/wait. This makes the previously racy
     // process.take -> terminate gap observable without sleeps or test-only hooks.
     fn check_cleanup(mode: &str) {
         let kernel = crate::AtelierKernel::new_in_memory().unwrap();
         let spec: DomainProcessSpec = serde_json::from_value(json!({
             "domain_id":"reaping", "command":"python3",
-            "args":["-c", "import os,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); time.sleep(30)"],
+            "args":["-c", IPC_HOLD],
             "auto_restart": mode == "automatic", "restart_delay_ms": 0
         }))
         .unwrap();

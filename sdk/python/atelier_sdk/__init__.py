@@ -9,9 +9,23 @@ __version__ = "0.2.0"
 import asyncio
 import json
 import os
+import socket
 import sys
 import threading
 import uuid
+
+
+def _open_endpoint(path, mode):
+    """打开一条单向内核端点。
+
+    Windows 命名管道可直接当文件打开；Unix domain socket 不是文件，
+    只能 `socket.connect()` 后用 `makefile()` 拿到同样的文件接口。
+    """
+    if sys.platform == "win32":
+        return open(path, mode, buffering=0)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    return sock.makefile("wb" if "w" in mode else "rb", buffering=0)
 
 TERMINAL = {"completed", "execution_failed", "target_invalid", "contract_invalid"}
 
@@ -59,9 +73,10 @@ class AtelierDomain:
         in_path = os.environ.pop("ATELIER_IPC_IN", None)
         out_path = os.environ.pop("ATELIER_IPC_OUT", None)
         if in_path and out_path:
-            # 两条单向管道：in（内核→域，只读）、out（域→内核，只写）。
-            self._read_pipe = open(in_path, "rb", buffering=0)
-            self._write_pipe = open(out_path, "wb", buffering=0)
+            # 两条单向端点：in（内核→域，只读）、out（域→内核，只写）。
+            # Windows 命名管道支持文件 API；Unix domain socket 不是文件，必须 connect()。
+            self._read_pipe = _open_endpoint(in_path, "rb")
+            self._write_pipe = _open_endpoint(out_path, "wb")
 
     # ── 能力 2：注册处理器 ──────────────────────────────────────────────
     def handler(self, name):

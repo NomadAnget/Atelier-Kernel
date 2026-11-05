@@ -13,9 +13,34 @@ fn python_cmd() -> &'static str {
 }
 
 const PY_IPC_PREAMBLE: &str = r#"
-import json, os, sys, time
-ipc_in = open(os.environ["ATELIER_IPC_IN"], "r", encoding="utf-8", newline="\n")
-ipc_out = open(os.environ["ATELIER_IPC_OUT"], "w", encoding="utf-8", newline="\n")
+import json, os, socket, sys, time
+
+
+def _ipc_endpoint(name, mode):
+    path = os.environ[name]
+    if sys.platform == "win32":
+        return open(path, mode, encoding="utf-8", newline="\n")
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    return sock.makefile(mode, encoding="utf-8", newline="\n")
+
+
+ipc_in = _ipc_endpoint("ATELIER_IPC_IN", "r")
+ipc_out = _ipc_endpoint("ATELIER_IPC_OUT", "w")
+"#;
+
+/// 跨平台连接两条端点后保持不关闭（Windows 文件 API / Unix domain socket connect）。
+const PY_IPC_HOLD: &str = r#"import os, socket, sys
+if sys.platform == "win32":
+    r = open(os.environ["ATELIER_IPC_IN"], "rb", buffering=0)
+    w = open(os.environ["ATELIER_IPC_OUT"], "wb", buffering=0)
+else:
+    def _o(n, m):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(os.environ[n])
+        return s.makefile(m, buffering=0)
+    r = _o("ATELIER_IPC_IN", "rb")
+    w = _o("ATELIER_IPC_OUT", "wb")
 "#;
 
 #[test]
@@ -959,7 +984,7 @@ fn test_auto_restart_respects_max_restarts_limit() {
         domain_id: "doomed_domain".to_string(),
         command: python_cmd().to_string(),
         args: vec!["-c".into(),
-            "import sys,time,os; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); f=open(sys.argv[1],'a'); f.write('start\\n'); f.close(); time.sleep(0.12); sys.exit(1)".into(),
+            format!("{PY_IPC_HOLD}\nf=open(sys.argv[1],'a'); f.write('start\\n'); f.close(); time.sleep(0.12); sys.exit(1)"),
             starts.to_string_lossy().into_owned()],
         working_dir: None,
         env: Default::default(),
@@ -2397,7 +2422,7 @@ for line in ipc_in:
 
     // 4. Test candidate failure and automatic rollback
     // Script that intentionally fails validation (immediate exit / crash)
-    let bad_script = "import sys,os; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); sys.exit(42)";
+    let bad_script = format!("{PY_IPC_HOLD}\nsys.exit(42)");
     let bad_spec = json!({
         "domain_id": "worker_roll",
         "command": python_cmd(),

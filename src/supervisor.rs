@@ -383,6 +383,26 @@ fn ipc_reader<R: std::io::Read>(input: R) -> impl std::io::Read {
     // 端点 reader 已内建 PeekNamedPipe 轮询（Windows）与非阻塞语义（Unix）。
     input
 }
+/// 在工作线程里接受端点并取出内核侧的一半（`in` 取写端、`out` 取读端）。
+/// accept 放在这里而不是 spawn 路径，避免「域没连上」阻塞 supervisor。
+fn accept_writer(
+    mut listener: crate::endpoint::EndpointListener,
+) -> std::io::Result<crate::endpoint::EndpointWriter> {
+    let (_reader, writer) = listener.accept()?.into_split();
+    #[cfg(unix)]
+    writer.set_nonblocking(true)?;
+    Ok(writer)
+}
+
+fn accept_reader(
+    mut listener: crate::endpoint::EndpointListener,
+) -> std::io::Result<crate::endpoint::EndpointReader> {
+    let (reader, _writer) = listener.accept()?.into_split();
+    #[cfg(unix)]
+    reader.set_nonblocking(true)?;
+    Ok(reader)
+}
+
 fn pump_lines<R: std::io::Read>(
     mut input: R,
     stop: &AtomicBool,
@@ -814,8 +834,14 @@ impl DomainSupervisorInner {
         &self,
         domain_id: &str,
         spec: &DomainProcessSpec,
-    ) -> Result<(Child, crate::endpoint::EndpointWriter, crate::endpoint::EndpointReader), SupervisorError>
-    {
+    ) -> Result<
+        (
+            Child,
+            crate::endpoint::EndpointListener,
+            crate::endpoint::EndpointListener,
+        ),
+        SupervisorError,
+    > {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         let nonce = &nonce[..8];
         let in_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-in"));
@@ -865,47 +891,9 @@ impl DomainSupervisorInner {
             source,
         })?;
 
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name(format!("kernel-accept-{domain_id}"))
-            .spawn(move || {
-                let mut in_listener = in_listener;
-                let mut out_listener = out_listener;
-                let result = in_listener
-                    .accept()
-                    .and_then(|in_stream| out_listener.accept().map(|out_stream| (in_stream, out_stream)));
-                let _ = sender.send(result);
-            })
-            .map_err(|source| SupervisorError::SpawnFailed {
-                domain: domain_id.to_string(),
-                source,
-            })?;
-
-        let (in_stream, out_stream) = match receiver.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(source)) => {
-                let _ = child.kill();
-                return Err(SupervisorError::SpawnFailed {
-                    domain: domain_id.to_string(),
-                    source,
-                });
-            }
-            Err(_) => {
-                let _ = child.kill();
-                return Err(SupervisorError::SpawnFailed {
-                    domain: domain_id.to_string(),
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "domain did not connect to the IPC endpoints",
-                    ),
-                });
-            }
-        };
-
-        // in 管道：内核只写；out 管道：内核只读。
-        let (_in_reader, in_writer) = in_stream.into_split();
-        let (out_reader, _out_writer) = out_stream.into_split();
-        Ok((child, in_writer, out_reader))
+        // 端点接受下沉到工作线程：spawn 只做生命周期挂接，不等域连上来。
+        // 这样「域启动慢」和「域根本不连」都不会阻塞 supervisor。
+        Ok((child, in_listener, out_listener))
     }
 
     fn launch(
@@ -968,7 +956,7 @@ impl DomainSupervisorInner {
                 .env
                 .insert("ATELIER_MANAGED_READY".into(), "1".into());
         }
-        let (mut child, mut tx, rx) = self.spawn_child_endpoint(id, &child_spec)?;
+        let (mut child, in_listener, out_listener) = self.spawn_child_endpoint(id, &child_spec)?;
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -996,8 +984,6 @@ impl DomainSupervisorInner {
         let result = (|| -> std::io::Result<()> {
             #[cfg(unix)]
             {
-                tx.set_nonblocking(true)?;
-                rx.set_nonblocking(true)?;
                 if let Some(io) = &stdout {
                     nonblocking(io)?;
                 }
@@ -1013,6 +999,14 @@ impl DomainSupervisorInner {
                 thread::Builder::new()
                     .name(format!("kernel-tx-{id}-{generation}"))
                     .spawn(move || {
+                        let mut tx = match accept_writer(in_listener) {
+                            Ok(writer) => writer,
+                            Err(error) => {
+                                diagnostics.record("tx_accept", io_error(&error), true);
+                                drain.store(true, Ordering::Release);
+                                return;
+                            }
+                        };
                         while !stop.load(Ordering::Acquire) {
                             match inbox.recv_timeout(Duration::from_millis(50)) {
                                 Ok(frame) => {
@@ -1051,6 +1045,14 @@ impl DomainSupervisorInner {
                 thread::Builder::new()
                     .name(format!("kernel-rx-{id}-{generation}"))
                     .spawn(move || {
+                        let rx = match accept_reader(out_listener) {
+                            Ok(reader) => reader,
+                            Err(error) => {
+                                diagnostics.record("rx_accept", io_error(&error), true);
+                                drain.store(true, Ordering::Release);
+                                return;
+                            }
+                        };
                         let result = pump_lines(ipc_reader(rx), &stop, Some(&drain), |line| {
                             if line.len() < 8192 {
                                 if let Ok(value)=serde_json::from_str::<Value>(line) {

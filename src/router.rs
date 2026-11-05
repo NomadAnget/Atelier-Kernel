@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
-use crate::ledger::{KernelLedger, ReceiptTransition};
+use crate::services::ledger::{KernelLedger, ReceiptTransition};
 use crate::logging::{KernelLogHub, LogQuery, LogRecord};
 use crate::services::objects::{DeleteOutcome, ObjectHub};
 use crate::observer::KernelObserver;

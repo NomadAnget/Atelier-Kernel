@@ -245,10 +245,10 @@ fn take_temporary(
 impl PipeSender {
     pub(crate) fn accept(
         &self,
-        ledger: &crate::ledger::KernelLedger,
+        ledger: &crate::services::ledger::KernelLedger,
         msg: &crate::protocol::KernelMessage,
         seq: u64,
-    ) -> Result<(crate::ledger::DeliveryRecord, bool), QueueError> {
+    ) -> Result<(crate::services::ledger::DeliveryRecord, bool), QueueError> {
         let mut state = self.0.state.lock();
         if state.closed {
             return Err(QueueError("domain output disconnected".into()));

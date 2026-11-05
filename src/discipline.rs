@@ -7,7 +7,7 @@ use ruff_python_ast::{self as ast, Stmt};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::{AUDIT_COLUMNS, AUDIT_TABLE, KERNEL_LEDGER_COLUMNS, KERNEL_LEDGER_TABLE};
+use crate::services::ledger::{AUDIT_COLUMNS, AUDIT_TABLE, KERNEL_LEDGER_COLUMNS, KERNEL_LEDGER_TABLE};
 use crate::storage::{DOMAIN_TABLE_COLUMNS, verify_sqlite_table_columns};
 use crate::supervisor::{KernelBootConfig, SupervisorError};
 

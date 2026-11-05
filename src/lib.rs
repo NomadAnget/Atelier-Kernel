@@ -2,7 +2,6 @@ pub mod discipline;
 pub mod endpoint;
 pub mod services;
 pub mod frontend;
-pub mod ledger;
 mod log_spool;
 pub mod logging;
 pub mod nucleus;
@@ -23,7 +22,7 @@ use parking_lot::Mutex;
 
 pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
 pub use frontend::InteractiveFrontendDomain;
-pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
+pub use services::ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
 pub use services::objects::{DeleteOutcome, Object, ObjectHub, ObjectRef};
 pub use logging::{
     KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore, ProgressState,

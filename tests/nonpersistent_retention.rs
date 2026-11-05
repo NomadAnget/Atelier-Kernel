@@ -5,7 +5,7 @@
 //! escape the capacity accounting, and identity/session indexes must be reclaimed once the
 //! result has been published.
 
-use atelier_kernel::ledger::KernelLedger;
+use atelier_kernel::services::ledger::KernelLedger;
 use atelier_kernel::protocol::ContractStatus;
 use serde_json::{Value, json};
 

@@ -47,26 +47,15 @@ class AtelierDomain:
         self._seq = 1
         self._lock = threading.Lock()
 
-        self._reader = None
-        self._writer = None
+        self._pipe = None
         self._loop = None
         self._done = None
         self._closed = False
         self._read_thread = None
 
-        read_raw = os.environ.pop("ATELIER_IPC_READ_FD", None)
-        write_raw = os.environ.pop("ATELIER_IPC_WRITE_FD", None)
-        handle_mode = os.environ.pop("ATELIER_IPC_HANDLE_MODE", None)
-        if read_raw and write_raw:
-            read_fd, write_fd = int(read_raw), int(write_raw)
-            if os.name == "nt" and handle_mode in ("win32", "win32_handle"):
-                import msvcrt
-
-                binary = getattr(os, "O_BINARY", 0)
-                read_fd = msvcrt.open_osfhandle(read_fd, os.O_RDONLY | binary)
-                write_fd = msvcrt.open_osfhandle(write_fd, os.O_WRONLY | binary)
-            self._reader = os.fdopen(read_fd, "r", encoding="utf-8", newline="\n")
-            self._writer = os.fdopen(write_fd, "w", encoding="utf-8", newline="\n")
+        pipe_path = os.environ.pop("ATELIER_IPC_PIPE", None)
+        if pipe_path:
+            self._pipe = open(pipe_path, "r+b", buffering=0)
 
     # ── 能力 2：注册处理器 ──────────────────────────────────────────────
     def handler(self, name):
@@ -406,8 +395,8 @@ class AtelierDomain:
 
     # ── 能力 1：生命周期 ──────────────────────────────────────────────
     async def run_async(self, *, on_start=None, on_close=None):
-        if self._reader is None or self._writer is None:
-            raise RuntimeError("IPC pipes are not configured (ATELIER_IPC_READ_FD / WRITE_FD)")
+        if self._pipe is None:
+            raise RuntimeError("IPC endpoint is not configured (ATELIER_IPC_PIPE)")
         self._loop = asyncio.get_running_loop()
         self._done = self._loop.create_future()
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -447,26 +436,34 @@ class AtelierDomain:
 
     # ── 传输 ──────────────────────────────────────────────────────────
     def _write(self, frame):
-        if self._closed:
+        if self._closed or self._pipe is None:
             return
-        line = json.dumps(frame, ensure_ascii=False)
+        line = json.dumps(frame, ensure_ascii=False) + "\n"
         with self._lock:
-            if self._writer is not None:
-                self._writer.write(line + "\n")
-                self._writer.flush()
+            self._pipe.write(line.encode("utf-8"))
 
     def _read_loop(self):
-        for line in self._reader:
-            line = line.strip()
-            if not line:
-                continue
+        buffer = b""
+        while not self._closed:
             try:
-                frame = json.loads(line)
-            except Exception:
-                continue
-            if self._loop is not None:
-                # 不阻塞读线程：处理器里可能再发 request，需要读线程继续处理回执。
-                asyncio.run_coroutine_threadsafe(self._handle(frame), self._loop)
+                chunk = self._pipe.read(8192)
+            except Exception:  # noqa: BLE001
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                raw, buffer = buffer.split(b"\n", 1)
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    frame = json.loads(raw.decode("utf-8"))
+                except Exception:  # noqa: BLE001
+                    continue
+                if self._loop is not None:
+                    # 不阻塞读线程：处理器里可能再发 request，需要读线程继续处理回执。
+                    asyncio.run_coroutine_threadsafe(self._handle(frame), self._loop)
 
     async def _handle(self, frame):
         if frame.get("frame_type") == "receipt":

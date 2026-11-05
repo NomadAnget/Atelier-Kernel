@@ -379,57 +379,9 @@ fn cancel_worker(handle: &thread::JoinHandle<()>) {
 }
 // IPC reads must be interruptible on every supported OS. Unlike diagnostic readers,
 // this endpoint drains bytes already in the pipe before transport failure is published.
-#[cfg(not(windows))]
-fn ipc_reader(input: std::io::PipeReader) -> impl std::io::Read {
+fn ipc_reader(input: crate::endpoint::EndpointReader) -> impl std::io::Read {
+    // 端点 reader 已内建 PeekNamedPipe 轮询（Windows）与非阻塞语义（Unix）。
     input
-}
-#[cfg(windows)]
-fn ipc_reader(input: std::io::PipeReader) -> impl std::io::Read {
-    struct Reader(std::io::PipeReader);
-    impl std::io::Read for Reader {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            use std::os::windows::io::AsRawHandle;
-            #[link(name = "kernel32")]
-            unsafe extern "system" {
-                fn PeekNamedPipe(
-                    handle: *mut std::ffi::c_void,
-                    buffer: *mut std::ffi::c_void,
-                    size: u32,
-                    read: *mut u32,
-                    available: *mut u32,
-                    left: *mut u32,
-                ) -> i32;
-            }
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            let mut available = 0;
-            let ok = unsafe {
-                PeekNamedPipe(
-                    self.0.as_raw_handle(),
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null_mut(),
-                    &mut available,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                let error = std::io::Error::last_os_error();
-                return if matches!(error.raw_os_error(), Some(109 | 232)) {
-                    Ok(0)
-                } else {
-                    Err(error)
-                };
-            }
-            if available == 0 {
-                return Err(std::io::ErrorKind::WouldBlock.into());
-            }
-            let count = buf.len().min(available as usize);
-            self.0.read(&mut buf[..count])
-        }
-    }
-    Reader(input)
 }
 fn pump_lines<R: std::io::Read>(
     mut input: R,
@@ -488,7 +440,7 @@ fn pump_lines<R: std::io::Read>(
     Ok(())
 }
 fn write_frame(
-    output: &mut std::io::PipeWriter,
+    output: &mut crate::endpoint::EndpointWriter,
     frame: &KernelToDomainFrame,
     stop: &AtomicBool,
 ) -> std::io::Result<()> {
@@ -1004,7 +956,7 @@ impl DomainSupervisorInner {
                 .env
                 .insert("ATELIER_MANAGED_READY".into(), "1".into());
         }
-        let (mut child, mut tx, rx) = self.spawn_child_pipes(id, &child_spec)?;
+        let (mut child, mut tx, rx) = self.spawn_child_endpoint(id, &child_spec)?;
         let pid = child.id();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -1032,8 +984,8 @@ impl DomainSupervisorInner {
         let result = (|| -> std::io::Result<()> {
             #[cfg(unix)]
             {
-                nonblocking(&tx)?;
-                nonblocking(&rx)?;
+                tx.set_nonblocking(true)?;
+                rx.set_nonblocking(true)?;
                 if let Some(io) = &stdout {
                     nonblocking(io)?;
                 }

@@ -460,6 +460,8 @@ function claimIpcFds() {
       windowsHide: true,
     });
     bridge.stdout.pause();
+    bridge.on("exit", (code) => process.stderr.write("v2 bridge exit " + code + "\n"));
+    bridge.on("error", (error) => process.stderr.write("v2 bridge error " + String(error && error.message) + "\n"));
     return { input: bridge.stdout, output: bridge.stdin, bridge };
   }
   const input = new net.Socket({ fd: readFd, readable: true, writable: false });

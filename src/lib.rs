@@ -4,6 +4,7 @@ pub mod ledger;
 mod log_spool;
 pub mod logging;
 pub mod nucleus;
+pub mod object_hub;
 pub mod observer;
 pub mod outbox;
 pub mod port_forwarder;

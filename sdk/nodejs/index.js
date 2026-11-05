@@ -543,32 +543,32 @@ class AtelierDomain {
   /**
    * Writes a record to this domain's dedicated storage table via `kernel.storage`.
    */
-  storageInsert(recordId, category, data, upsert = true) {
-    return this.send(
+  async storageInsert(recordId, category, data, upsert = true) {
+    return (await this.request(
       "kernel.storage",
       "StorageInsert",
       { record_id: recordId, category, upsert },
       data
-    );
+    )).data;
   }
 
   /**
    * Updates a record in this domain's dedicated storage table via `kernel.storage`.
    */
-  storageUpdate(recordId, data, patch = true) {
-    return this.send(
+  async storageUpdate(recordId, data, patch = true) {
+    return (await this.request(
       "kernel.storage",
       "StorageUpdate",
       { record_id: recordId, patch },
       data
-    );
+    )).data;
   }
 
   /**
    * Deletes record(s) from this domain's dedicated storage table via `kernel.storage`.
    * Supports both object options `{ recordId, category }` and positional arguments `(recordId, category)`.
    */
-  storageDelete(arg1, arg2) {
+  async storageDelete(arg1, arg2) {
     const params = {};
     if (typeof arg1 === "object" && arg1 !== null) {
       if (arg1.recordId !== undefined) params.record_id = arg1.recordId;
@@ -578,14 +578,14 @@ class AtelierDomain {
       if (arg1 !== undefined) params.record_id = arg1;
       if (arg2 !== undefined) params.category = arg2;
     }
-    return this.send("kernel.storage", "StorageDelete", params, {});
+    return (await this.request("kernel.storage", "StorageDelete", params, {})).data;
   }
 
   /**
    * Queries this domain's storage table or another domain's storage table (read-only cross-domain access).
    * Supports both object options `{ domain, recordId, category, filter, limit }` and positional arguments.
    */
-  storageQuery(arg1, recordId, category, filter, limit = 500) {
+  async storageQuery(arg1, recordId, category, filter, limit = 500) {
     const params = { limit };
     if (typeof arg1 === "object" && arg1 !== null) {
       if (arg1.domain !== undefined) params.domain = arg1.domain;
@@ -601,7 +601,7 @@ class AtelierDomain {
       if (category !== undefined) params.category = category;
       if (filter !== undefined) params.filter = filter;
     }
-    return this.send("kernel.storage", "StorageQuery", params, {});
+    return (await this.request("kernel.storage", "StorageQuery", params, {})).data;
   }
 
   /**

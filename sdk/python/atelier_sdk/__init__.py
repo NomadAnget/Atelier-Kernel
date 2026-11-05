@@ -661,13 +661,8 @@ class AtelierDomain(AsyncRuntime):
         data: Dict[str, Any],
         upsert: bool = True,
     ):
-        """Writes a record to this domain's dedicated storage table via `kernel.storage`."""
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageInsert",
-            params={"record_id": record_id, "category": category, "upsert": upsert},
-            data=data,
-        )
+        """Writes a record and returns the stored record (request semantics)."""
+        return await self.storage_insert_async(record_id, category, data, upsert)
 
     async def storage_update(
         self,
@@ -675,31 +670,16 @@ class AtelierDomain(AsyncRuntime):
         data: Dict[str, Any],
         patch: bool = True,
     ):
-        """Updates a record in this domain's dedicated storage table via `kernel.storage`."""
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageUpdate",
-            params={"record_id": record_id, "patch": patch},
-            data=data,
-        )
+        """Updates a record and returns it (request semantics)."""
+        return await self.storage_update_async(record_id, data, patch)
 
     async def storage_delete(
         self,
         record_id: Optional[str] = None,
         category: Optional[str] = None,
     ):
-        """Deletes record(s) from this domain's dedicated storage table via `kernel.storage`."""
-        params: Dict[str, Any] = {}
-        if record_id is not None:
-            params["record_id"] = record_id
-        if category is not None:
-            params["category"] = category
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageDelete",
-            params=params,
-            data={},
-        )
+        """Deletes record(s) and returns the outcome (request semantics)."""
+        return await self.storage_delete_async(record_id, category)
 
     async def storage_query(
         self,
@@ -710,22 +690,14 @@ class AtelierDomain(AsyncRuntime):
         filter_map: Optional[Dict[str, Any]] = None,
         limit: int = 500,
     ):
-        """Queries this domain's storage table or another domain's table (read-only cross-domain access)."""
-        params: Dict[str, Any] = {"limit": limit}
-        if domain is not None:
-            params["domain"] = domain
-        if record_id is not None:
-            params["record_id"] = record_id
-        if category is not None:
-            params["category"] = category
-        active_filter = filter if filter is not None else filter_map
-        if active_filter is not None:
-            params["filter"] = active_filter
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageQuery",
-            params=params,
-            data={},
+        """Queries this domain's storage table and returns the data (request semantics)."""
+        return await self.storage_query_async(
+            domain=domain,
+            record_id=record_id,
+            category=category,
+            filter=filter,
+            filter_map=filter_map,
+            limit=limit,
         )
 
     async def put_object(self, virtual_path: str):

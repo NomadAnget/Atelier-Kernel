@@ -612,6 +612,11 @@ class AtelierDomain {
     return (await this.request("kernel.storage", "StorageObjectPut", { virtual_path: virtualPath }, {})).data;
   }
 
+  /** Returns the object_id assigned to a vfs:// path (C4). */
+  fileObjectId(virtualPath) {
+    return this._fileNamespace ? this._fileNamespace.objectId(virtualPath) : null;
+  }
+
   /**
    * Resolves an `object_id` to its object ref (C4).
    */

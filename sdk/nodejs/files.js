@@ -42,6 +42,15 @@ class FileNamespace {
     return path.join(this.root, objectId);
   }
 
+  objectId(virtualPath) {
+    try {
+      const physical = this.cache.get(this.normalize(virtualPath));
+      return physical ? this.byPhysical.get(path.resolve(physical)) || null : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
   objectIdForPath(p) {
     try {
       return this.byPhysical.get(path.resolve(p)) || null;

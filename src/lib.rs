@@ -85,15 +85,32 @@ impl AtelierKernel {
 
     /// Creates a new Atelier Kernel backed by a persistent SQLite database file.
     pub fn open_with_db(db_path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        Self::open_with_optional_root(db_path, None)
+    }
+
+    /// Same as [`open_with_db`], but uses an explicit C4 project root
+    /// (all domain files live under `<project_root>/<domain>/`).
+    pub fn open_with_db_and_root(
+        db_path: impl AsRef<Path>,
+        project_root: impl AsRef<Path>,
+    ) -> Result<Self, StorageError> {
+        Self::open_with_optional_root(db_path, Some(project_root.as_ref().to_path_buf()))
+    }
+
+    fn open_with_optional_root(
+        db_path: impl AsRef<Path>,
+        project_root: Option<std::path::PathBuf>,
+    ) -> Result<Self, StorageError> {
         let ledger = Arc::new(KernelLedger::open_with_db(Some(db_path.as_ref()))?);
         let path = ledger.database_path().expect("file-backed database path");
         let storage = Arc::new(DomainStorageEngine::open_file(&path)?);
         let logger = Arc::new(KernelLogHub::new(Some(&path))?);
-        // 项目根默认取数据库所在目录（db_path 默认 ./data/atelier_kernel.db → ./data）。
-        let project_root = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // 未显式给项目根时默认取数据库所在目录（db_path 默认 ./data/atelier_kernel.db → ./data）。
+        let project_root = project_root.unwrap_or_else(|| {
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+        });
         let object_hub = Arc::new(Mutex::new(ObjectHub::with_db(
             project_root,
             ledger.db_conn.as_ref().unwrap().clone(),

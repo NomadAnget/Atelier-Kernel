@@ -75,7 +75,7 @@ fn run_variant_smoke_test(
     boot_config: &KernelBootConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("[SmokeTest] Booting variant from config: {}", config_path);
-    let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
+    let kernel = AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?;
 
     if boot_config.domains.is_empty() {
         return Err("No domains declared in boot configuration".into());
@@ -331,14 +331,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.iter().any(|a| a == "--auto" || a == "-a") {
-        let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
+        let kernel = AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?;
         let frontend = InteractiveFrontendDomain::attach_and_boot(&kernel);
         frontend.run_all_automated_demos();
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--cli") {
-        let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
+        let kernel = AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?;
         let frontend = InteractiveFrontendDomain::attach_and_boot(&kernel);
         frontend.run_repl();
         return Ok(());
@@ -349,14 +349,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !args.iter().any(|a| a == "--headless");
 
     if enable_web_ui {
-        let kernel = Arc::new(AtelierKernel::open_with_db(&boot_config.db_path)?);
+        let kernel = Arc::new(AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?);
         let web_domain = Arc::new(WebFrontendDomain::attach_with_config(kernel, &boot_config));
         web_domain.serve_http(&boot_config.web_ui_bind)?;
         return Ok(());
     }
 
     // Default: Headless microkernel runtime without HTTP server port overhead
-    let kernel = AtelierKernel::open_with_db(&boot_config.db_path)?;
+    let kernel = AtelierKernel::open_with_db_and_root(&boot_config.db_path, &boot_config.project_root)?;
     let spawned = kernel.supervisor().boot_from_config(&boot_config);
     println!(
         "[AtelierKernel] Microkernel headless runtime active ({} domain(s) supervised from {})",

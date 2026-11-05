@@ -62,6 +62,9 @@ pub struct KernelBootConfig {
     pub source_path: Option<std::path::PathBuf>,
     #[serde(default = "default_db_path")]
     pub db_path: String,
+    /// C4 项目根：所有域文件集中到 `<project_root>/<domain>/`；默认 `./data`。
+    #[serde(default = "default_project_root")]
+    pub project_root: String,
     #[serde(default = "default_web_bind")]
     pub web_ui_bind: String,
     #[serde(default)]
@@ -72,6 +75,10 @@ pub struct KernelBootConfig {
 
 fn default_db_path() -> String {
     "./data/atelier_kernel.db".to_string()
+}
+
+fn default_project_root() -> String {
+    "./data".to_string()
 }
 
 fn default_web_bind() -> String {
@@ -113,6 +120,10 @@ impl KernelBootConfig {
             let db_p = std::path::Path::new(&cfg.db_path);
             if db_p.is_relative() {
                 cfg.db_path = base_dir.join(db_p).to_string_lossy().to_string();
+            }
+            let root_p = std::path::Path::new(&cfg.project_root);
+            if root_p.is_relative() {
+                cfg.project_root = base_dir.join(root_p).to_string_lossy().to_string();
             }
             for spec in &mut cfg.domains {
                 match &spec.working_dir {

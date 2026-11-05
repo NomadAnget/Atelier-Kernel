@@ -807,8 +807,8 @@ impl DomainSupervisorInner {
         Ok((child, k2d_tx, d2k_rx))
     }
 
-    /// 命名端点版 spawn：内核 bind 端点 → spawn 域 → accept → 拆成读/写两半。
-    /// 端口由内核创建、域主动 connect，不再传 fd/HANDLE。
+    /// 命名端点版 spawn：两条单向管道，`in`（内核→域，域只读）、`out`（域→内核，域只写）。
+    /// 单向管道避免 Windows 上「同一句柄并发阻塞读 + 写」的串行化死锁。
     #[allow(dead_code)]
     fn spawn_child_endpoint(
         &self,
@@ -816,11 +816,14 @@ impl DomainSupervisorInner {
         spec: &DomainProcessSpec,
     ) -> Result<(Child, crate::endpoint::EndpointWriter, crate::endpoint::EndpointReader), SupervisorError>
     {
-        let path = crate::endpoint::endpoint_path(
-            domain_id,
-            &uuid::Uuid::new_v4().simple().to_string(),
-        );
-        let listener = crate::endpoint::bind(&path).map_err(|source| SupervisorError::SpawnFailed {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let in_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-in"));
+        let out_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-out"));
+        let in_listener = crate::endpoint::bind(&in_path).map_err(|source| SupervisorError::SpawnFailed {
+            domain: domain_id.to_string(),
+            source,
+        })?;
+        let out_listener = crate::endpoint::bind(&out_path).map_err(|source| SupervisorError::SpawnFailed {
             domain: domain_id.to_string(),
             source,
         })?;
@@ -833,7 +836,9 @@ impl DomainSupervisorInner {
                 .env_remove("ATELIER_IPC_READ_FD")
                 .env_remove("ATELIER_IPC_WRITE_FD")
                 .env_remove("ATELIER_IPC_HANDLE_MODE")
-                .env("ATELIER_IPC_PIPE", &path)
+                .env_remove("ATELIER_IPC_PIPE")
+                .env("ATELIER_IPC_IN", &in_path)
+                .env("ATELIER_IPC_OUT", &out_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -859,20 +864,24 @@ impl DomainSupervisorInner {
             source,
         })?;
 
-        let mut listener = listener;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name(format!("kernel-accept-{domain_id}"))
             .spawn(move || {
-                let _ = sender.send(listener.accept());
+                let mut in_listener = in_listener;
+                let mut out_listener = out_listener;
+                let result = in_listener
+                    .accept()
+                    .and_then(|in_stream| out_listener.accept().map(|out_stream| (in_stream, out_stream)));
+                let _ = sender.send(result);
             })
             .map_err(|source| SupervisorError::SpawnFailed {
                 domain: domain_id.to_string(),
                 source,
             })?;
 
-        let stream = match receiver.recv_timeout(Duration::from_secs(20)) {
-            Ok(Ok(stream)) => stream,
+        let (in_stream, out_stream) = match receiver.recv_timeout(Duration::from_secs(20)) {
+            Ok(Ok(pair)) => pair,
             Ok(Err(source)) => {
                 let _ = child.kill();
                 return Err(SupervisorError::SpawnFailed {
@@ -886,14 +895,16 @@ impl DomainSupervisorInner {
                     domain: domain_id.to_string(),
                     source: std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
-                        "domain did not connect to the IPC endpoint",
+                        "domain did not connect to the IPC endpoints",
                     ),
                 });
             }
         };
 
-        let (reader, writer) = stream.into_split();
-        Ok((child, writer, reader))
+        // in 管道：内核只写；out 管道：内核只读。
+        let (_in_reader, in_writer) = in_stream.into_split();
+        let (out_reader, _out_writer) = out_stream.into_split();
+        Ok((child, in_writer, out_reader))
     }
 
     fn launch(

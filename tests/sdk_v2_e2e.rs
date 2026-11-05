@@ -31,7 +31,7 @@ from atelier_sdk import AtelierDomain
 _trace.write("imported\n")
 
 domain = AtelierDomain("v2test")
-_trace.write("constructed pipe=" + str(domain._pipe) + "\n")
+_trace.write("constructed\n")
 
 @domain.handler("echo")
 async def echo(msg):

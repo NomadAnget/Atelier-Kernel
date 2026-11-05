@@ -47,17 +47,19 @@ class AtelierDomain:
         self._seq = 1
         self._lock = threading.Lock()
 
-        self._pipe = None
-        self._pipe_fd = None
+        self._read_pipe = None
+        self._write_pipe = None
         self._loop = None
         self._done = None
         self._closed = False
         self._read_thread = None
 
-        pipe_path = os.environ.pop("ATELIER_IPC_PIPE", None)
-        if pipe_path:
-            self._pipe = open(pipe_path, "r+b", buffering=0)
-            self._pipe_fd = self._pipe.fileno()
+        in_path = os.environ.pop("ATELIER_IPC_IN", None)
+        out_path = os.environ.pop("ATELIER_IPC_OUT", None)
+        if in_path and out_path:
+            # 两条单向管道：in（内核→域，只读）、out（域→内核，只写）。
+            self._read_pipe = open(in_path, "rb", buffering=0)
+            self._write_pipe = open(out_path, "wb", buffering=0)
 
     # ── 能力 2：注册处理器 ──────────────────────────────────────────────
     def handler(self, name):
@@ -397,8 +399,8 @@ class AtelierDomain:
 
     # ── 能力 1：生命周期 ──────────────────────────────────────────────
     async def run_async(self, *, on_start=None, on_close=None):
-        if self._pipe is None:
-            raise RuntimeError("IPC endpoint is not configured (ATELIER_IPC_PIPE)")
+        if self._read_pipe is None or self._write_pipe is None:
+            raise RuntimeError("IPC endpoints are not configured (ATELIER_IPC_IN / ATELIER_IPC_OUT)")
         self._loop = asyncio.get_running_loop()
         self._done = self._loop.create_future()
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -438,17 +440,17 @@ class AtelierDomain:
 
     # ── 传输 ──────────────────────────────────────────────────────────
     def _write(self, frame):
-        if self._closed or self._pipe is None:
+        if self._closed or self._write_pipe is None:
             return
         line = json.dumps(frame, ensure_ascii=False) + "\n"
         with self._lock:
-            os.write(self._pipe_fd, line.encode("utf-8"))
+            self._write_pipe.write(line.encode("utf-8"))
 
     def _read_loop(self):
         buffer = b""
         while not self._closed:
             try:
-                chunk = os.read(self._pipe_fd, 8192)
+                chunk = os.read(self._read_pipe.fileno(), 8192)
             except Exception:  # noqa: BLE001
                 break
             if not chunk:

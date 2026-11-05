@@ -435,9 +435,84 @@ fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {
-        "py" => scan_python_source(path, &source, depth, report),
-        "js" | "mjs" | "cjs" => scan_js_source(path, &source, depth, report),
+        "py" => {
+            scan_python_source(path, &source, depth, report);
+            scan_file_operations(path, &source, report);
+        }
+        "js" | "mjs" | "cjs" => {
+            scan_js_source(path, &source, depth, report);
+            scan_file_operations(path, &source, report);
+        }
         _ => {}
+    }
+}
+
+/// C4：业务域的文件操作必须显式使用 `vfs://` 虚拟命名空间前缀，
+/// 这样内核存储枢纽才能确定性接管，第三方库的文件操作也不会被误拦。
+fn scan_file_operations(path: &Path, source: &str, report: &mut ConstitutionReport) {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let patterns: &[&str] = if ext == "py" {
+        &[
+            "open(",
+            ".read_text(",
+            ".write_text(",
+            ".read_bytes(",
+            ".write_bytes(",
+            "os.remove(",
+            "os.unlink(",
+            "os.rename(",
+            "os.open(",
+        ]
+    } else {
+        &[
+            "fs.open(",
+            "fs.openSync(",
+            "fs.readFile(",
+            "fs.readFileSync(",
+            "fs.writeFile(",
+            "fs.writeFileSync(",
+            "fs.createReadStream(",
+            "fs.createWriteStream(",
+            "fs.rm(",
+            "fs.rmSync(",
+            "fs.unlink(",
+            "fs.unlinkSync(",
+            "fs.rename(",
+            "fs.renameSync(",
+        ]
+    };
+    for (idx, line) in source.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        for pat in patterns {
+            let Some(pos) = line.find(pat) else {
+                continue;
+            };
+            let after = line[pos + pat.len()..].trim_start();
+            let literal = if let Some(rest) = after.strip_prefix('"') {
+                rest.split('"').next()
+            } else if let Some(rest) = after.strip_prefix('\'') {
+                rest.split('\'').next()
+            } else {
+                None
+            };
+            // 只校验字符串字面量路径；变量路径无法静态判定，交给运行时前缀判定。
+            let Some(lit) = literal else {
+                continue;
+            };
+            if !lit.starts_with("vfs://") {
+                report.violations.push(ConstitutionViolation {
+                    rule: "C4".to_string(),
+                    location: format!("{}:{}", path.display(), line_no),
+                    detail: format!(
+                        "file operation `{pat}{lit}` must use the vfs:// virtual namespace (e.g. vfs://users/a.png) so the kernel storage hub can index it"
+                    ),
+                });
+            }
+        }
     }
 }
 

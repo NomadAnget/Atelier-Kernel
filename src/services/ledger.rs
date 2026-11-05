@@ -22,7 +22,7 @@ use crate::nucleus::{AuditRecord, Message, Nucleus};
 use crate::protocol::{
     ContractStatus, DeliveryPolicy, KernelMessage, MessageReceipt, now_millis, parse_target_address,
 };
-use crate::storage::{StorageError, verify_sqlite_table_columns};
+use crate::services::storage::{StorageError, verify_sqlite_table_columns};
 
 /// 权威活消息表（唯一表名，M7 检查用）。
 pub const KERNEL_LEDGER_TABLE: &str = "messages";

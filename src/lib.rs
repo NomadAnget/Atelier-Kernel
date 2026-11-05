@@ -10,7 +10,6 @@ pub mod outbox;
 pub mod protocol;
 pub mod router;
 pub mod routing;
-pub mod storage;
 pub mod supervisor;
 pub mod transport;
 pub mod web_frontend;
@@ -46,7 +45,7 @@ pub use protocol::{
     MessageReceipt, ObservationEvent, OutboundMessage,
 };
 pub use router::{CandidateEntry, DrainingEntry, KernelRouter};
-pub use storage::{DomainStorageEngine, StorageError, StoredRecord};
+pub use services::storage::{DomainStorageEngine, StorageError, StoredRecord};
 pub use supervisor::{
     DomainPipeClient, DomainProcessSpec, DomainSupervisor, DomainUpdateResult, KernelBootConfig,
     SupervisorError,

@@ -14,14 +14,14 @@ const MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const EVENT_BYTES: usize = 256 * 1024;
 const MEMORY_ITEMS: usize = 1024;
 
-pub(crate) fn initialize(conn: &Connection) -> Result<(), crate::storage::StorageError> {
+pub(crate) fn initialize(conn: &Connection) -> Result<(), crate::services::storage::StorageError> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS kernel_outbox (
         id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
         delivery_id TEXT, priority INTEGER NOT NULL, seq INTEGER NOT NULL DEFAULT 0, frame TEXT NOT NULL);
         ",
     )?;
-    crate::storage::verify_sqlite_table_columns(conn, "kernel_outbox", OUTBOX_COLUMNS)?;
+    crate::services::storage::verify_sqlite_table_columns(conn, "kernel_outbox", OUTBOX_COLUMNS)?;
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_kernel_outbox_channel ON kernel_outbox(channel,priority,seq,id);")?;
     Ok(())
 }
@@ -31,7 +31,7 @@ pub(crate) fn insert_frame(
     channel: &str,
     seq: u64,
     frame: &KernelToDomainFrame,
-) -> Result<(), crate::storage::StorageError> {
+) -> Result<(), crate::services::storage::StorageError> {
     let (_, lane) = classify(frame);
     let id = match frame {
         KernelToDomainFrame::Deliver(m) => Some(m.message_id.as_str()),

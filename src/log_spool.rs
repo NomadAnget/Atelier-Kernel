@@ -1,5 +1,5 @@
 //! Durable append buffer independent from the application's SQLite writer lock.
-use crate::{logging::LogRecord, storage::StorageError};
+use crate::{logging::LogRecord, services::storage::StorageError};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{
@@ -33,12 +33,12 @@ impl LogSpool {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
             CREATE TABLE IF NOT EXISTS log_spool_metadata(id INTEGER PRIMARY KEY,source_id TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS pending_logs(seq INTEGER PRIMARY KEY AUTOINCREMENT,record TEXT NOT NULL);")?;
-        crate::storage::verify_sqlite_table_columns(
+        crate::services::storage::verify_sqlite_table_columns(
             &db,
             "log_spool_metadata",
             &["id", "source_id"],
         )?;
-        crate::storage::verify_sqlite_table_columns(&db, "pending_logs", &["seq", "record"])?;
+        crate::services::storage::verify_sqlite_table_columns(&db, "pending_logs", &["seq", "record"])?;
         let existing: Option<String> = db
             .query_row(
                 "SELECT source_id FROM log_spool_metadata WHERE id=1",
@@ -61,7 +61,7 @@ impl LogSpool {
             [&source],
         )?;
         target.execute_batch("CREATE TABLE IF NOT EXISTS kernel_log_import(source_id TEXT PRIMARY KEY,last_seq INTEGER NOT NULL);")?;
-        crate::storage::verify_sqlite_table_columns(target, "kernel_log_import", CURSOR_COLUMNS)?;
+        crate::services::storage::verify_sqlite_table_columns(target, "kernel_log_import", CURSOR_COLUMNS)?;
         let imported: u64 = target
             .query_row(
                 "SELECT last_seq FROM kernel_log_import WHERE source_id=?1",

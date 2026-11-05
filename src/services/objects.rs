@@ -15,7 +15,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 
-use crate::storage::StorageError;
+use crate::services::storage::StorageError;
 
 const OBJECTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS objects(
   object_id TEXT PRIMARY KEY,owner TEXT NOT NULL,virtual_path TEXT NOT NULL,

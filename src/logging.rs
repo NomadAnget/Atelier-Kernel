@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::storage::StorageError;
+use crate::services::storage::StorageError;
 
 pub const LOGS_TABLE: &str = "hub_logs";
 

@@ -27,7 +27,7 @@ use crate::protocol::{
     MSG_UNSUBSCRIBE_NOTIFY, MSG_UNSUBSCRIBE_OBSERVER, MSG_UNSUBSCRIBE_TELEMETRY, MSG_UPDATE_DOMAIN,
     MessageReceipt, ObservationEvent, OutboundMessage, now_millis, parse_target_address,
 };
-use crate::storage::DomainStorageEngine;
+use crate::services::storage::DomainStorageEngine;
 
 /// Hard ceiling for one `QueryObserver` reply. The observer history itself approaches the
 /// 16 MiB IPC frame limit, so an unbounded `limit` turns a read into a transport failure.

@@ -1,4 +1,5 @@
 pub mod discipline;
+pub mod endpoint;
 pub mod frontend;
 pub mod ledger;
 mod log_spool;

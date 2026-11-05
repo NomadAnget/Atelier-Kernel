@@ -11,8 +11,11 @@ use serde_json::json;
 #[test]
 fn new_kernel_composes_end_to_end() {
     // C4：大文件走对象索引，不进消息
-    let mut hub = ObjectHub::new();
-    let obj = hub.register("engines", "/objects/video.bin".into(), b"large binary payload");
+    let mut hub = ObjectHub::new(std::env::temp_dir().join(format!(
+        "atelier-assembly-{}",
+        uuid::Uuid::new_v4()
+    )));
+    let obj = hub.allocate("engines", "objects/video.bin").unwrap();
 
     let mut tr = Transport::new();
     let mut routing = Routing::new();

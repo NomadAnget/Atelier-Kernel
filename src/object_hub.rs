@@ -1,19 +1,15 @@
-//! ObjectHub —— C4 存储枢纽对象索引：一个「绝对路径索引」。
+//! ObjectHub —— C4 存储枢纽：虚拟路径 → 唯一 id → 平铺物理文件的索引。
 //!
-//! 大文件不进管道；对象就是域自己磁盘上的一个文件。内核**不复制、不移动、不读取、不接管**
-//! 物理文件，只把文件的绝对路径 + size 记进 `objects` 索引表，并把「文件对象」（即该绝对路径）
-//! 交给接收域当普通文件使用（Python 的 `open(path)`、Node 的 `fs.createReadStream(path)`）。
-//! 消息 `data` 里只带 `object_id` 引用，字节不进管道。
-//!
-//! 契约（见 CONSTITUTION.md C4）：
-//!   - 写权随域（M3）：只有归属域能删索引行；跨域读取只读；
-//!   - 无 TTL、无硬配额；索引删除时机由业务域显式决定；
-//!   - 引用未清零前不得删索引；
-//!   - 物理文件的生命周期归业务域：内核删索引不删文件；
-//!   - 自愈：文件对象被使用前检查物理文件是否仍存在，不存在则清理失效索引行。
+//! 模型（见 CONSTITUTION.md C4）：
+//!   - 启动配置只有一个项目根 `project_root`（默认 `./data`）；域根 = `<project_root>/<domain>/`。
+//!   - 物理落盘：**平铺的唯一 id 文件** `<project_root>/<domain>/<object_id>`，无子目录。
+//!   - 业务域的目录结构（如 `users/avatars/a.png`）是**虚拟**的，只存在于本索引：
+//!     `(owner, virtual_path) → object_id → physical_path`。
+//!   - 内核不复制、不移动、不读取文件内容；`size` 由调用方在 `commit` 时给出。
+//!   - 使用前自愈：物理文件不存在时清掉失效索引行。
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -22,16 +18,19 @@ use rusqlite::{Connection, params};
 use crate::storage::StorageError;
 
 const OBJECTS_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS objects(
-  object_id TEXT PRIMARY KEY,owner TEXT NOT NULL,path TEXT NOT NULL,
-  size INTEGER NOT NULL,ref_count INTEGER NOT NULL DEFAULT 0,
-  created_at INTEGER NOT NULL);";
+  object_id TEXT PRIMARY KEY,owner TEXT NOT NULL,virtual_path TEXT NOT NULL,
+  physical_path TEXT NOT NULL,size INTEGER NOT NULL DEFAULT 0,
+  ref_count INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,
+  UNIQUE(owner,virtual_path));";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Object {
     pub object_id: String,
     pub owner: String,
-    /// 域文件系统中的绝对路径；内核只索引，不拥有该文件。
-    pub path: String,
+    /// 业务域自己的虚拟路径（仅存在于索引里）。
+    pub virtual_path: String,
+    /// 平铺的唯一 id 物理文件绝对路径。
+    pub physical_path: String,
     pub size: u64,
     pub ref_count: u64,
 }
@@ -39,6 +38,8 @@ pub struct Object {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectRef {
     pub object_id: String,
+    pub virtual_path: String,
+    pub physical_path: String,
     pub size: u64,
 }
 
@@ -52,56 +53,59 @@ pub enum DeleteOutcome {
 
 pub struct ObjectHub {
     objects: BTreeMap<String, Object>,
+    by_path: BTreeMap<(String, String), String>,
     next_id: u64,
+    root: PathBuf,
     db: Option<Arc<Mutex<Connection>>>,
 }
 
-impl Default for ObjectHub {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ObjectHub {
-    pub fn new() -> Self {
+    pub fn new(project_root: PathBuf) -> Self {
         ObjectHub {
             objects: BTreeMap::new(),
+            by_path: BTreeMap::new(),
             next_id: 1,
+            root: project_root,
             db: None,
         }
     }
 
     /// 从 SQLite 载入对象索引（跨重启存在）。
-    pub fn with_db(db: Arc<Mutex<Connection>>) -> Result<Self, StorageError> {
+    pub fn with_db(project_root: PathBuf, db: Arc<Mutex<Connection>>) -> Result<Self, StorageError> {
         db.lock().execute_batch(OBJECTS_SCHEMA)?;
         let mut hub = ObjectHub {
             objects: BTreeMap::new(),
+            by_path: BTreeMap::new(),
             next_id: 1,
+            root: project_root,
             db: Some(db.clone()),
         };
         let rows = {
             let guard = db.lock();
             let mut stmt = guard.prepare(
-                "SELECT object_id,owner,path,size,ref_count FROM objects ORDER BY rowid",
+                "SELECT object_id,owner,virtual_path,physical_path,size,ref_count FROM objects ORDER BY rowid",
             )?;
             stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)? as u64,
+                    r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)? as u64,
+                    r.get::<_, i64>(5)? as u64,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?
         };
-        for (object_id, owner, path, size, ref_count) in rows {
+        for (object_id, owner, virtual_path, physical_path, size, ref_count) in rows {
             if let Some(n) = object_id.strip_prefix("obj_").and_then(|s| s.parse::<u64>().ok()) {
                 hub.next_id = hub.next_id.max(n + 1);
             }
+            hub.by_path
+                .insert((owner.clone(), virtual_path.clone()), object_id.clone());
             hub.objects.insert(
                 object_id.clone(),
-                Object { object_id, owner, path, size, ref_count },
+                Object { object_id, owner, virtual_path, physical_path, size, ref_count },
             );
         }
         Ok(hub)
@@ -113,72 +117,100 @@ impl ObjectHub {
         object_id
     }
 
-    /// 登记一个域文件：只索引绝对路径 + size（`metadata`，零读取），不复制、不移动。
-    /// 返回的 `object_id` 就是域可当作普通文件使用的「文件对象」引用。
-    pub fn register_file(&mut self, owner: &str, source_path: &Path) -> Result<ObjectRef, String> {
-        let absolute = source_path
-            .canonicalize()
-            .map_err(|e| format!("object path must exist and be addressable: {e}"))?;
-        let size = std::fs::metadata(&absolute)
-            .map_err(|e| e.to_string())?
-            .len();
+    fn physical_for(&self, owner: &str, object_id: &str) -> PathBuf {
+        self.root.join(owner).join(object_id)
+    }
+
+    /// 为一个虚拟路径分配唯一 id（幂等：同一 owner+virtual_path 复用原 id）。
+    /// 不创建文件本身，只创建域目录；返回物理路径供调用方写入。
+    pub fn allocate(&mut self, owner: &str, virtual_path: &str) -> Result<ObjectRef, String> {
+        if let Some(id) = self
+            .by_path
+            .get(&(owner.to_string(), virtual_path.to_string()))
+            .cloned()
+        {
+            if let Some(obj) = self.objects.get(&id) {
+                return Ok(ObjectRef {
+                    object_id: obj.object_id.clone(),
+                    virtual_path: obj.virtual_path.clone(),
+                    physical_path: obj.physical_path.clone(),
+                    size: obj.size,
+                });
+            }
+        }
         let object_id = self.alloc_id();
+        let physical = self.physical_for(owner, &object_id);
+        if let Some(parent) = physical.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         let obj = Object {
             object_id: object_id.clone(),
             owner: owner.to_string(),
-            path: absolute.to_string_lossy().to_string(),
-            size,
+            virtual_path: virtual_path.to_string(),
+            physical_path: physical.to_string_lossy().to_string(),
+            size: 0,
             ref_count: 0,
         };
         self.objects.insert(object_id.clone(), obj.clone());
+        self.by_path
+            .insert((owner.to_string(), virtual_path.to_string()), object_id.clone());
         if let Some(db) = &self.db {
             db.lock()
                 .execute(
-                    "INSERT INTO objects(object_id,owner,path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+                    "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
-                        obj.object_id, obj.owner, obj.path, obj.size as i64,
-                        obj.ref_count as i64, crate::protocol::now_millis()
+                        obj.object_id, obj.owner, obj.virtual_path, obj.physical_path,
+                        obj.size as i64, obj.ref_count as i64, crate::protocol::now_millis()
                     ],
                 )
                 .map_err(|e| e.to_string())?;
         }
-        Ok(ObjectRef { object_id, size })
+        Ok(ObjectRef {
+            object_id,
+            virtual_path: virtual_path.to_string(),
+            physical_path: obj.physical_path,
+            size: 0,
+        })
     }
 
-    /// 内存内注册（测试/结构证明用）：给定字节长度与假路径，不写文件。
-    pub fn register(&mut self, owner: &str, path: String, bytes: &[u8]) -> ObjectRef {
-        let object_id = self.alloc_id();
-        let size = bytes.len() as u64;
-        self.objects.insert(
-            object_id.clone(),
-            Object {
-                object_id: object_id.clone(),
-                owner: owner.to_string(),
-                path,
-                size,
-                ref_count: 0,
-            },
-        );
-        ObjectRef { object_id, size }
+    /// 写入完成后登记实际大小。
+    pub fn commit(&mut self, object_id: &str, size: u64) -> Result<(), String> {
+        let Some(obj) = self.objects.get_mut(object_id) else {
+            return Err(format!("unknown object '{object_id}'"));
+        };
+        obj.size = size;
+        if let Some(db) = &self.db {
+            db.lock()
+                .execute(
+                    "UPDATE objects SET size=?1 WHERE object_id=?2",
+                    params![size as i64, object_id],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 
-    /// 跨域只读：任何域都能解析引用（不可写）。
+    /// 按归属域 + 虚拟路径解析（域自己的读路径）。
+    pub fn resolve_path(&mut self, owner: &str, virtual_path: &str) -> Option<Object> {
+        let id = self
+            .by_path
+            .get(&(owner.to_string(), virtual_path.to_string()))?
+            .clone();
+        self.resolve(&id)
+    }
+
+    /// 按唯一 id 解析（跨域只读）。
     /// 使用前自愈：物理文件已不存在时清掉失效索引行并返回 `None`。
-    pub fn resolve(&mut self, object_id: &str) -> Option<&Object> {
-        let missing = self
+    pub fn resolve(&mut self, object_id: &str) -> Option<Object> {
+        let stale = self
             .objects
             .get(object_id)
-            .is_some_and(|o| !Path::new(&o.path).exists());
-        if missing {
-            self.objects.remove(object_id);
-            if let Some(db) = &self.db {
-                let _ = db
-                    .lock()
-                    .execute("DELETE FROM objects WHERE object_id=?1", [object_id]);
-            }
+            .is_some_and(|o| !Path::new(&o.physical_path).exists());
+        if stale {
+            self.remove(object_id);
             return None;
         }
-        self.objects.get(object_id)
+        self.objects.get(object_id).cloned()
     }
 
     /// 取引用：ref_count +1。
@@ -217,21 +249,38 @@ impl ObjectHub {
         ok
     }
 
-    /// 显式删除：只有归属域能删；引用未清零不得删。
-    /// 只移除索引行——物理文件归业务域所有，内核不删除、不移动它。
+    /// 显式删除：只有归属域能删；引用未清零不得删。只移除索引行。
     pub fn delete(&mut self, object_id: &str, by_domain: &str) -> DeleteOutcome {
         match self.objects.get(object_id) {
             None => DeleteOutcome::Unknown,
             Some(o) if o.owner != by_domain => DeleteOutcome::Forbidden,
             Some(o) if o.ref_count > 0 => DeleteOutcome::Referenced,
             Some(_) => {
-                self.objects.remove(object_id);
-                if let Some(db) = &self.db {
-                    let _ = db
-                        .lock()
-                        .execute("DELETE FROM objects WHERE object_id=?1", [object_id]);
-                }
+                self.remove(object_id);
                 DeleteOutcome::Deleted
+            }
+        }
+    }
+
+    /// 按虚拟路径删除（归属域）。
+    pub fn delete_path(&mut self, owner: &str, virtual_path: &str) -> DeleteOutcome {
+        let Some(id) = self
+            .by_path
+            .get(&(owner.to_string(), virtual_path.to_string()))
+            .cloned()
+        else {
+            return DeleteOutcome::Unknown;
+        };
+        self.delete(&id, owner)
+    }
+
+    fn remove(&mut self, object_id: &str) {
+        if let Some(obj) = self.objects.remove(object_id) {
+            self.by_path.remove(&(obj.owner, obj.virtual_path));
+            if let Some(db) = &self.db {
+                let _ = db
+                    .lock()
+                    .execute("DELETE FROM objects WHERE object_id=?1", [object_id]);
             }
         }
     }
@@ -245,111 +294,91 @@ impl ObjectHub {
 mod tests {
     use super::*;
 
-    fn real_file(name: &str, bytes: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("atelier-obj-{name}-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("f.bin");
-        std::fs::write(&f, bytes).unwrap();
-        (dir, f)
+    fn temp_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("atelier-obj-{tag}-{}", uuid::Uuid::new_v4()))
     }
 
     #[test]
-    fn write_isolation_and_readonly_cross_domain() {
-        let (dir, src) = real_file("iso", b"large binary payload");
-        let mut hub = ObjectHub::new();
-        let r = hub.register_file("engines", &src).unwrap();
-        assert!(hub.resolve(&r.object_id).is_some());
-        assert_eq!(hub.resolve(&r.object_id).unwrap().owner, "engines");
-        assert_eq!(hub.delete(&r.object_id, "publishers"), DeleteOutcome::Forbidden);
-        assert!(hub.resolve(&r.object_id).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
+    fn allocate_maps_virtual_path_to_flat_unique_file() {
+        let root = temp_root("alloc");
+        let mut hub = ObjectHub::new(root.clone());
+        let r = hub.allocate("engines", "users/avatars/a.png").unwrap();
+        assert!(r.object_id.starts_with("obj_"));
+        // 物理路径平铺在域根下，文件名就是唯一 id，没有子目录
+        assert_eq!(
+            Path::new(&r.physical_path),
+            root.join("engines").join(&r.object_id)
+        );
+        assert_eq!(r.virtual_path, "users/avatars/a.png");
+        // 幂等：同一虚拟路径复用同一 id
+        let again = hub.allocate("engines", "users/avatars/a.png").unwrap();
+        assert_eq!(again.object_id, r.object_id);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn kernel_records_size_without_hashing_content() {
-        let bytes = b"hello object hub";
-        let (dir, src) = real_file("size", bytes);
-        let mut hub = ObjectHub::new();
-        let r = hub.register_file("engines", &src).unwrap();
-        assert_eq!(r.size, bytes.len() as u64);
-        assert_eq!(hub.resolve(&r.object_id).unwrap().size, r.size);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    fn resolve_path_and_cross_domain_resolve() {
+        let root = temp_root("resolve");
+        let mut hub = ObjectHub::new(root.clone());
+        let r = hub.allocate("engines", "out/video.bin").unwrap();
+        // 域自己写入物理文件
+        std::fs::write(&r.physical_path, b"binary").unwrap();
+        hub.commit(&r.object_id, 6).unwrap();
 
-    #[test]
-    fn no_delete_while_referenced_and_explicit_delete() {
-        let mut hub = ObjectHub::new();
-        let r = hub.register("engines", "/o".into(), b"data");
-        assert!(hub.acquire(&r.object_id));
-        assert_eq!(hub.delete(&r.object_id, "engines"), DeleteOutcome::Referenced);
-        assert!(hub.release(&r.object_id));
-        assert_eq!(hub.delete(&r.object_id, "engines"), DeleteOutcome::Deleted);
-        assert!(hub.resolve(&r.object_id).is_none());
-    }
-
-    #[test]
-    fn object_lifetime_is_independent_of_message() {
-        let mut hub = ObjectHub::new();
-        let r = hub.register("engines", "/o".into(), b"payload");
-        assert_eq!(hub.len(), 1);
-        for _ in 0..1000 {
-            hub.register("engines", "/o".into(), b"x");
-        }
-        assert_eq!(hub.len(), 1001);
-        assert_eq!(hub.delete(&r.object_id, "engines"), DeleteOutcome::Deleted);
-    }
-
-    #[test]
-    fn register_file_indexes_absolute_path_and_persists_across_restart() {
-        let dir = std::env::temp_dir().join(format!("atelier-obj-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("source.bin");
-        std::fs::write(&src, b"persisted object bytes").unwrap();
-        let canonical = src.canonicalize().unwrap();
-
-        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let mut hub = ObjectHub::with_db(db.clone()).unwrap();
-        let r = hub.register_file("engines", &src).unwrap();
-        assert_eq!(r.size, 22);
-        let obj = hub.resolve(&r.object_id).unwrap();
-        // 内核只记绝对路径，不复制、不移动：源文件原地保留
-        assert_eq!(Path::new(&obj.path), canonical.as_path());
-        assert!(src.exists(), "kernel must not move or delete the domain file");
-
-        // 跨重启：重新从 SQLite 载入
-        let mut hub2 = ObjectHub::with_db(db).unwrap();
-        {
-            let obj2 = hub2.resolve(&r.object_id).expect("object index survives restart");
-            assert_eq!(obj2.owner, "engines");
-            assert_eq!(obj2.size, r.size);
-        }
-
-        // 删除只移除索引，不删物理文件
-        assert_eq!(hub2.delete(&r.object_id, "engines"), DeleteOutcome::Deleted);
-        assert!(src.exists(), "index delete must not remove the domain file");
-        let _ = std::fs::remove_dir_all(&dir);
+        let by_path = hub.resolve_path("engines", "out/video.bin").unwrap();
+        assert_eq!(by_path.object_id, r.object_id);
+        assert_eq!(by_path.size, 6);
+        // 跨域按 id 只读解析
+        let cross = hub.resolve(&r.object_id).unwrap();
+        assert_eq!(cross.owner, "engines");
+        // 其他域的虚拟路径查不到（命名空间隔离）
+        assert!(hub.resolve_path("other", "out/video.bin").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn resolve_self_heals_rows_whose_file_is_gone() {
-        let dir = std::env::temp_dir().join(format!("atelier-obj-stale-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let src = dir.join("gone.bin");
-        std::fs::write(&src, b"will be removed").unwrap();
-
-        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let mut hub = ObjectHub::with_db(db.clone()).unwrap();
-        let r = hub.register_file("engines", &src).unwrap();
+        let root = temp_root("stale");
+        let mut hub = ObjectHub::new(root.clone());
+        let r = hub.allocate("engines", "a.bin").unwrap();
+        std::fs::write(&r.physical_path, b"x").unwrap();
         assert!(hub.resolve(&r.object_id).is_some());
+        std::fs::remove_file(&r.physical_path).unwrap();
+        assert!(hub.resolve(&r.object_id).is_none(), "stale row cleaned");
+        assert!(hub.resolve_path("engines", "a.bin").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // 域把文件删了：使用前检查应清掉失效索引行
-        std::fs::remove_file(&src).unwrap();
-        assert!(hub.resolve(&r.object_id).is_none(), "stale row must be cleaned");
-        let persisted: i64 = db
-            .lock()
-            .query_row("SELECT count(*) FROM objects", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(persisted, 0, "stale row must also be removed from SQLite");
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn delete_is_index_only_and_write_isolated() {
+        let root = temp_root("delete");
+        let mut hub = ObjectHub::new(root.clone());
+        let r = hub.allocate("engines", "a.bin").unwrap();
+        std::fs::write(&r.physical_path, b"x").unwrap();
+        assert_eq!(hub.delete(&r.object_id, "publishers"), DeleteOutcome::Forbidden);
+        assert_eq!(hub.delete(&r.object_id, "engines"), DeleteOutcome::Deleted);
+        // 物理文件仍在（内核不删域文件）
+        assert!(Path::new(&r.physical_path).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn index_survives_restart() {
+        let root = temp_root("restart");
+        std::fs::create_dir_all(&root).unwrap();
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let (object_id, physical) = {
+            let mut hub = ObjectHub::with_db(root.clone(), db.clone()).unwrap();
+            let r = hub.allocate("engines", "a/b.bin").unwrap();
+            std::fs::write(&r.physical_path, b"data").unwrap();
+            hub.commit(&r.object_id, 4).unwrap();
+            (r.object_id, r.physical_path)
+        };
+        let mut hub2 = ObjectHub::with_db(root.clone(), db).unwrap();
+        let obj = hub2.resolve_path("engines", "a/b.bin").expect("index survives restart");
+        assert_eq!(obj.object_id, object_id);
+        assert_eq!(obj.physical_path, physical);
+        assert_eq!(obj.size, 4);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

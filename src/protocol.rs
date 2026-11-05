@@ -68,6 +68,7 @@ pub const MSG_STORAGE_DELETE: &str = "StorageDelete";
 
 /// C4 存储枢纽对象接口消息类型（大文件不进管道，域只拿 object_id）。
 pub const MSG_STORAGE_OBJECT_PUT: &str = "StorageObjectPut";
+pub const MSG_STORAGE_OBJECT_COMMIT: &str = "StorageObjectCommit";
 pub const MSG_STORAGE_OBJECT_GET: &str = "StorageObjectGet";
 pub const MSG_STORAGE_OBJECT_DELETE: &str = "StorageObjectDelete";
 

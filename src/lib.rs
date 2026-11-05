@@ -38,8 +38,8 @@ pub use protocol::{
     MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_QUERY_DOMAIN_ASSEMBLY, MSG_QUERY_HANDLERS,
     MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
-    MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET,
-    MSG_STORAGE_OBJECT_PUT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
+    MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_OBJECT_COMMIT, MSG_STORAGE_OBJECT_DELETE,
+    MSG_STORAGE_OBJECT_GET, MSG_STORAGE_OBJECT_PUT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
@@ -77,7 +77,9 @@ impl AtelierKernel {
         let ledger = Arc::new(KernelLedger::open_with_db(None)?);
         let storage = Arc::new(DomainStorageEngine::new_in_memory()?);
         let logger = Arc::new(KernelLogHub::new(None)?);
-        let object_hub = Arc::new(Mutex::new(ObjectHub::new()));
+        let project_root = std::env::temp_dir()
+            .join(format!("atelier-files-{}", uuid::Uuid::new_v4()));
+        let object_hub = Arc::new(Mutex::new(ObjectHub::new(project_root)));
         Ok(Self::from_components(ledger, storage, logger, object_hub))
     }
 
@@ -87,7 +89,13 @@ impl AtelierKernel {
         let path = ledger.database_path().expect("file-backed database path");
         let storage = Arc::new(DomainStorageEngine::open_file(&path)?);
         let logger = Arc::new(KernelLogHub::new(Some(&path))?);
+        // 项目根默认取数据库所在目录（db_path 默认 ./data/atelier_kernel.db → ./data）。
+        let project_root = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
         let object_hub = Arc::new(Mutex::new(ObjectHub::with_db(
+            project_root,
             ledger.db_conn.as_ref().unwrap().clone(),
         )?));
         Ok(Self::from_components(ledger, storage, logger, object_hub))

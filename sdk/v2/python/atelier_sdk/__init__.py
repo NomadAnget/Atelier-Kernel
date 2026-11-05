@@ -434,9 +434,6 @@ class AtelierDomain:
                 if asyncio.iscoroutine(result):
                     await result
 
-    def run(self, **kwargs):
-        asyncio.run(self.run_async(**kwargs))
-
     def shutdown(self):
         self._closed = True
         if self._done is not None and not self._done.done() and self._loop is not None:

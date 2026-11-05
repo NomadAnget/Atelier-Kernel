@@ -54,9 +54,9 @@ async def storage_handler(msg):
     query = await domain.storage_query(record_id=record_id)
     return {"rows": len(query.get("items") or []), "count": query.get("count")}
 
-domain.run()
+import asyncio
+asyncio.run(domain.run_async())
 "#;
-
 #[test]
 fn sdk_v2_round_trip() {
     let v2 = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/v2/python");

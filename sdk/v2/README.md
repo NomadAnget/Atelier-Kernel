@@ -45,7 +45,7 @@
 
 | # | 能力 | Python | Node |
 |---|---|---|---|
-| 1 | 生命周期 | `run` / `run_async` / `shutdown` | `run` / `runAsync` / `shutdown` |
+| 1 | 生命周期 | `run_async` / `shutdown` | `run` / `runAsync` / `shutdown` |
 | 2 | 注册处理器 | `handler(name)` | `handler(name)` |
 | 3 | 发消息 | `send` | `send` |
 | 4 | 请求-响应 | `request` | `request` |

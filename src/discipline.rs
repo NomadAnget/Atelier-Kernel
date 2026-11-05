@@ -620,11 +620,15 @@ fn scan_python_source(path: &Path, source: &str, depth: usize, report: &mut Cons
     // 2. M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code
     for (idx, raw_line) in source.lines().enumerate() {
         let line_no = idx + 1;
-        if raw_line.contains("ATELIER_IPC_READ_FD") || raw_line.contains("ATELIER_IPC_WRITE_FD") {
+        if raw_line.contains("ATELIER_IPC_READ_FD")
+            || raw_line.contains("ATELIER_IPC_WRITE_FD")
+            || raw_line.contains("ATELIER_IPC_IN")
+            || raw_line.contains("ATELIER_IPC_OUT")
+        {
             report.violations.push(ConstitutionViolation {
                 rule: "M5".to_string(),
                 location: format!("{}:{}", path.display(), line_no),
-                detail: "direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD in domain code is forbidden; use AtelierDomain SDK".to_string(),
+                detail: "direct manipulation of the dedicated IPC endpoints (ATELIER_IPC_IN / ATELIER_IPC_OUT) in domain code is forbidden; use the AtelierDomain SDK".to_string(),
             });
         }
     }
@@ -731,12 +735,16 @@ fn scan_js_source(path: &Path, source: &str, depth: usize, report: &mut Constitu
             }
         }
 
-        // M5: Forbid direct manipulation of dedicated IPC pipe descriptors in business domain code
-        if trimmed.contains("ATELIER_IPC_READ_FD") || trimmed.contains("ATELIER_IPC_WRITE_FD") {
+        // M5: Forbid direct manipulation of the dedicated IPC endpoints in business domain code
+        if trimmed.contains("ATELIER_IPC_READ_FD")
+            || trimmed.contains("ATELIER_IPC_WRITE_FD")
+            || trimmed.contains("ATELIER_IPC_IN")
+            || trimmed.contains("ATELIER_IPC_OUT")
+        {
             report.violations.push(ConstitutionViolation {
                 rule: "M5".to_string(),
                 location,
-                detail: "direct manipulation of ATELIER_IPC_READ_FD / ATELIER_IPC_WRITE_FD in domain code is forbidden; use AtelierDomain SDK".to_string(),
+                detail: "direct manipulation of the dedicated IPC endpoints (ATELIER_IPC_IN / ATELIER_IPC_OUT) in domain code is forbidden; use the AtelierDomain SDK".to_string(),
             });
         }
     }

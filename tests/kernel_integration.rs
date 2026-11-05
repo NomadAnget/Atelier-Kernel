@@ -14,16 +14,8 @@ fn python_cmd() -> &'static str {
 
 const PY_IPC_PREAMBLE: &str = r#"
 import json, os, sys, time
-r_val = int(os.environ["ATELIER_IPC_READ_FD"])
-w_val = int(os.environ["ATELIER_IPC_WRITE_FD"])
-if os.name == "nt" and os.environ.get("ATELIER_IPC_HANDLE_MODE") in ("win32", "win32_handle"):
-    import msvcrt
-    r_fd = msvcrt.open_osfhandle(r_val, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    w_fd = msvcrt.open_osfhandle(w_val, os.O_WRONLY | getattr(os, "O_BINARY", 0))
-else:
-    r_fd, w_fd = r_val, w_val
-ipc_in = os.fdopen(r_fd, "r", encoding="utf-8", buffering=1, closefd=False)
-ipc_out = os.fdopen(w_fd, "w", encoding="utf-8", buffering=1, closefd=False)
+ipc_in = open(os.environ["ATELIER_IPC_IN"], "r", encoding="utf-8", newline="\n")
+ipc_out = open(os.environ["ATELIER_IPC_OUT"], "w", encoding="utf-8", newline="\n")
 "#;
 
 #[test]
@@ -967,7 +959,7 @@ fn test_auto_restart_respects_max_restarts_limit() {
         domain_id: "doomed_domain".to_string(),
         command: python_cmd().to_string(),
         args: vec!["-c".into(),
-            "import sys,time; f=open(sys.argv[1],'a'); f.write('start\\n'); f.close(); time.sleep(0.12); sys.exit(1)".into(),
+            "import sys,time,os; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); f=open(sys.argv[1],'a'); f.write('start\\n'); f.close(); time.sleep(0.12); sys.exit(1)".into(),
             starts.to_string_lossy().into_owned()],
         working_dir: None,
         env: Default::default(),

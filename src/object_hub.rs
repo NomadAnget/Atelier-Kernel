@@ -173,6 +173,79 @@ impl ObjectHub {
         })
     }
 
+    /// 方案 A：SDK 已写入平铺文件、自带全局唯一 object_id，这里只登记映射。
+    /// 同一 virtual_path 已存在时复用原 id（覆盖语义，更新 size）。
+    pub fn register_external(
+        &mut self,
+        owner: &str,
+        virtual_path: &str,
+        object_id: &str,
+        size: u64,
+    ) -> Result<ObjectRef, String> {
+        if let Some(existing) = self
+            .by_path
+            .get(&(owner.to_string(), virtual_path.to_string()))
+            .cloned()
+        {
+            if let Some(obj) = self.objects.get_mut(&existing) {
+                obj.size = size;
+                if let Some(db) = &self.db {
+                    let _ = db.lock().execute(
+                        "UPDATE objects SET size=?1 WHERE object_id=?2",
+                        params![size as i64, existing],
+                    );
+                }
+                return Ok(ObjectRef {
+                    object_id: obj.object_id.clone(),
+                    virtual_path: obj.virtual_path.clone(),
+                    physical_path: obj.physical_path.clone(),
+                    size,
+                });
+            }
+        }
+        let physical = self.physical_for(owner, object_id);
+        if let Some(parent) = physical.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let obj = Object {
+            object_id: object_id.to_string(),
+            owner: owner.to_string(),
+            virtual_path: virtual_path.to_string(),
+            physical_path: physical.to_string_lossy().to_string(),
+            size,
+            ref_count: 0,
+        };
+        self.objects.insert(object_id.to_string(), obj.clone());
+        self.by_path
+            .insert((owner.to_string(), virtual_path.to_string()), object_id.to_string());
+        if let Some(db) = &self.db {
+            db.lock()
+                .execute(
+                    "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    params![
+                        obj.object_id, obj.owner, obj.virtual_path, obj.physical_path,
+                        obj.size as i64, obj.ref_count as i64, crate::protocol::now_millis()
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(ObjectRef {
+            object_id: object_id.to_string(),
+            virtual_path: virtual_path.to_string(),
+            physical_path: obj.physical_path,
+            size,
+        })
+    }
+
+    /// 列出某域的全部对象（SDK 启动时拉一次做本地缓存）。
+    pub fn list_owner(&self, owner: &str) -> Vec<Object> {
+        self.objects
+            .values()
+            .filter(|o| o.owner == owner)
+            .cloned()
+            .collect()
+    }
+
     /// 写入完成后登记实际大小。
     pub fn commit(&mut self, object_id: &str, size: u64) -> Result<(), String> {
         let Some(obj) = self.objects.get_mut(object_id) else {

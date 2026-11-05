@@ -71,6 +71,7 @@ pub const MSG_STORAGE_OBJECT_PUT: &str = "StorageObjectPut";
 pub const MSG_STORAGE_OBJECT_COMMIT: &str = "StorageObjectCommit";
 pub const MSG_STORAGE_OBJECT_GET: &str = "StorageObjectGet";
 pub const MSG_STORAGE_OBJECT_DELETE: &str = "StorageObjectDelete";
+pub const MSG_STORAGE_OBJECT_LIST: &str = "StorageObjectList";
 
 /// Built-in domain message delivery persistence / QoS types.
 pub const MSG_DELIVERY_DURABLE: &str = "Durable";

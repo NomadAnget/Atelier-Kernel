@@ -762,6 +762,29 @@ class AtelierDomain(AsyncRuntime):
             data={},
         )
 
+    def enable_file_interception(self, root: Optional[str] = None):
+        """Installs the C4 virtual file namespace (C4).
+
+        After this, plain `open("users/a.png", "w")` writes a flat unique-id file under the
+        domain root and registers the virtual path with the kernel; reads resolve via the
+        local index cache. Developers keep using native file handles.
+        """
+        from ._files import install
+
+        base = root or os.environ.get("ATELIER_FILES_ROOT") or "."
+        self._file_namespace = install(base, self._submit)
+        return self._file_namespace
+
+    async def refresh_file_index(self, timeout: float = 30):
+        """Pulls this domain's object index from the kernel into the local read cache (C4)."""
+        result = (
+            await self.request("kernel.storage", "StorageObjectList", {}, {}, timeout)
+        )["data"]
+        namespace = getattr(self, "_file_namespace", None)
+        if namespace is not None:
+            namespace.load_index(result.get("objects") or [])
+        return result
+
     async def query_logs(
         self,
         domain: Optional[str] = None,

@@ -19,7 +19,8 @@ use crate::protocol::{
     KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_DOMAIN_ASSEMBLY,
     MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
-    MSG_STORAGE_OBJECT_COMMIT, MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET, MSG_STORAGE_OBJECT_PUT,
+    MSG_STORAGE_OBJECT_COMMIT, MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET,
+    MSG_STORAGE_OBJECT_LIST, MSG_STORAGE_OBJECT_PUT,
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
@@ -1452,7 +1453,16 @@ impl KernelRouter {
                     );
                     return;
                 };
-                match self.object_hub.lock().allocate(source_domain, virtual_path) {
+                let external_id = msg.params.get("object_id").and_then(Value::as_str);
+                let size = msg.params.get("size").and_then(Value::as_u64).unwrap_or(0);
+                let result = {
+                    let mut hub = self.object_hub.lock();
+                    match external_id {
+                        Some(id) => hub.register_external(source_domain, virtual_path, id, size),
+                        None => hub.allocate(source_domain, virtual_path),
+                    }
+                };
+                match result {
                     Ok(obj_ref) => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
@@ -1468,7 +1478,7 @@ impl KernelRouter {
                         source_domain,
                         msg,
                         ContractStatus::ExecutionFailed,
-                        Some(json!({"error": "object_allocate_failed", "reason": e})),
+                        Some(json!({"error": "object_register_failed", "reason": e})),
                     ),
                 }
             }
@@ -1568,6 +1578,28 @@ impl KernelRouter {
                         Some(json!({"error": "object_referenced"})),
                     ),
                 }
+            }
+            MSG_STORAGE_OBJECT_LIST => {
+                let objects: Vec<_> = self
+                    .object_hub
+                    .lock()
+                    .list_owner(source_domain)
+                    .into_iter()
+                    .map(|o| {
+                        json!({
+                            "object_id": o.object_id,
+                            "virtual_path": o.virtual_path,
+                            "physical_path": o.physical_path,
+                            "size": o.size,
+                        })
+                    })
+                    .collect();
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::Completed,
+                    Some(json!({"objects": objects})),
+                );
             }
             _ => match self.storage.execute_message(msg) {
                 Ok(result_data) => {

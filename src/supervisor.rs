@@ -537,14 +537,7 @@ impl ManagedProcess {
 
     fn terminate(&mut self) {
         // Observe natural exit before any administrative kill; cleanup is not the cause.
-        // A pipe EOF can precede the OS process exit, so give the natural exit a brief
-        // window before attributing the exit to our own kill.
-        for _ in 0..10 {
-            if self.observe_exit() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
+        self.observe_exit();
         self.stop.store(true, Ordering::Release);
         self.output.close();
         #[cfg(windows)]

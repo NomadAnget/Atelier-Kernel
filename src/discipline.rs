@@ -446,6 +446,42 @@ fn is_test_source(path: &Path, file_name: &str) -> bool {
     })
 }
 
+/// 读取域根下的 `.atelier-c4-native` 声明式豁免清单（每行一个路径模式，`#` 注释）。
+fn native_manifest(domain_root: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(domain_root.join(".atelier-c4-native")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.trim_start_matches("./").to_string())
+        .collect()
+}
+
+/// 支持 `dir/**`（目录前缀）、`*`（子串通配）与精确相对路径。
+fn matches_native(pattern: &str, relative: &str) -> bool {
+    if let Some(dir) = pattern.strip_suffix("/**") {
+        return relative == dir || relative.starts_with(&format!("{dir}/"));
+    }
+    if pattern.contains('*') {
+        let mut cursor = 0;
+        for (index, part) in pattern.split('*').enumerate() {
+            if part.is_empty() {
+                continue;
+            }
+            let Some(found) = relative[cursor..].find(part) else {
+                return false;
+            };
+            if index == 0 && found != 0 {
+                return false;
+            }
+            cursor += found + part.len();
+        }
+        return true;
+    }
+    relative == pattern
+}
+
 fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return;
@@ -464,6 +500,19 @@ fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
 
     let domain_root = find_domain_root(path);
     let depth = compute_directory_depth(path, &domain_root);
+
+    // 域级声明式豁免：每个域在 `.atelier-c4-native` 里集中声明原生资产/工具路径。
+    let relative = path
+        .strip_prefix(&domain_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
+    if native_manifest(&domain_root)
+        .iter()
+        .any(|pattern| matches_native(pattern, &relative))
+    {
+        return;
+    }
 
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     match ext {

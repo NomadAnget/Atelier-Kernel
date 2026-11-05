@@ -133,16 +133,12 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 ## 6. 已知必须保留的语义（不可因收敛而丢）
 
 - **Durable 重放**：`receipts_for_*` 在终态后仍能从 `audit` 读回结果；
-- **磁盘无关的故障收敛**：死域在途消息收敛靠 `messages` 的活行（含 Durable 活行在磁盘，读失败时用内存缓存的最小元数据兜底——见 §7）；
+- **磁盘无关的故障收敛（已定案 §7=A）**：放弃磁盘无关兜底——磁盘坏时死域 Durable 在途消息留在 `execution_outcome: unknown`，不强行收敛，不维护常驻第二真相源；
 - **跨代际隔离**：`origin`/`channel` 绑定随 `messages` 活行，代际退役即清；
 - **`source` 去重键 ≠ `source_domain` 域 id**：这是上次 M3 踩的坑，新结构里 `submissions.dedup_key` 与 `messages.source_domain` 显式分列，不再混用。
 
-## 7. 磁盘无关兜底的取舍（需你拍板）
+## 7. 磁盘无关兜底（已定案 A）
 
-`fail_inflight_for_channel` 的注释要求"即使磁盘不可用也能关死代际"。旧结构靠 `identities.record` 内存缓存兜底；新结构里 Durable 活行在磁盘，磁盘坏了就读不到。
-
-两个选择：
-- **A（简单）**：放弃磁盘无关兜底——磁盘坏时死域 Durable 在途消息留在 `execution_outcome: unknown`，不强行收敛（宪法允许"执行结果可能未知"）；
-- **B（保留）**：在内存里为每个 Durable 活行缓存一行最小元数据（status/target/source_domain，不含 payload）——这仍是一份"第二真相源"，但只有三个字段，且只服务于故障收敛这一个场景。
+`fail_inflight_for_channel` 的旧注释要求"即使磁盘不可用也能关死代际"，旧结构靠 `identities.record` 内存缓存兜底。**已定案 A**：放弃磁盘无关兜底——磁盘坏时死域 Durable 在途消息留在 `execution_outcome: unknown`，不强行收敛。依据宪法 C3:48"无法持久化的失败反馈仅为当前进程中的明确失败，不伪称其本身已有跨重启持久保证"；不为极端故障维护常驻第二真相源。
 
 我建议 **A**：宪法 C3:48 已经写死"无法持久化的失败反馈仅为当前进程中的明确失败，不伪称其本身已有跨重启持久保证"，磁盘坏属于极端场景，不该为它维护常驻第二真相源。

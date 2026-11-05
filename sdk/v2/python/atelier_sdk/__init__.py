@@ -48,6 +48,7 @@ class AtelierDomain:
         self._lock = threading.Lock()
 
         self._pipe = None
+        self._pipe_fd = None
         self._loop = None
         self._done = None
         self._closed = False
@@ -56,6 +57,7 @@ class AtelierDomain:
         pipe_path = os.environ.pop("ATELIER_IPC_PIPE", None)
         if pipe_path:
             self._pipe = open(pipe_path, "r+b", buffering=0)
+            self._pipe_fd = self._pipe.fileno()
 
     # ── 能力 2：注册处理器 ──────────────────────────────────────────────
     def handler(self, name):
@@ -440,13 +442,13 @@ class AtelierDomain:
             return
         line = json.dumps(frame, ensure_ascii=False) + "\n"
         with self._lock:
-            self._pipe.write(line.encode("utf-8"))
+            os.write(self._pipe_fd, line.encode("utf-8"))
 
     def _read_loop(self):
         buffer = b""
         while not self._closed:
             try:
-                chunk = self._pipe.read(8192)
+                chunk = os.read(self._pipe_fd, 8192)
             except Exception:  # noqa: BLE001
                 break
             if not chunk:

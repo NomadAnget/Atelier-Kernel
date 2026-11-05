@@ -120,7 +120,7 @@ class AtelierDomain {
     this._closed = false;
     this._input = null;
     this._output = null;
-    this._fds = claimIpcFds();
+    this._fds = IPC_FDS;
   }
 
   // 能力 2：注册处理器
@@ -338,7 +338,7 @@ class AtelierDomain {
     this._streams = openStreams(this._fds);
     this._input = this._streams.input;
     this._output = this._streams.output;
-    process.stderr.write("v2 transport ready input=" + !!this._input + " output=" + !!this._output + " bridge=" + !!this._streams.bridge + "\n");
+    process.stderr.write("v2 transport fds=" + JSON.stringify(this._fds) + " bridge=" + !!this._streams.bridge + "\n");
     this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: {} }, data: {} });
     this._readLoop();
     if (onStart) await onStart();
@@ -481,5 +481,8 @@ function withTimeout(promise, seconds) {
     new Promise((_, reject) => setTimeout(() => reject(new DomainRequestError("timeout")), seconds * 1000)),
   ]);
 }
+
+// 与旧 SDK 一致：模块加载时就认领 IPC 句柄。
+const IPC_FDS = claimIpcFds();
 
 module.exports = { AtelierDomain, DomainRequestError, DomainExecutionFailed, FileNamespace };

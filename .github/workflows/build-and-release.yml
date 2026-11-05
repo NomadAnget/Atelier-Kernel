@@ -53,7 +53,7 @@ jobs:
       - name: Build Kernel for Native SDK Regression
         run: cargo build --locked
 
-      - name: Run Cross-Language SDK Consistency Test Suite
+      - name: Run SDK Unit Test Suites
         shell: bash
         run: |
           if command -v python3 >/dev/null 2>&1 && python3 --version >/dev/null 2>&1; then
@@ -61,20 +61,8 @@ jobs:
           else
             PY_BIN="python"
           fi
-          $PY_BIN tests/sdk_consistency_test.py
-          $PY_BIN tests/sdk_async_consistency_test.py
-          $PY_BIN tests/sdk_portable_features_test.py
-          $PY_BIN tests/sdk_transport_bounds_test.py
-          $PY_BIN tests/sdk_message_ids_test.py
-          $PY_BIN tests/sdk_terminal_wait_test.py
-          node --test tests/sdk_terminal_wait_test.cjs
-          $PY_BIN tests/sdk_observer_slow_test.py
-          $PY_BIN tests/sdk_log_slow_test.py
-          $PY_BIN tests/sdk_observer_memory_integration.py
-          $PY_BIN tests/sdk_self_restart_integration.py
-          $PY_BIN tests/sdk_log_pagination_integration.py
-          $PY_BIN tests/sdk_progress_state_test.py
-          $PY_BIN sdk/python/tests/test_module_logger.py
+          PYTHONPATH=sdk/python $PY_BIN sdk/python/tests/test_domain.py
+          node --test sdk/nodejs/tests/domain.test.mjs
 
   build-sdk-packages:
     needs: [ci-test]
@@ -108,18 +96,10 @@ jobs:
           pip install dist/sdk/atelier_sdk-*.whl
           python3 -c "from atelier_sdk import AtelierDomain, __version__; print('Verified Python SDK version:', __version__)"
 
-      - name: Run Cross-Language SDK Consistency Test Suite
+      - name: Run SDK Unit Test Suites
         run: |
-          python3 tests/sdk_consistency_test.py
-          python3 tests/sdk_async_consistency_test.py
-          python3 tests/sdk_portable_features_test.py
-          python3 tests/sdk_transport_bounds_test.py
-          python3 tests/sdk_message_ids_test.py
-          python3 tests/sdk_terminal_wait_test.py
-          node --test tests/sdk_terminal_wait_test.cjs
-          python3 tests/sdk_observer_slow_test.py
-          python3 tests/sdk_log_slow_test.py
-          python3 tests/sdk_progress_state_test.py
+          PYTHONPATH=sdk/python python3 sdk/python/tests/test_domain.py
+          node --test sdk/nodejs/tests/domain.test.mjs
 
       - name: Upload SDK Packages Artifact
         uses: actions/upload-artifact@v7

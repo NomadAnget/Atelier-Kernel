@@ -27,19 +27,22 @@ const DEFAULT_TEMPLATE_JSON: &str = r#"{
 "#;
 
 const SAMPLE_PY_DOMAIN: &str = r#"#!/usr/bin/env python3
+import asyncio
+
 from atelier_sdk import AtelierDomain
 
-domain = AtelierDomain()
+domain = AtelierDomain("sample_py")
+
 
 @domain.handler("ping")
 async def on_ping(msg):
-    domain.logger.info("Received ping from %s", msg.source_domain)
-    await domain.storage_insert_async(record_id="last_ping", category="health", data=msg.data)
-    domain.logger.phase("INFO", "finish", "Handled ping request")
+    domain.logger.info("Received ping", source=msg.source_domain)
+    await domain.storage_insert("last_ping", "health", msg.data)
     return {"pong": True, "from": "sample_py", "received": msg.data}
 
+
 if __name__ == "__main__":
-    domain.run()
+    asyncio.run(domain.run_async())
 "#;
 
 fn init_variant_skeleton(target_dir: &str) -> Result<(), Box<dyn std::error::Error>> {

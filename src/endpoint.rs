@@ -6,9 +6,13 @@
 use std::io;
 
 /// 由域 ID 与随机后缀生成端点路径。
+///
+/// Unix 的 `sun_path` 上限很小（macOS 约 104 字节），而 macOS 默认 temp 目录
+/// （`/var/folders/...`）本身就很长，所以 socket 固定放 `/tmp` 且名字保持紧凑。
 pub fn endpoint_path(domain: &str, nonce: &str) -> String {
     let safe: String = domain
         .chars()
+        .take(12)
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
     #[cfg(windows)]
@@ -17,7 +21,7 @@ pub fn endpoint_path(domain: &str, nonce: &str) -> String {
     }
     #[cfg(unix)]
     {
-        format!("{}/atelier-{safe}-{nonce}.sock", std::env::temp_dir().display())
+        format!("/tmp/atl-{safe}-{nonce}.sock")
     }
 }
 

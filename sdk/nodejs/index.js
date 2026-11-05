@@ -541,6 +541,7 @@ class AtelierDomain {
       this.reportReceipt(frame.message_id, frame.target, "target_invalid", { error: "unknown handler" });
       return;
     }
+    this.reportReceipt(frame.message_id, frame.target, "received");
     this.reportReceipt(frame.message_id, frame.target, "started");
     try {
       frame.data = await this._decodeFiles(frame.data || {});

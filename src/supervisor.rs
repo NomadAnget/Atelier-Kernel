@@ -824,6 +824,7 @@ impl DomainSupervisorInner {
     ) -> Result<(Child, crate::endpoint::EndpointWriter, crate::endpoint::EndpointReader), SupervisorError>
     {
         let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let nonce = &nonce[..8];
         let in_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-in"));
         let out_path = crate::endpoint::endpoint_path(domain_id, &format!("{nonce}-out"));
         let in_listener = crate::endpoint::bind(&in_path).map_err(|source| SupervisorError::SpawnFailed {

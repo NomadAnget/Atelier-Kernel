@@ -1,9 +1,10 @@
-"""Atelier SDK v2（Python）：单层、全异步、无遗留别名。
+"""Atelier SDK (Python) — 单层 `AtelierDomain`，全异步，15 项能力。
 
-只暴露 `AtelierDomain`。15 项能力见 `sdk/v2/README.md`。
-本文件先实现核心：传输、消息、回执、处理器、生命周期。
-存储/查询/监督/订阅/C4/日志在后续层补齐。
+传输：内核通过两条单向命名端点（`ATELIER_IPC_IN` / `ATELIER_IPC_OUT`）交付；
+本模块只负责协议与能力，不关心 Windows 命名管道 / Unix domain socket 的差异。
 """
+
+__version__ = "0.2.0"
 
 import asyncio
 import json
@@ -527,6 +528,7 @@ class AtelierDomain:
                 frame.get("message_id"), target, "target_invalid", {"error": "unknown handler"}
             )
             return
+        self.report_receipt(frame.get("message_id"), target, "received")
         self.report_receipt(frame.get("message_id"), target, "started")
         try:
             frame["data"] = await self._decode_files(frame.get("data"))

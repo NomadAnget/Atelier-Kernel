@@ -1,8 +1,8 @@
 //! 新内核组装证明：把 5 个已验证模块接起来，跑通完整消息生命周期。
 //! 这是"换骨"的端到端预演——不碰旧 router/ledger，只证明新零件能拼成一台内核。
 
-use atelier_kernel::object_hub::ObjectHub;
-use atelier_kernel::observer_proj::Observer;
+use atelier_kernel::services::objects::ObjectHub;
+use atelier_kernel::services::observer_proj::Observer;
 use atelier_kernel::protocol::{ContractStatus, DeliveryPolicy};
 use atelier_kernel::routing::Routing;
 use atelier_kernel::transport::{Frame, Transport};

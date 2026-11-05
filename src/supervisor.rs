@@ -1,5 +1,5 @@
 use crate::outbox::{self, PipeReceiver};
-use crate::port_forwarder::{Forwarder, PortBinding};
+use crate::services::ports::{Forwarder, PortBinding};
 use crate::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;

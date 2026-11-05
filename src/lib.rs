@@ -1,15 +1,13 @@
 pub mod discipline;
 pub mod endpoint;
+pub mod services;
 pub mod frontend;
 pub mod ledger;
 mod log_spool;
 pub mod logging;
 pub mod nucleus;
-pub mod object_hub;
 pub mod observer;
-pub mod observer_proj;
 pub mod outbox;
-pub mod port_forwarder;
 pub mod protocol;
 pub mod router;
 pub mod routing;
@@ -26,7 +24,7 @@ use parking_lot::Mutex;
 pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
 pub use frontend::InteractiveFrontendDomain;
 pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
-pub use object_hub::{DeleteOutcome, Object, ObjectHub, ObjectRef};
+pub use services::objects::{DeleteOutcome, Object, ObjectHub, ObjectRef};
 pub use logging::{
     KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore, ProgressState,
 };

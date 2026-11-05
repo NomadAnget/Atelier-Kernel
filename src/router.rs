@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::ledger::{KernelLedger, ReceiptTransition};
 use crate::logging::{KernelLogHub, LogQuery, LogRecord};
-use crate::object_hub::{DeleteOutcome, ObjectHub};
+use crate::services::objects::{DeleteOutcome, ObjectHub};
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,

@@ -292,7 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|w| w[0] == "--port-relay")
         .map(|w| w[1].as_str())
     {
-        return atelier_kernel::port_forwarder::run(address.parse()?).map_err(Into::into);
+        return atelier_kernel::services::ports::run(address.parse()?).map_err(Into::into);
     }
     // Load external startup configuration (`kernel_boot.json`)
     let config_path = args

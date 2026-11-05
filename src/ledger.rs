@@ -527,6 +527,12 @@ impl KernelLedger {
             )
             .expect("exited source result cleanup");
         }
+        // 终态记录不再保留在内存账本里：留在这里只会堆积到配额上限。
+        mem.execute(
+            "DELETE FROM kernel_ledger WHERE message_id=?1",
+            [&r.message_id],
+        )
+        .expect("terminal ledger cleanup");
         mem.execute(
             "DELETE FROM identities WHERE message_id=?1",
             [&r.message_id],
@@ -743,7 +749,7 @@ impl KernelLedger {
                     let mut stmt = mem
                         .prepare(
                             "SELECT message_id, coalesce(length(data),0) FROM kernel_ledger \
-                             WHERE status IN ('sent','received','completed','execution_failed','contract_invalid','target_invalid') \
+                             WHERE status IN ('completed','execution_failed','contract_invalid','target_invalid') \
                              ORDER BY created_at ASC",
                         )
                         .expect("quota victim query");

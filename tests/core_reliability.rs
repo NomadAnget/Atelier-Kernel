@@ -68,7 +68,7 @@ fn crash_after_physical_write_fixture() {
     std::process::exit(0);
 }
 #[test]
-fn process_recovery_closes_every_old_nonterminal_without_replay_or_losing_completed_result() {
+fn process_recovery_closes_every_old_nonterminal_and_clears_old_terminal_rows() {
     let path = database("written");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -89,9 +89,8 @@ fn process_recovery_closes_every_old_nonterminal_without_replay_or_losing_comple
         assert_eq!(r.status, ContractStatus::ExecutionFailed);
         assert_eq!(r.data.unwrap()["execution_outcome"], "unknown");
     }
-    let completed = k.ledger().get_persisted_record(&ids[2]).unwrap();
-    assert_eq!(completed.status, ContractStatus::Completed);
-    assert_eq!(completed.data.unwrap(), json!({"result":"must survive"}));
+    // 上一代终态记录在启动时清理：内核重启必然伴随所有域重启，重启后没有读取者。
+    assert!(k.ledger().get_persisted_record(&ids[2]).is_none());
     let worker = k.attach_domain("worker");
     worker.register_handlers(&["run"]);
     assert!(

@@ -35,7 +35,7 @@ fn owner_process_fixture() {
     assert!(k.is_err(), "second OS host must refuse the live database");
 }
 #[test]
-fn exclusive_database_owner_preserves_live_result_and_releases_after_exit() {
+fn exclusive_database_owner_releases_after_exit_and_clears_old_terminal_rows() {
     let path = dir().join("kernel.db");
     let k = AtelierKernel::open_with_db(&path).unwrap();
     let s = k.attach_domain("sender");
@@ -66,10 +66,8 @@ fn exclusive_database_owner_preserves_live_result_and_releases_after_exit() {
     drop(s);
     drop(k);
     let reopened = AtelierKernel::open_with_db(&path).unwrap();
-    assert_eq!(
-        reopened.ledger().get_persisted_record(&id).unwrap().data,
-        Some(json!({"kept":true}))
-    );
+    // 上一代终态记录在启动时清理：重启后不再可查。
+    assert!(reopened.ledger().get_persisted_record(&id).is_none());
     drop(reopened);
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "owner_process_fixture", "--ignored"])

@@ -1136,15 +1136,16 @@ fn test_delivery_persistence_message_types_durable_volatile_ephemeral() {
         assert_eq!(kernel.ledger().persisted_count(), 1);
     }
 
-    // Reopen kernel with the same SQLite database file: only the Durable delivery record survives across restart.
+    // Reopen kernel with the same SQLite database file: 上一代终态记录在启动时清理。
     let reopened = AtelierKernel::open_with_db(&db_path).unwrap();
-    assert_eq!(reopened.ledger().persisted_count(), 1);
-    let recovered = reopened
-        .ledger()
-        .get_record(&durable_id, "worker.run")
-        .expect("Durable delivery record should be reloaded from SQLite on reopen");
-    assert_eq!(recovered.status, ContractStatus::Completed);
-    assert_eq!(recovered.data, Some(json!({"ok": "durable"})));
+    assert_eq!(reopened.ledger().persisted_count(), 0);
+    assert!(
+        reopened
+            .ledger()
+            .get_record(&durable_id, "worker.run")
+            .is_none(),
+        "old terminal rows are cleared on startup"
+    );
     assert!(
         reopened
             .ledger()

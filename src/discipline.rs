@@ -154,7 +154,17 @@ fn check_boot_config_file(
             continue;
         }
 
+        let mut skip_next = false;
         for arg in &spec.args {
+            if skip_next {
+                skip_next = false;
+                continue;
+            }
+            // `--import <module>` / `--require <module>` 的值是模块标识符，不是入口脚本。
+            if arg == "--import" || arg == "--require" || arg == "-r" || arg == "--loader" {
+                skip_next = true;
+                continue;
+            }
             if arg.starts_with('-') {
                 continue;
             }
@@ -418,11 +428,33 @@ impl<'a> StatementVisitor<'a> for PythonConstitutionVisitor<'a> {
     }
 }
 
+/// 测试夹具 / 引擎内部工具：不是业务文件操作，不参与 C4 门禁。
+fn is_test_source(path: &Path, file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.starts_with("test_")
+        || lower.ends_with("_test.py")
+        || lower.ends_with(".test.mjs")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".spec.mjs")
+        || lower.ends_with(".spec.js")
+    {
+        return true;
+    }
+    path.components().any(|c| {
+        let s = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+        s == "tests" || s == "test" || s == "cli_tests"
+    })
+}
+
 fn scan_domain_source_file(path: &Path, report: &mut ConstitutionReport) {
     let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
     if matches!(file_name, "atelier_sdk.py" | "atelier_sdk.js") {
+        return;
+    }
+    // 测试夹具与引擎内部工具不是业务文件操作，不纳入 C4 静态门禁。
+    if is_test_source(path, file_name) {
         return;
     }
     let Ok(source) = fs::read_to_string(path) else {
@@ -485,6 +517,10 @@ fn scan_file_operations(path: &Path, source: &str, report: &mut ConstitutionRepo
         let line_no = idx + 1;
         let trimmed = line.trim_start();
         if trimmed.starts_with('#') || trimmed.starts_with("//") {
+            continue;
+        }
+        // 显式豁免：外部工具/静态配置的合法原生文件操作。
+        if line.contains("native-file:") {
             continue;
         }
         for pat in patterns {

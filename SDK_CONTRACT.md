@@ -109,3 +109,40 @@ Rules:
 - Cross-domain consumers pass the `object_id` in message `data` and resolve it via `ObjectGet`; the returned `physical_path` is opened natively.
 - `atelier-kernel --check` statically fails any domain source file whose file operations use a string-literal path without the `vfs://` prefix. Third-party libraries are not scanned and not prefix-matched.
 - No OS sandbox: C extensions / native addons / subprocesses bypass language-level wrapping, so centralization is a convention, not a hard boundary.
+
+## API semantics and naming (both SDKs)
+
+Two primitives, one rule:
+
+| Primitive | Returns | Use for |
+|---|---|---|
+| `send(targets, type, params, data)` | message id(s) | fire-and-forget, pipelining, callback-driven flows |
+| `request(target, type, params, data)` | the terminal result's `data` | request/response, business CRUD, queries |
+
+Business APIs MUST use `request` semantics and return data; `send` is the explicit low-level escape hatch. `send`-returning-id variants of business APIs are removed.
+
+Naming rules:
+
+- Python uses `snake_case`, Node uses `camelCase`; the same capability maps to the same name after case conversion.
+- No `_async` / `Async` suffixes: both SDKs are async, the suffix is legacy and must not be added.
+- Every capability below exists on both sides with identical semantics.
+
+| Capability | Python | Node |
+|---|---|---|
+| lifecycle | `run` / `run_async` / `shutdown` / `close` | `run` / `runAsync` / `shutdown` / `close` |
+| handler | `handler(name)` | `handler(name)` |
+| send / request | `send` / `request` | `send` / `request` |
+| wait / forget | `wait_result` / `wait_results` / `forget_result` | `waitResult` / `waitResults` / `forgetResult` |
+| report receipt | `report_receipt` | `reportReceipt` |
+| storage CRUD (returns data) | `storage_insert/update/delete/query` | `storageInsert/Update/Delete/Query` |
+| logs | `query_logs` | `queryLogs` |
+| registry | `query_handlers` / `discover_handlers` / `get_handler_description` | `queryHandlers` / `discoverHandlers` / `getHandlerDescription` |
+| runtime | `query_runtime` | `queryRuntime` |
+| observer | `query_observer` / `on_observation` | `queryObserver` / `onObservation` |
+| supervisor | `supervisor_start/stop/restart/update` | `supervisor.start/stop/restart/update` |
+| subscribe | `subscribe_logs/telemetry/notify/observer` (+ `unsubscribe_*`) | same names, camelCase |
+| notify | `notify` | `notify` |
+| progress | `query_progress` | `queryProgress` |
+| C4 objects | `put_object` / `get_object` / `delete_object` / `file_object_id` / `enable_file_interception` / `refresh_file_index` | `putObject` / `getObject` / `deleteObject` / `fileObjectId` / `enableFileInterception` / `refreshFileIndex` |
+| ports | `bindings` | `bindings` |
+| logger | `logger` / `attach_stdlib_logging` | `logger` / `attachStdlibLogging` |

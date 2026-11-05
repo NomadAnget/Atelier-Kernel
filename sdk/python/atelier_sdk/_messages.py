@@ -27,8 +27,14 @@ class MessageClient:
         loop=asyncio.get_running_loop()
         if self._closed or self._async_loop is not loop:raise DomainRequestError('connection_closed')
         if not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or timeout<=0:raise ValueError('invalid timeout')
-        reserved=sum(len(e['targets'])-len(e['ids']) for e in self._pending.values())
-        if not all(t in INFRA for t in names) and len(self._results)+reserved+len(names)>self._limits['max_pending']:raise DomainRequestError('busy')
+        if not all(t in INFRA for t in names):
+            # 业务数据面平滑背压：容量不足时等待（可重试），仅在超过 timeout 后才 busy。
+            deadline=None if timeout is None else time.monotonic()+timeout
+            while True:
+                reserved=sum(len(e['targets'])-len(e['ids']) for e in self._pending.values())
+                if len(self._results)+reserved+len(names)<=self._limits['max_pending']:break
+                if deadline is not None and time.monotonic()>=deadline:raise DomainRequestError('busy')
+                await asyncio.sleep(0.01)
         with self._write_lock:seq=self._seq_counter;self._seq_counter+=1
         future=loop.create_future();entry={'targets':names,'ids':{},'future':future};self._pending[seq]=entry
         accepted=False

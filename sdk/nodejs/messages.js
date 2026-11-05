@@ -12,9 +12,16 @@ module.exports=function messageMethods(RequestError){
    if(!Number.isFinite(timeout)||timeout<=0)throw Error('invalid timeout');
    if(signal?.aborted)throw new RequestError('cancelled');
    const control=options.control===true||unique.every(t=>INFRA.has(t));
-   const reserved=[...this._pending.values()].reduce((n,e)=>n+e.targets.length-e.ids.size,0);
-   // 控制面保留通道：运维/监督消息不受数据面 _results 预算限制，数据面饱和不得堵死控制面。
-   if(!control&&this._results.size+reserved+unique.length>this._limits.maxPending)throw new RequestError('busy');
+   // 业务数据面平滑背压：容量不足时等待（可重试），仅在超过 timeout 后才 busy。
+   if(!control){
+     const deadline=Date.now()+timeout*1000;
+     while(true){
+       const reserved=[...this._pending.values()].reduce((n,e)=>n+e.targets.length-e.ids.size,0);
+       if(this._results.size+reserved+unique.length<=this._limits.maxPending)break;
+       if(Date.now()>=deadline)throw new RequestError('busy');
+       await new Promise(r=>setTimeout(r,10));
+     }
+   }
    const seq=this._seqCounter++;let resolve,reject;
    const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});promise.catch(()=>{});
    const entry={targets:unique,ids:new Map(),resolve,reject};this._pending.set(seq,entry);let accepted=false;

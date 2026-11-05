@@ -25,6 +25,7 @@ class FileNamespace:
         self._submit = submit  # 同步 _submit(targets, message_type, params, data)
         self.prefix = prefix
         self._cache = {}  # virtual_path -> physical_path
+        self._object_ids = {}  # virtual_path -> object_id
         self._original_open = builtins.open
         self._installed = False
 
@@ -70,8 +71,13 @@ class FileNamespace:
             physical = self._physical(object_id)
             os.makedirs(self.root, exist_ok=True)
             self._cache[virtual] = physical
+            self._object_ids[virtual] = object_id
             self._register(virtual, object_id)
         return self._original_open(physical, mode, *args, **kwargs)
+
+    def object_id(self, path):
+        """最近一次为该虚拟路径分配的 object_id（供消息携带）。"""
+        return self._object_ids.get(self.normalize(path))
 
     def install(self):
         if self._installed:

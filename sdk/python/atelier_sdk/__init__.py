@@ -773,6 +773,8 @@ class AtelierDomain(AsyncRuntime):
         """
         from ._files import install
 
+        import os
+
         base = root or os.environ.get("ATELIER_FILES_ROOT") or "."
         self._file_namespace = install(base, self._submit, prefix)
         return self._file_namespace
@@ -786,6 +788,11 @@ class AtelierDomain(AsyncRuntime):
         if namespace is not None:
             namespace.load_index(result.get("objects") or [])
         return result
+
+    def file_object_id(self, path: str) -> Optional[str]:
+        """Returns the object_id assigned on the last vfs:// write of `path` (C4)."""
+        namespace = getattr(self, "_file_namespace", None)
+        return namespace.object_id(path) if namespace is not None else None
 
     async def query_logs(
         self,

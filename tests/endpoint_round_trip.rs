@@ -23,10 +23,11 @@ fn endpoint_round_trip() {
     });
 
     let mut server = listener.accept().unwrap();
+    let (mut reader, mut writer) = server.into_split();
     let mut request = [0u8; 6];
-    server.read_exact(&mut request).unwrap();
-    server.write_all(b"world\n").unwrap();
-    server.flush().unwrap();
+    reader.read_exact(&mut request).unwrap();
+    writer.write_all(b"world\n").unwrap();
+    writer.flush().unwrap();
 
     let reply = client.join().unwrap();
     assert_eq!(&request, b"hello\n");

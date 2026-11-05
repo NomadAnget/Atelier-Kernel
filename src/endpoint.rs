@@ -1,13 +1,11 @@
 //! 命名端点传输：Windows 命名管道 / Unix domain socket。
 //!
-//! 内核是服务端：创建端点 → spawn 域 → accept → 双向读写 JSON-Lines。
-//! `EndpointStream` 只实现 `Read`/`Write`，上层读/写线程与协议不变。
+//! 内核是服务端：创建端点 → spawn 域 → accept → 拆成读/写两半供两个线程使用。
+//! 协议（JSON-Lines）不变。
 
 use std::io;
 
 /// 由域 ID 与随机后缀生成端点路径。
-/// - Windows: `\\.\pipe\atelier-<domain>-<nonce>`
-/// - Unix:    `<temp>/atelier-<domain>-<nonce>.sock`
 pub fn endpoint_path(domain: &str, nonce: &str) -> String {
     let safe: String = domain
         .chars()
@@ -28,7 +26,7 @@ pub fn bind(path: &str) -> io::Result<EndpointListener> {
     imp::bind(path)
 }
 
-pub use imp::{EndpointListener, EndpointStream};
+pub use imp::{EndpointListener, EndpointReader, EndpointStream, EndpointWriter};
 
 #[cfg(unix)]
 mod imp {
@@ -39,14 +37,25 @@ mod imp {
 
     pub struct EndpointStream(UnixStream);
 
+    pub struct EndpointReader(UnixStream);
+
+    pub struct EndpointWriter(UnixStream);
+
     pub fn bind(path: &str) -> io::Result<EndpointListener> {
         let _ = std::fs::remove_file(path);
         Ok(EndpointListener(UnixListener::bind(path)?))
     }
 
     impl EndpointListener {
-        pub fn accept(&self) -> io::Result<EndpointStream> {
+        pub fn accept(&mut self) -> io::Result<EndpointStream> {
             Ok(EndpointStream(self.0.accept()?.0))
+        }
+    }
+
+    impl EndpointStream {
+        pub fn into_split(self) -> (EndpointReader, EndpointWriter) {
+            let writer = self.0.try_clone().expect("clone unix stream");
+            (EndpointReader(self.0), EndpointWriter(writer))
         }
     }
 
@@ -64,12 +73,29 @@ mod imp {
             self.0.flush()
         }
     }
+
+    impl io::Read for EndpointReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl io::Write for EndpointWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
 }
 
 #[cfg(windows)]
 mod imp {
     use std::ffi::c_void;
     use std::io::{self, Read, Write};
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::Arc;
 
     const PIPE_ACCESS_DUPLEX: u32 = 0x0000_0003;
     const PIPE_TYPE_BYTE: u32 = 0x0000_0000;
@@ -93,6 +119,14 @@ mod imp {
         fn ConnectNamedPipe(handle: *mut c_void, overlapped: *mut c_void) -> i32;
         fn ReadFile(handle: *mut c_void, buf: *mut u8, len: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
         fn WriteFile(handle: *mut c_void, buf: *const u8, len: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+        fn PeekNamedPipe(
+            handle: *mut c_void,
+            buffer: *mut c_void,
+            size: u32,
+            read: *mut u32,
+            avail: *mut u32,
+            left: *mut u32,
+        ) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn GetLastError() -> u32;
     }
@@ -102,7 +136,26 @@ mod imp {
     }
 
     pub struct EndpointStream {
-        handle: *mut c_void,
+        shared: Arc<SharedHandle>,
+    }
+
+    pub struct EndpointReader(Arc<SharedHandle>);
+
+    pub struct EndpointWriter(Arc<SharedHandle>);
+
+    struct SharedHandle(*mut c_void);
+
+    unsafe impl Send for SharedHandle {}
+    unsafe impl Sync for SharedHandle {}
+
+    impl Drop for SharedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
     }
 
     pub fn bind(path: &str) -> io::Result<EndpointListener> {
@@ -136,39 +189,86 @@ mod imp {
             }
             let handle = self.handle;
             self.handle = std::ptr::null_mut();
-            Ok(EndpointStream { handle })
+            Ok(EndpointStream {
+                shared: Arc::new(SharedHandle(handle)),
+            })
+        }
+    }
+
+    impl EndpointStream {
+        pub fn into_split(self) -> (EndpointReader, EndpointWriter) {
+            (EndpointReader(self.shared.clone()), EndpointWriter(self.shared))
         }
     }
 
     impl Read for EndpointStream {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let mut read = 0u32;
-            let ok = unsafe {
-                ReadFile(self.handle, buf.as_mut_ptr(), buf.len() as u32, &mut read, std::ptr::null_mut())
-            };
-            if ok == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(read as usize)
-            }
+            read_handle(self.shared.0, buf)
         }
     }
 
     impl Write for EndpointStream {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut written = 0u32;
+            write_handle(self.shared.0, buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl EndpointReader {
+        /// 是否有可读数据（等价于旧实现里的 PeekNamedPipe 轮询）。
+        pub fn has_data(&self) -> io::Result<bool> {
+            let mut avail = 0u32;
             let ok = unsafe {
-                WriteFile(self.handle, buf.as_ptr(), buf.len() as u32, &mut written, std::ptr::null_mut())
+                PeekNamedPipe(self.0.0, std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut avail, std::ptr::null_mut())
             };
             if ok == 0 {
                 Err(io::Error::last_os_error())
             } else {
-                Ok(written as usize)
+                Ok(avail > 0)
             }
         }
+    }
 
+    impl Read for EndpointReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            read_handle(self.0.0, buf)
+        }
+    }
+
+    impl Write for EndpointWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            write_handle(self.0.0, buf)
+        }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    fn read_handle(handle: *mut c_void, buf: &mut [u8]) -> io::Result<usize> {
+        let mut read = 0u32;
+        let ok = unsafe { ReadFile(handle, buf.as_mut_ptr(), buf.len() as u32, &mut read, std::ptr::null_mut()) };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(read as usize)
+        }
+    }
+
+    fn write_handle(handle: *mut c_void, buf: &[u8]) -> io::Result<usize> {
+        let mut written = 0u32;
+        let ok = unsafe { WriteFile(handle, buf.as_ptr(), buf.len() as u32, &mut written, std::ptr::null_mut()) };
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(written as usize)
+        }
+    }
+
+    impl AsRawHandle for EndpointStream {
+        fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+            self.shared.0 as std::os::windows::io::RawHandle
         }
     }
 
@@ -178,17 +278,6 @@ mod imp {
                 unsafe {
                     CloseHandle(self.handle);
                 }
-            }
-        }
-    }
-
-    impl Drop for EndpointStream {
-        fn drop(&mut self) {
-            if !self.handle.is_null() {
-                unsafe {
-                    CloseHandle(self.handle);
-                }
-                self.handle = std::ptr::null_mut();
             }
         }
     }

@@ -167,6 +167,37 @@ impl Nucleus {
         id
     }
 
+    /// 消息级基础操作：收进一条消息的活跃行。
+    /// 这是核的最小粒度——提交（多 target、去重、重放）在 `admit` 里组合它。
+    /// 换骨时旧 API 的 `record_initial_target_state` 就映射到这里（解法 B）。
+    pub fn put(
+        &mut self,
+        message_id: String,
+        logical_id: String,
+        source: String,
+        seq: u64,
+        target: String,
+        message_type: String,
+        policy: DeliveryPolicy,
+        status: ContractStatus,
+        data: Option<serde_json::Value>,
+    ) {
+        self.active.insert(
+            message_id.clone(),
+            Message {
+                message_id,
+                logical_id,
+                source,
+                seq,
+                target,
+                message_type,
+                policy,
+                status,
+                data,
+            },
+        );
+    }
+
     /// 收进一个提交。`dedup_key` 是 source 的去重键（`{domain}#{generation}`），
     /// `source` 是纯域 id；二者显式分离，绝不混用。
     pub fn admit(
@@ -195,19 +226,16 @@ impl Nucleus {
         let logical_id = self.generate_id().replacen("msg_", "logical_", 1);
         let ids: Vec<String> = targets.iter().map(|_| self.generate_id()).collect();
         for (target, id) in targets.iter().zip(&ids) {
-            self.active.insert(
+            self.put(
                 id.clone(),
-                Message {
-                    message_id: id.clone(),
-                    logical_id: logical_id.clone(),
-                    source: source.to_string(),
-                    seq,
-                    target: target.clone(),
-                    message_type: message_type.to_string(),
-                    policy,
-                    status: ContractStatus::Sent,
-                    data: data.clone(),
-                },
+                logical_id.clone(),
+                source.to_string(),
+                seq,
+                target.clone(),
+                message_type.to_string(),
+                policy,
+                ContractStatus::Sent,
+                data.clone(),
             );
         }
         let sub = Submission { logical_id: logical_id.clone(), ids: ids.clone(), replayed: false };

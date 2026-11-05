@@ -16,6 +16,7 @@ class FileNamespace {
     this._submit = submit; // (targets, messageType, params, data) => seq
     this.prefix = prefix;
     this.cache = new Map(); // virtual -> physical
+    this.byPhysical = new Map(); // physical -> object_id（供消息编解码反查）
   }
 
   matches(p) {
@@ -32,12 +33,21 @@ class FileNamespace {
     for (const item of objects || []) {
       if (item && item.virtual_path && item.physical_path) {
         this.cache.set(item.virtual_path, item.physical_path);
+        if (item.object_id) this.byPhysical.set(path.resolve(item.physical_path), item.object_id);
       }
     }
   }
 
   _physical(objectId) {
     return path.join(this.root, objectId);
+  }
+
+  objectIdForPath(p) {
+    try {
+      return this.byPhysical.get(path.resolve(p)) || null;
+    } catch (_) {
+      return null;
+    }
   }
 
   _register(virtualPath, objectId) {
@@ -61,6 +71,7 @@ class FileNamespace {
       physical = this._physical(objectId);
       fs.mkdirSync(this.root, { recursive: true });
       this.cache.set(virtual, physical);
+      this.byPhysical.set(path.resolve(physical), objectId);
       this._register(virtual, objectId);
     }
     return physical;

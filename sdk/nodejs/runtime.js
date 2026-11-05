@@ -307,6 +307,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
           let abort;
           const abortError=()=>new ExecutionFailed({code:'cancelled',error:'cancelled',reason:'domain is shutting down'});
           const cancelled=new Promise((_,reject)=>{abort=()=>reject(abortError());signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();});
+          try{const {decode}=require('./codec');frame.data=await decode(Object.hasOwn(frame,'data')?frame.data:{},async(id)=>{const res=await this.request('kernel.storage','StorageObjectGet',{object_id:id},{});return require('fs').promises.open(res?.data?.physical_path,'r');});}catch(_){}
           const invoke=async()=>{if(this._stageDelayMs)await sleep(this._stageDelayMs);if(signal.aborted)throw abortError();const fn=this._handlers.get(frame.target.split('.').slice(1).join('.'));if(!fn)throw new ExecutionFailed({error:`Unknown handler: ${frame.target.split('.').slice(1).join('.')}`});return fn({...frame,params:frame.params||{},data:Object.hasOwn(frame,'data')?frame.data:{},targets:frame.targets||[frame.target],signal},this);};
           let result;
           try{result=await Promise.race([invoke(),cancelled]);}finally{signal.removeEventListener('abort',abort);}

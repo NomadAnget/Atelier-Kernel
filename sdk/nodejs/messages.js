@@ -11,6 +11,8 @@ module.exports=function messageMethods(RequestError){
    if(this._closed||this._state==='new')throw new RequestError('connection_closed');
    if(!Number.isFinite(timeout)||timeout<=0)throw Error('invalid timeout');
    if(signal?.aborted)throw new RequestError('cancelled');
+   // C4：把消息里的文件句柄编码成 object_id 引用。
+   try{const codec=require('./codec');params=codec.encode(params||{});data=codec.encode(data||{});}catch(_){}
    const control=options.control===true||unique.every(t=>INFRA.has(t));
    // 业务数据面平滑背压：容量不足时等待（可重试），仅在超过 timeout 后才 busy。
    if(!control){

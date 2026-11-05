@@ -26,6 +26,7 @@ class FileNamespace:
         self.prefix = prefix
         self._cache = {}  # virtual_path -> physical_path
         self._object_ids = {}  # virtual_path -> object_id
+        self._by_physical = {}  # physical_path -> object_id（供消息编解码把文件对象还原成 id）
         self._original_open = builtins.open
         self._installed = False
 
@@ -44,6 +45,15 @@ class FileNamespace:
             ph = item.get("physical_path")
             if vp and ph:
                 self._cache[vp] = ph
+                if item.get("object_id"):
+                    self._by_physical[os.path.abspath(ph)] = item["object_id"]
+
+    def object_id_for_path(self, path):
+        """给一个已打开的原生文件对象（读其 .name）反查 object_id。"""
+        try:
+            return self._by_physical.get(os.path.abspath(path))
+        except Exception:
+            return None
 
     def _physical(self, object_id):
         return os.path.join(self.root, object_id)
@@ -72,6 +82,7 @@ class FileNamespace:
             os.makedirs(self.root, exist_ok=True)
             self._cache[virtual] = physical
             self._object_ids[virtual] = object_id
+            self._by_physical[os.path.abspath(physical)] = object_id
             self._register(virtual, object_id)
         return self._original_open(physical, mode, *args, **kwargs)
 

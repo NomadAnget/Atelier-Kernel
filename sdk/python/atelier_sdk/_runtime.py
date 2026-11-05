@@ -266,6 +266,8 @@ class AsyncRuntime(MessageClient):
 
     async def _execute(self,frame):
         from . import DeliveryMessage
+        # C4：把消息里的文件引用还原成原生文件对象，业务处理器直接拿到文件对象。
+        frame['data']=await self._decode_files(frame.get('data'))
         msg=DeliveryMessage(frame)
         token=_context.set(dict(logical_id=msg.logical_id,message_id=msg.message_id,source_domain=msg.source_domain,target=msg.target,message_type=msg.message_type))
         try:
@@ -284,6 +286,15 @@ class AsyncRuntime(MessageClient):
         except DomainExecutionFailed as error:self.report_receipt(msg.message_id,msg.target,'execution_failed',error.payload)
         except Exception as error:self.report_receipt(msg.message_id,msg.target,'execution_failed',dict(error='handler_exception',reason=str(error)))
         finally:_context.reset(token)
+
+    async def _decode_files(self,value):
+        from ._codec import decode
+        if value is None:return {}
+        async def resolver(object_id):
+            # 跨域对象：向内核换取只读句柄，再开成原生文件对象。
+            result=await self.request('kernel.storage','StorageObjectGet',{'object_id':object_id},{})
+            return open(result['data']['physical_path'],'rb')
+        return await decode(value,resolver)
 
     async def _receive(self,frame):
         if frame.get('frame_type')=='receipt':

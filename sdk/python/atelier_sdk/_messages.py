@@ -24,6 +24,9 @@ class MessageClient:
         names=[targets] if single else targets
         if not isinstance(names,list) or not names or not all(isinstance(t,str) and t for t in names):raise ValueError('targets must be a name or non-empty name list')
         names=list(dict.fromkeys(names))
+        # C4：把消息里的原生文件对象编码成 object_id 引用。
+        from ._codec import encode as _encode_files
+        params=_encode_files(params or {});data=_encode_files(data or {})
         loop=asyncio.get_running_loop()
         if self._closed or self._async_loop is not loop:raise DomainRequestError('connection_closed')
         if not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or timeout<=0:raise ValueError('invalid timeout')

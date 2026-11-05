@@ -777,6 +777,9 @@ class AtelierDomain(AsyncRuntime):
 
         base = root or os.environ.get("ATELIER_FILES_ROOT") or "."
         self._file_namespace = install(base, self._submit, prefix)
+        from . import _codec
+
+        _codec.set_namespace(self._file_namespace)
         return self._file_namespace
 
     async def refresh_file_index(self, timeout: float = 30):

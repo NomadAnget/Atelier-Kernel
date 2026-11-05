@@ -156,6 +156,123 @@ class AtelierDomain:
             }
         )
 
+    # ── 能力 8：本域存储（唯一实现 `_storage`，其余只转发）──────────────
+    async def _storage(self, message_type, params, data=None):
+        return (await self.request("kernel.storage", message_type, params, data or {}))["data"]
+
+    async def storage_insert(self, record_id, category, data, upsert=True):
+        return await self._storage(
+            "StorageInsert",
+            {"record_id": record_id, "category": category, "upsert": upsert},
+            data,
+        )
+
+    async def storage_update(self, record_id, data, patch=True):
+        return await self._storage("StorageUpdate", {"record_id": record_id, "patch": patch}, data)
+
+    async def storage_delete(self, record_id=None, category=None):
+        params = {}
+        if record_id is not None:
+            params["record_id"] = record_id
+        if category is not None:
+            params["category"] = category
+        return await self._storage("StorageDelete", params)
+
+    async def storage_query(self, domain=None, record_id=None, category=None, filter=None, limit=500):
+        params = {"limit": limit}
+        if domain is not None:
+            params["domain"] = domain
+        if record_id is not None:
+            params["record_id"] = record_id
+        if category is not None:
+            params["category"] = category
+        if filter is not None:
+            params["filter"] = filter
+        return await self._storage("StorageQuery", params)
+
+    # ── 能力 9：查询（唯一实现 `_query`，其余只转发）────────────────────
+    async def _query(self, target, message_type, params):
+        return (await self.request(target, message_type, params or {}))["data"]
+
+    async def query_logs(self, **params):
+        return await self._query("kernel.logger", "QueryLogs", params)
+
+    async def query_handlers(self, **params):
+        return await self._query("kernel.registry", "QueryHandlers", params)
+
+    async def query_runtime(self, **params):
+        return await self._query("kernel.runtime", "QueryRuntime", params)
+
+    async def query_observer(self, **params):
+        return await self._query("kernel.observer", "QueryObserver", params)
+
+    async def query_progress(self):
+        return await self._query("kernel.logger", "QueryProgress", {})
+
+    # ── 能力 10：监督（唯一实现 `_supervisor`，其余只转发）──────────────
+    async def _supervisor(self, action, params):
+        return (await self.request("kernel.supervisor", action, params))["data"]
+
+    async def supervisor_start(self, domain, spec=None):
+        params = {"domain": domain}
+        if spec is not None:
+            params["spec"] = spec
+        return await self._supervisor("StartDomain", params)
+
+    async def supervisor_stop(self, domain):
+        return await self._supervisor("StopDomain", {"domain": domain})
+
+    async def supervisor_restart(self, domain):
+        return await self._supervisor("RestartDomain", {"domain": domain})
+
+    async def supervisor_update(self, domain, spec=None, probe_handler=None):
+        params = {"domain": domain}
+        if spec is not None:
+            params["spec"] = spec
+        if probe_handler is not None:
+            params["probe_handler"] = probe_handler
+        return await self._supervisor("UpdateDomain", params)
+
+    # ── 能力 11：订阅（唯一实现 `_subscribe`，其余只转发）───────────────
+    async def _subscribe(self, kind, topic, enabled):
+        message_type = ("Subscribe" if enabled else "Unsubscribe") + topic
+        return (await self.request(f"kernel.{kind}", message_type, {}))["data"]
+
+    async def subscribe_logs(self):
+        return await self._subscribe("logger", "Logs", True)
+
+    async def unsubscribe_logs(self):
+        return await self._subscribe("logger", "Logs", False)
+
+    async def subscribe_telemetry(self):
+        return await self._subscribe("telemetry", "Telemetry", True)
+
+    async def unsubscribe_telemetry(self):
+        return await self._subscribe("telemetry", "Telemetry", False)
+
+    async def subscribe_notify(self):
+        return await self._subscribe("notify", "Notify", True)
+
+    async def unsubscribe_notify(self):
+        return await self._subscribe("notify", "Notify", False)
+
+    async def subscribe_observer(self):
+        return await self._subscribe("observer", "Observer", True)
+
+    async def unsubscribe_observer(self):
+        return await self._subscribe("observer", "Observer", False)
+
+    # ── 能力 12：通知（唯一实现 `notify`）───────────────────────────────
+    async def notify(self, level, message, title="", details=None):
+        return (
+            await self.request(
+                "kernel.notify",
+                title or "Notification",
+                {"severity": level, "level": level},
+                {"title": title, "message": message, "details": details or {}},
+            )
+        )["data"]
+
     # ── 能力 1：生命周期 ──────────────────────────────────────────────
     async def run_async(self, *, on_start=None, on_close=None):
         if self._reader is None or self._writer is None:

@@ -15,6 +15,31 @@
    - `_results`：已终态、等取走的结果；
    - `_namespace`：虚拟路径 ↔ 平铺 id 映射。
 5. **两语言同构**：Python `snake_case`、Node `camelCase`，能力一一对应。
+6. **单一权威实现**：每项能力只有**一条**权威实现路径；其余入口（命名变体、门面对象、
+   语言习惯写法）只做**接口适配**，不得包含任何业务逻辑。
+
+## 单一权威实现（硬约束）
+
+| 能力 | 权威实现（唯一） | 适配层（仅转发，禁止逻辑） |
+|---|---|---|
+| 1 生命周期 | `run_async` / `run` / `shutdown` | Node `run`/`runAsync` 同构命名 |
+| 2 处理器 | `handler(name)` | — |
+| 3 发消息 | `send` | — |
+| 4 请求 | `request`（= `send` + `wait_result` + `forget_result`） | — |
+| 5 等待/遗忘 | `wait_result` / `wait_results` / `forget_result` | — |
+| 6 回执 | `report_receipt` | — |
+| 7 事件 | `on_receipt` / `on_log` / `on_notify` / `on_observation` / `on_telemetry` | — |
+| 8 存储 | 内部 `_storage(msg_type, params, data)` | `storage_insert/update/delete/query` 只转发 |
+| 9 查询 | 内部 `_query(target, type, params)` | `query_logs/query_handlers/query_runtime/query_observer/query_progress` 只转发 |
+| 10 监督 | 内部 `_supervisor(action, params)` | `supervisor_start/stop/restart/update` 只转发 |
+| 11 订阅 | 内部 `_subscribe(kind, handler)` | `subscribe_*` / `unsubscribe_*` 只转发 |
+| 12 通知 | `notify`（= `request(kernel.notify, ...)`） | — |
+| 13 C4 | `_namespace` 实例 + `put_object` / `get_object` / `delete_object` | `file_object_id` / `enable_file_interception` / `refresh_file_index` 只转发 |
+| 14 日志 | `logger`（唯一实例） | `debug/info/warn/error` 只转发 |
+| 15 端口 | `bindings`（属性） | — |
+
+**判定标准**：如果某个能力的实现逻辑出现在两个地方，就是违规。改一处必须能覆盖全部入口。
+
 
 ## 对外能力（15 项）
 

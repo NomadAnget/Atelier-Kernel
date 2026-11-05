@@ -617,6 +617,11 @@ class AtelierDomain {
     return this._fileNamespace ? this._fileNamespace.objectId(virtualPath) : null;
   }
 
+  /** Handler description query, non-suffixed standard name (registry). */
+  getHandlerDescription(target, options = {}) {
+    return this.getHandlerDescriptionAsync(target, options);
+  }
+
   /**
    * Resolves an `object_id` to its object ref (C4).
    */

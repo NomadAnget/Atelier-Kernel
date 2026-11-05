@@ -125,6 +125,9 @@ class AsyncRuntime(MessageClient):
     async def get_handler_description_async(self,target,timeout=30):
         res=await self.query_handlers_async(target=target,timeout=timeout)
         return res.get('description')
+    async def get_handler_description(self,target,timeout=30):
+        """标准名（无 `_async` 后缀）的处理器描述查询。"""
+        return await self.get_handler_description_async(target,timeout)
 
     async def storage_insert_async(self,record_id,category,data,upsert=True,timeout=30):
         return await self._decode_files((await self.request('kernel.storage','StorageInsert',dict(record_id=record_id,category=category,upsert=upsert),data,timeout))['data'])

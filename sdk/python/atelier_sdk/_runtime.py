@@ -291,9 +291,9 @@ class AsyncRuntime(MessageClient):
         from ._codec import decode
         if value is None:return {}
         async def resolver(object_id):
-            # 跨域对象：向内核换取只读句柄，再开成原生文件对象。
+            # 跨域对象：owner 域只决定物理位置，不决定访问权限；并发由 OS 文件锁负责。
             result=await self.request('kernel.storage','StorageObjectGet',{'object_id':object_id},{})
-            return open(result['data']['physical_path'],'rb')
+            return open(result['data']['physical_path'],'rb+')
         return await decode(value,resolver)
 
     async def _receive(self,frame):

@@ -19,21 +19,15 @@ fn python() -> String {
 const SCRIPT: &str = r#"import os,json,time,sys
 from pathlib import Path
 root=Path(sys.argv[1])
-value={'pid':os.getpid(),'custom':os.environ.get('ENV_PROBE_VALUE'),'empty':os.environ.get('ENV_PROBE_EMPTY'),'path':os.environ.get('PATH'),'read_fd':os.environ.get('ATELIER_IPC_READ_FD'),'write_fd':os.environ.get('ATELIER_IPC_WRITE_FD'),'mode':os.environ.get('ATELIER_IPC_HANDLE_MODE')}
+w=open(os.environ['ATELIER_IPC_OUT'],'wb',buffering=0)
+r=open(os.environ['ATELIER_IPC_IN'],'rb',buffering=0)
+value={'pid':os.getpid(),'custom':os.environ.get('ENV_PROBE_VALUE'),'empty':os.environ.get('ENV_PROBE_EMPTY'),'path':os.environ.get('PATH'),'in_pipe':os.environ.get('ATELIER_IPC_IN'),'out_pipe':os.environ.get('ATELIER_IPC_OUT')}
 if os.environ.get('ENV_PROBE_REGISTER','yes')=='yes':
- fd=int(os.environ['ATELIER_IPC_WRITE_FD'])
- if os.name=='nt':
-  import msvcrt
-  fd=msvcrt.open_osfhandle(fd,os.O_WRONLY)
- os.write(fd,(json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['ping']},'data':{}})+'\n').encode())
+ w.write((json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['ping']},'data':{}})+'\n').encode())
 tmp=root/(str(os.getpid())+'.tmp');tmp.write_text(json.dumps(value));tmp.replace(root/(str(os.getpid())+'.json'))
 if os.environ.get('ENV_PROBE_EXIT_ONCE')=='yes' and not (root/'exited-once').exists():
  (root/'exited-once').write_text('yes');sys.exit(7)
-fd=int(os.environ['ATELIER_IPC_READ_FD'])
-if os.name=='nt':
- import msvcrt
- fd=msvcrt.open_osfhandle(fd,os.O_RDONLY)
-while os.read(fd,8192):pass
+while r.read(8192):pass
 "#;
 fn spec(root: &Path) -> DomainProcessSpec {
     let mut s = DomainProcessSpec::new(
@@ -121,10 +115,8 @@ fn boot_manual_restart_and_saved_spec_preserve_environment_without_parent_mutati
     assert_eq!(a["custom"], "literal $HOME ~ 权重=ok");
     assert_eq!(a["empty"], "");
     assert_eq!(a["path"], path);
-    assert!(a["read_fd"].as_str().unwrap().parse::<u64>().unwrap() > 0);
-    assert!(a["write_fd"].as_str().unwrap().parse::<u64>().unwrap() > 0);
-    #[cfg(unix)]
-    assert!(a["mode"].is_null());
+    assert!(a["in_pipe"].as_str().unwrap().contains("atelier-"));
+    assert!(a["out_pipe"].as_str().unwrap().contains("atelier-"));
     let next = k.supervisor().respawn_domain("env_probe").unwrap();
     assert_ne!(*first, next);
     assert_eq!(report(&root, next)["custom"], a["custom"]);

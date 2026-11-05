@@ -80,3 +80,32 @@ Python/Node 的现有调用保持不变。SDK 同时执行的入站业务调用�
 `domain.bindings` exposes the kernel-assigned private endpoint for each configured public port binding. See [PORT_BINDINGS.md](docs/PORT_BINDINGS.md). `probe_handler` is compatibility-only and does not execute a health probe. Updates without explicit spec reread the source boot file.
 
 `on_observation` / `onObservation` also receives DomainStatusChanged and DomainStateSnapshot. The former is best-effort; the latter retains the latest current-state image and coalesces slow delivery. Cache: Python `domain.observer.domain_states`, Node `domain.observer.domainStates`. No polling, persistent replay, or subscriber queue settings. See [DOMAIN_STATE_OBSERVATION.md](docs/DOMAIN_STATE_OBSERVATION.md). The snapshot does not make ordinary lifecycle observations lossless.
+
+## C4 virtual file namespace (`vfs://`)
+
+The kernel storage hub indexes `(domain, virtual_path) → object_id → physical_path`. Physical files are flat unique-id files under `<project_root>/<domain>/<object_id>`; the domain's directory tree is virtual and lives in the kernel index.
+
+SDK file interception is **scoped to an explicit `vfs://` prefix** — nothing else is intercepted, so dependency libraries keep native file semantics:
+
+```python
+domain.enable_file_interception()        # Python; root defaults to ATELIER_FILES_ROOT
+await domain.refresh_file_index()        # pull this domain's index into the local read cache
+with open("vfs://users/a.png", "wb") as f:
+    f.write(payload)
+object_id = domain.file_object_id("vfs://users/a.png")
+```
+
+```js
+domain.enableFileInterception();          // Node
+await domain.refreshFileIndex();
+fs.writeFileSync("vfs://users/a.png", payload);
+```
+
+Rules:
+
+- Only `vfs://` paths are resolved; `open()`/`fs.*` on any other path is untouched.
+- Writes generate a globally-unique `object_id`, write the flat file, and fire-and-forget register `virtual_path → object_id`; reads resolve from the local index cache.
+- The SDK keeps the native handle's lifecycle (no wrapper, no close hook). `size` and file existence are taken by the kernel on `resolve` (metadata + self-heal).
+- Cross-domain consumers pass the `object_id` in message `data` and resolve it via `ObjectGet`; the returned `physical_path` is opened natively.
+- `atelier-kernel --check` statically fails any domain source file whose file operations use a string-literal path without the `vfs://` prefix. Third-party libraries are not scanned and not prefix-matched.
+- No OS sandbox: C extensions / native addons / subprocesses bypass language-level wrapping, so centralization is a convention, not a hard boundary.

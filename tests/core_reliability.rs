@@ -1,8 +1,10 @@
 //! Whole-core reliability acceptance. These regressions reproduce the old implementation's
 //! crash windows and resource ownership defects, using the real ledger, queues and processes.
 use atelier_kernel::{
-    AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KernelToDomainFrame as Frame,
+    AtelierKernel, ContractStatus, KernelToDomainFrame as Frame,
 };
+#[cfg(unix)]
+use atelier_kernel::{DomainProcessSpec, DomainStatus};
 use serde_json::json;
 use std::{
     path::PathBuf,

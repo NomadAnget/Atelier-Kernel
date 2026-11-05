@@ -22,7 +22,7 @@ fn endpoint_round_trip() {
         reply
     });
 
-    let mut server = listener.accept().unwrap();
+    let server = listener.accept().unwrap();
     let (mut reader, mut writer) = server.into_split();
     let mut request = [0u8; 6];
     reader.read_exact(&mut request).unwrap();

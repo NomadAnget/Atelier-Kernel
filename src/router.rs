@@ -1091,7 +1091,7 @@ impl KernelRouter {
                 if let Some(supervisor) = self.supervisor() {
                     if self
                         .control_inflight
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                             (count < 32).then_some(count + 1)
                         })
                         .is_err()

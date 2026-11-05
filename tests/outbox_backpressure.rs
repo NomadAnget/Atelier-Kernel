@@ -1,7 +1,10 @@
 use atelier_kernel::{
-    AtelierKernel, ContractStatus, DomainProcessSpec, DomainStatus, KernelToDomainFrame as Frame,
+    AtelierKernel, ContractStatus, DomainStatus, KernelToDomainFrame as Frame,
 };
+#[cfg(target_os = "linux")]
+use atelier_kernel::DomainProcessSpec;
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[test]

@@ -2,7 +2,6 @@ use crate::services::outbox;
 use crate::services::ports::{Forwarder, PortBinding};
 use crate::diag::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
 use std::collections::HashMap;
-use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -25,58 +24,11 @@ pub use crate::supervisor::config::{
     DomainProcessSpec, DomainUpdateResult, KernelBootConfig, SupervisorError,
 };
 
-
 #[cfg(unix)]
 unsafe extern "C" {
     fn fcntl(fd: std::os::raw::c_int, cmd: std::os::raw::c_int, ...) -> std::os::raw::c_int;
 }
 
-#[cfg(unix)]
-fn clear_cloexec(fd: std::os::raw::c_int) -> std::io::Result<()> {
-    const F_SETFD: std::os::raw::c_int = 2;
-    let rc = unsafe { fcntl(fd, F_SETFD, 0 as std::os::raw::c_int) };
-    if rc == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn allocate_non_stdio_pipes() -> std::io::Result<(
-    std::io::PipeReader,
-    std::io::PipeWriter,
-    std::io::PipeReader,
-    std::io::PipeWriter,
-)> {
-    use std::os::fd::AsRawFd;
-    let mut held = Vec::new();
-    loop {
-        let (k2d_rx, k2d_tx) = std::io::pipe()?;
-        let (d2k_rx, d2k_tx) = std::io::pipe()?;
-        if k2d_rx.as_raw_fd() >= 3 && d2k_tx.as_raw_fd() >= 3 {
-            drop(held);
-            return Ok((k2d_rx, k2d_tx, d2k_rx, d2k_tx));
-        }
-        held.push((k2d_rx, k2d_tx, d2k_rx, d2k_tx));
-        if held.len() > 8 {
-            return Err(std::io::Error::other(
-                "failed to allocate IPC pipe descriptors >= 3",
-            ));
-        }
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" {
-    fn SetHandleInformation(hObject: *mut std::ffi::c_void, dwMask: u32, dwFlags: u32) -> i32;
-}
-
-#[cfg(windows)]
-const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
-
-#[cfg(windows)]
-static PIPE_INHERITANCE: Mutex<()> = Mutex::new(());
 const MAX_IPC_FRAME: usize = 16 * 1024 * 1024;
 #[cfg(unix)]
 fn nonblocking<T: std::os::fd::AsRawFd>(io: &T) -> std::io::Result<()> {
@@ -437,155 +389,6 @@ impl DomainSupervisorInner {
             })
             .clone())
     }
-    fn spawn_child_pipes(
-        &self,
-        domain_id: &str,
-        spec: &DomainProcessSpec,
-    ) -> Result<(Child, std::io::PipeWriter, std::io::PipeReader), SupervisorError> {
-        #[cfg(windows)]
-        let _inheritance = PIPE_INHERITANCE.lock();
-
-        #[cfg(unix)]
-        let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) =
-            allocate_non_stdio_pipes().map_err(|source| SupervisorError::SpawnFailed {
-                domain: domain_id.to_string(),
-                source,
-            })?;
-
-        #[cfg(windows)]
-        let (k2d_rx, k2d_tx, d2k_rx, d2k_tx) = {
-            let (k2d_rx, k2d_tx) =
-                std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
-                    domain: domain_id.to_string(),
-                    source,
-                })?;
-            let (d2k_rx, d2k_tx) =
-                std::io::pipe().map_err(|source| SupervisorError::SpawnFailed {
-                    domain: domain_id.to_string(),
-                    source,
-                })?;
-            (k2d_rx, k2d_tx, d2k_rx, d2k_tx)
-        };
-
-        #[cfg(unix)]
-        let (r_fd, w_fd) = {
-            use std::os::fd::AsRawFd;
-            let r = k2d_rx.as_raw_fd();
-            let w = d2k_tx.as_raw_fd();
-            (r, w)
-        };
-
-        #[cfg(windows)]
-        let (r_handle, w_handle) = {
-            use std::os::windows::io::AsRawHandle;
-            let r_h = k2d_rx.as_raw_handle();
-            let w_h = d2k_tx.as_raw_handle();
-            unsafe {
-                if SetHandleInformation(r_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-                    == 0
-                    || SetHandleInformation(w_h as *mut _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)
-                        == 0
-                {
-                    return Err(SupervisorError::SpawnFailed {
-                        domain: domain_id.to_string(),
-                        source: std::io::Error::last_os_error(),
-                    });
-                }
-            }
-            (r_h as usize, w_h as usize)
-        };
-
-        let configure_cmd = |cmd: &mut Command| {
-            cmd.args(&spec.args)
-                .env_remove("ATELIER_PORT_BINDINGS")
-                .env_remove("ATELIER_MANAGED_READY")
-                .envs(&spec.env)
-                .env_remove("ATELIER_IPC_READ_FD")
-                .env_remove("ATELIER_IPC_WRITE_FD")
-                .env_remove("ATELIER_IPC_HANDLE_MODE")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            if let Some(root) = self.files_root.read().as_ref() {
-                let domain_root = root.join(&spec.domain_id);
-                let _ = std::fs::create_dir_all(&domain_root);
-                cmd.env("ATELIER_FILES_ROOT", domain_root.to_string_lossy().to_string());
-            }
-            if let Some(dir) = &spec.working_dir {
-                cmd.current_dir(dir);
-            }
-            #[cfg(unix)]
-            {
-                cmd.env("ATELIER_IPC_READ_FD", r_fd.to_string())
-                    .env("ATELIER_IPC_WRITE_FD", w_fd.to_string());
-                // Only the child clears CLOEXEC. Concurrent Unix spawns cannot inherit each other's pipes.
-                use std::os::unix::process::CommandExt;
-                unsafe {
-                    cmd.pre_exec(move || {
-                        clear_cloexec(r_fd)?;
-                        clear_cloexec(w_fd)?;
-                        Ok(())
-                    });
-                }
-            }
-            #[cfg(windows)]
-            {
-                cmd.env("ATELIER_IPC_READ_FD", r_handle.to_string())
-                    .env("ATELIER_IPC_WRITE_FD", w_handle.to_string())
-                    .env("ATELIER_IPC_HANDLE_MODE", "win32");
-            }
-        };
-
-        let command_str = if cfg!(windows) && spec.command == "python3" {
-            "python"
-        } else {
-            &spec.command
-        };
-        let mut cmd = Command::new(command_str);
-        configure_cmd(&mut cmd);
-
-        let child_res = match cmd.spawn() {
-            Ok(c) => Ok(c),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let alt_cmd = if command_str == "python3" {
-                    Some("python")
-                } else if command_str == "python" {
-                    Some("python3")
-                } else {
-                    None
-                };
-
-                if let Some(alt) = alt_cmd {
-                    let mut fallback = Command::new(alt);
-                    configure_cmd(&mut fallback);
-                    fallback
-                        .spawn()
-                        .map_err(|source| SupervisorError::SpawnFailed {
-                            domain: domain_id.to_string(),
-                            source,
-                        })
-                } else {
-                    Err(SupervisorError::SpawnFailed {
-                        domain: domain_id.to_string(),
-                        source: e,
-                    })
-                }
-            }
-            Err(e) => Err(SupervisorError::SpawnFailed {
-                domain: domain_id.to_string(),
-                source: e,
-            }),
-        };
-
-        // Explicitly drop the child-side pipe endpoints in the parent process immediately
-        // so the Kernel only holds (k2d_tx, d2k_rx) and receives immediate EOF when the domain exits.
-        drop(k2d_rx);
-        drop(d2k_tx);
-
-        let child = child_res?;
-        Ok((child, k2d_tx, d2k_rx))
-    }
-
     /// 命名端点版 spawn：两条单向管道，`in`（内核→域，域只读）、`out`（域→内核，域只写）。
     /// 单向管道避免 Windows 上「同一句柄并发阻塞读 + 写」的串行化死锁。
     #[allow(dead_code)]
@@ -645,7 +448,7 @@ impl DomainSupervisorInner {
         };
         let mut cmd = Command::new(command_str);
         configure_cmd(&mut cmd);
-        let mut child = cmd.spawn().map_err(|source| SupervisorError::SpawnFailed {
+        let child = cmd.spawn().map_err(|source| SupervisorError::SpawnFailed {
             domain: domain_id.to_string(),
             source,
         })?;
@@ -1555,7 +1358,7 @@ mod exit_drain_regression {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod bounded_transport_drain_test {
     use super::*;
     // Windows 上的 std pipe 需要 PeekNamedPipe 轮询；该轮询已内建到端点 reader，

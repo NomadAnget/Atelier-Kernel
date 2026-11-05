@@ -606,8 +606,8 @@ class AtelierDomain {
 
   /**
    * Registers a domain file as a kernel-indexed object via `kernel.storage` (C4).
-   * The kernel only indexes the absolute path (no copy, no move) and returns
-   * `{ object_id, size, checksum }`. The domain keeps using its path as a normal file.
+   * The kernel only indexes the absolute path (no copy, no move, no read) and returns
+   * `{ object_id, size }`. The domain keeps using its path as a normal file.
    */
   putObject(filePath) {
     const absolute = require("path").resolve(filePath);

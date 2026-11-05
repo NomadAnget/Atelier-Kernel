@@ -1,7 +1,7 @@
 //! C4 存储枢纽对象索引的端到端验证（宪法 C4）。
 //!
-//! 大文件不进消息管道：域把本地文件交给内核（StorageObjectPut），内核复制进自己的对象目录、
-//! 算 checksum、给 object_id；消息 data 只带 object_id 引用；跨域读取只读；删除权随域走。
+//! 内核只索引绝对路径（不复制、不移动、不读取物理文件），消息 data 只带 object_id 引用；
+//! 跨域读取只读；删除权随域走；物理文件不存在时使用前自愈清理失效索引。
 
 use atelier_kernel::{
     AtelierKernel, ContractStatus as S, KernelToDomainFrame as F, MSG_STORAGE_OBJECT_DELETE,
@@ -26,7 +26,7 @@ fn c4_object_flow_write_read_cross_domain_delete() {
     let consumer = k.attach_domain("consumer");
     let rogue = k.attach_domain("rogue");
 
-    // 写对象：域本地文件，内核复制进对象目录，域只拿 object_id/size/checksum。
+    // 写对象：域本地文件，内核只索引绝对路径，域只拿 object_id/size。
     let dir = std::env::temp_dir().join(format!("c4-src-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("video.bin");
@@ -55,7 +55,6 @@ fn c4_object_flow_write_read_cross_domain_delete() {
     let get = terminal(consumer.drain_frames());
     assert_eq!(get.status, S::Completed, "cross-domain read failed: {:?}", get.data);
     let get_data = get.data.unwrap();
-    assert_eq!(get_data["checksum"], put_data["checksum"]);
     assert_eq!(get_data["size"], put_data["size"]);
     assert!(!get_data["path"].as_str().unwrap().is_empty());
 

@@ -1463,7 +1463,6 @@ impl KernelRouter {
                         Some(json!({
                             "object_id": obj_ref.object_id,
                             "size": obj_ref.size,
-                            "checksum": obj_ref.checksum,
                         })),
                     ),
                     Err(e) => self.complete_kernel_internal_target(
@@ -1484,7 +1483,11 @@ impl KernelRouter {
                     );
                     return;
                 };
-                match self.object_hub.lock().resolve(object_id).cloned() {
+                let resolved = {
+                    let mut hub = self.object_hub.lock();
+                    hub.resolve(object_id).cloned()
+                };
+                match resolved {
                     Some(obj) => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
@@ -1492,7 +1495,6 @@ impl KernelRouter {
                         Some(json!({
                             "object_id": obj.object_id,
                             "size": obj.size,
-                            "checksum": obj.checksum,
                             "path": obj.path,
                             "owner": obj.owner,
                         })),

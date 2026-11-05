@@ -731,8 +731,8 @@ class AtelierDomain(AsyncRuntime):
     async def put_object(self, path: str):
         """Registers a domain file as a kernel-indexed object via `kernel.storage` (C4).
 
-        The kernel only indexes the file's absolute path (no copy, no move) and returns
-        `{"object_id","size","checksum"}`. The domain keeps using its file as a normal
+        The kernel only indexes the file's absolute path (no copy, no move, no read)
+        and returns `{"object_id","size"}`. The domain keeps using its file as a normal
         file object; the `object_id` is what messages carry.
         """
         import os

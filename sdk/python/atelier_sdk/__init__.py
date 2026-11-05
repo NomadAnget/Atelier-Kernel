@@ -728,39 +728,36 @@ class AtelierDomain(AsyncRuntime):
             data={},
         )
 
-    async def put_object(self, path: str):
-        """Registers a domain file as a kernel-indexed object via `kernel.storage` (C4).
+    async def put_object(self, virtual_path: str):
+        """Allocates a virtual path to a flat unique-id file and returns its object ref (C4).
 
-        The kernel only indexes the file's absolute path (no copy, no move, no read)
-        and returns `{"object_id","size"}`. The domain keeps using its file as a normal
-        file object; the `object_id` is what messages carry.
+        Returns ``{"object_id","virtual_path","physical_path","size"}``. The kernel only
+        indexes the mapping; subprocess tools that need a real path use ``physical_path``.
         """
-        import os
-
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageObjectPut",
-            params={"path": os.path.abspath(path)},
-            data={},
-        )
+        return (
+            await self.request(
+                "kernel.storage",
+                "StorageObjectPut",
+                {"virtual_path": virtual_path},
+                {},
+            )
+        )["data"]
 
     async def get_object(self, object_id: str):
-        """Resolves an `object_id` to a kernel-provided read-only file handle (C4)."""
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageObjectGet",
-            params={"object_id": object_id},
-            data={},
-        )
+        """Resolves an `object_id` to its object ref (C4)."""
+        return (
+            await self.request(
+                "kernel.storage", "StorageObjectGet", {"object_id": object_id}, {}
+            )
+        )["data"]
 
     async def delete_object(self, object_id: str):
         """Deletes this domain's object (index + physical file) via `kernel.storage` (C4)."""
-        return await self.send(
-            targets="kernel.storage",
-            message_type="StorageObjectDelete",
-            params={"object_id": object_id},
-            data={},
-        )
+        return (
+            await self.request(
+                "kernel.storage", "StorageObjectDelete", {"object_id": object_id}, {}
+            )
+        )["data"]
 
     def enable_file_interception(self, root: Optional[str] = None, prefix: str = "vfs://"):
         """Installs the C4 virtual file namespace (C4).

@@ -111,22 +111,55 @@ fn ipc_reader<R: std::io::Read>(input: R) -> impl std::io::Read {
 }
 /// 在工作线程里接受端点并取出内核侧的一半（`in` 取写端、`out` 取读端）。
 /// accept 放在这里而不是 spawn 路径，避免「域没连上」阻塞 supervisor。
-fn accept_writer(
+///
+/// 必须能被 `stop` 打断：域在连接前就退出（例如 stop/restart 立刻 kill）时，
+/// 阻塞 accept 会让 `terminate()` 的 `worker.join()` 永远等下去。
+/// Unix 用非阻塞 listener 轮询；Windows 仍靠 `cancel_worker` 取消同步 accept。
+fn accept_stream(
     mut listener: crate::edge::endpoint::EndpointListener,
-) -> std::io::Result<crate::edge::endpoint::EndpointWriter> {
-    let (_reader, writer) = listener.accept()?.into_split();
+    stop: &AtomicBool,
+) -> std::io::Result<Option<crate::edge::endpoint::EndpointStream>> {
+    #[cfg(unix)]
+    listener.set_nonblocking(true)?;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        match listener.accept() {
+            Ok(stream) => return Ok(Some(stream)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn accept_writer(
+    listener: crate::edge::endpoint::EndpointListener,
+    stop: &AtomicBool,
+) -> std::io::Result<Option<crate::edge::endpoint::EndpointWriter>> {
+    let Some(stream) = accept_stream(listener, stop)? else {
+        return Ok(None);
+    };
+    let (_reader, writer) = stream.into_split();
     #[cfg(unix)]
     writer.set_nonblocking(true)?;
-    Ok(writer)
+    Ok(Some(writer))
 }
 
 fn accept_reader(
-    mut listener: crate::edge::endpoint::EndpointListener,
-) -> std::io::Result<crate::edge::endpoint::EndpointReader> {
-    let (reader, _writer) = listener.accept()?.into_split();
+    listener: crate::edge::endpoint::EndpointListener,
+    stop: &AtomicBool,
+) -> std::io::Result<Option<crate::edge::endpoint::EndpointReader>> {
+    let Some(stream) = accept_stream(listener, stop)? else {
+        return Ok(None);
+    };
+    let (reader, _writer) = stream.into_split();
     #[cfg(unix)]
     reader.set_nonblocking(true)?;
-    Ok(reader)
+    Ok(Some(reader))
 }
 
 fn pump_lines<R: std::io::Read>(
@@ -725,8 +758,9 @@ impl DomainSupervisorInner {
                 thread::Builder::new()
                     .name(format!("kernel-tx-{id}-{generation}"))
                     .spawn(move || {
-                        let mut tx = match accept_writer(in_listener) {
-                            Ok(writer) => writer,
+                        let mut tx = match accept_writer(in_listener, &stop) {
+                            Ok(Some(writer)) => writer,
+                            Ok(None) => return,
                             Err(error) => {
                                 diagnostics.record("tx_accept", io_error(&error), true);
                                 drain.store(true, Ordering::Release);
@@ -771,8 +805,9 @@ impl DomainSupervisorInner {
                 thread::Builder::new()
                     .name(format!("kernel-rx-{id}-{generation}"))
                     .spawn(move || {
-                        let rx = match accept_reader(out_listener) {
-                            Ok(reader) => reader,
+                        let rx = match accept_reader(out_listener, &stop) {
+                            Ok(Some(reader)) => reader,
+                            Ok(None) => return,
                             Err(error) => {
                                 diagnostics.record("rx_accept", io_error(&error), true);
                                 drain.store(true, Ordering::Release);

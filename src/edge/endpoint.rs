@@ -64,6 +64,10 @@ mod imp {
     }
 
     impl EndpointListener {
+        /// Unix 上 accept 必须可轮询：域在连接前退出时，阻塞 accept 会卡死终止流程。
+        pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            self.listener.set_nonblocking(nonblocking)
+        }
         pub fn accept(&mut self) -> io::Result<EndpointStream> {
             Ok(EndpointStream(self.listener.accept()?.0))
         }

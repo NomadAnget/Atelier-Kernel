@@ -122,7 +122,7 @@ function enhance(Base,RequestError,ExecutionFailed) {
     _diagnostic(message){try{this.logger.error(message);}catch(_){process.stderr.write(message+'\n');}}
     constructor(options={}) {
       super(options);
-      const defaults={maxPending:1024,maxOutbox:256,maxFrameBytes:16777216,shutdownGrace:5};
+      const defaults={maxPending:1024,maxOutbox:256,maxFrameBytes:16777216,shutdownGrace:5,resultTtlMs:30000};
       for(const key of Object.keys(options))if(!['domain','stageDelayMs',...Object.keys(defaults)].includes(key))throw new Error('unknown SDK option: '+key);
       this._limits={...defaults};
       for(const key of Object.keys(defaults))if(options[key]!==undefined)this._limits[key]=options[key];

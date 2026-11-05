@@ -39,15 +39,16 @@ module.exports=function messageMethods(RequestError){
    if(entry&&!entry.ids.has(target)){
     if(this._results.has(mid))throw Error('kernel reused a child message ID');
     let resolve;const promise=new Promise(yes=>{resolve=yes;});
-    entry.ids.set(target,mid);this._results.set(mid,{target,promise,resolve,done:false,waiters:0});
+    entry.ids.set(target,mid);this._results.set(mid,{target,promise,resolve,done:false,waiters:0,evict:null});
     if(entry.ids.size===entry.targets.length)entry.resolve(entry.targets.map(t=>entry.ids.get(t)));
    }
    const result=this._results.get(mid);
-   if(result&&result.target===target&&!result.done&&terminal.includes(status)){result.done=true;result.resolve(frame);}
+   if(result&&result.target===target&&!result.done&&terminal.includes(status)){result.done=true;result.resolve(frame);if(!result.waiters)this._scheduleEvict(mid,result);}
   },
   async waitResult(messageId,{timeout=30,signal=this._currentSignal()}={}){
    if(timeout!==null&&(!Number.isFinite(timeout)||timeout<=0))throw Error('invalid timeout');
    const entry=this._results.get(messageId);if(!entry)throw new RequestError('unknown_message',null,messageId);
+   if(entry.evict){clearTimeout(entry.evict);entry.evict=null;}
    entry.waiters++;let observed=false;
    try{const frame=await this._awaitMessage(entry.promise,timeout,signal,messageId);observed=true;if(frame.status!=='completed')throw new RequestError(frame.status,frame.data,messageId);return frame;}
    finally{entry.waiters--;if(observed&&!entry.waiters)this._results.delete(messageId);}
@@ -56,7 +57,9 @@ module.exports=function messageMethods(RequestError){
    if(!Array.isArray(messageIds)||!messageIds.length||messageIds.some(id=>typeof id!=='string'||!id)||new Set(messageIds).size!==messageIds.length)throw Error('expected distinct message IDs');
    return Promise.all(messageIds.map(async mid=>{const target=this._results.get(mid)?.target??null;try{return {message_id:mid,target,status:'completed',receipt:await this.waitResult(mid,options),error:null};}catch(e){if(!(e instanceof RequestError))throw e;return {message_id:mid,target,status:e.status,receipt:null,error:{status:e.status,data:e.data,message_id:mid}};}}));
   },
-  forgetResult(mid){const entry=this._results.get(mid);if(entry?.waiters)throw new RequestError('busy',null,mid);return this._results.delete(mid);},
+  forgetResult(mid){const entry=this._results.get(mid);if(entry?.waiters)throw new RequestError('busy',null,mid);if(entry?.evict)clearTimeout(entry.evict);return this._results.delete(mid);},
+  // 未被取走的结果按 TTL 自动回收，避免 send-only 调用永久占满 maxPending（busy 自愈）。
+  _scheduleEvict(mid,entry){const ttl=this._limits.resultTtlMs;if(!ttl||ttl<=0)return;entry.evict=setTimeout(()=>{entry.evict=null;if(!entry.waiters)this._results.delete(mid);},ttl);entry.evict.unref?.();},
   requestMany(messageIds,options={}){return this.waitResults(messageIds,options);},
   async request(target,type,params={},data={},options={}){
    if(typeof target!=='string')throw Error('request requires one target');const start=Date.now(),timeout=options.timeout===undefined?30:options.timeout;let mid;

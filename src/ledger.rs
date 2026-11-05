@@ -748,19 +748,29 @@ impl KernelLedger {
                 let victims: Vec<(String, i64)> = {
                     let mut stmt = mem
                         .prepare(
-                            "SELECT message_id, coalesce(length(data),0) FROM kernel_ledger \
-                             WHERE status IN ('completed','execution_failed','contract_invalid','target_invalid') \
+                            "SELECT message_id, coalesce(length(data),0), target, message_type FROM kernel_ledger \
                              ORDER BY created_at ASC",
                         )
                         .expect("quota victim query");
                     let rows = stmt
-                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                        .query_map([], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        })
                         .expect("quota victim rows");
                     rows.filter_map(Result::ok).collect()
                 };
-                for (id, len) in victims {
+                for (id, len, target, kind) in victims {
                     if need <= 0 {
                         break;
+                    }
+                    // 非持久（Ephemeral）是尽力而为：终态与在途都可以丢；Durable/Volatile 一律不动。
+                    if DeliveryPolicy::resolve(&target, &kind) != DeliveryPolicy::Ephemeral {
+                        continue;
                     }
                     mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1", [&id])
                         .expect("quota eviction");

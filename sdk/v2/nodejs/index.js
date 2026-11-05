@@ -9,7 +9,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const TERMINAL = new Set(["completed", "execution_failed", "target_invalid", "contract_invalid"]);
-const SYSTEM_EVENTS = { LogEvent: "log", NotifyEvent: "notify", ObserverEvent: "observation", TelemetryEvent: "telemetry" };
+const SYSTEM_EVENTS = { LogEvent: "log", NotifyEvent: "notify", ObservationEvent: "observation", TelemetryEvent: "telemetry" };
 
 // Windows 上内核传的是 HANDLE，Node 不能直接用；桥接进程把 HANDLE 转成管道。
 const BRIDGE_PY = [

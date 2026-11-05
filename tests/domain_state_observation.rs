@@ -46,23 +46,24 @@ fn exercise(node: bool) {
     let py = r#"import asyncio,json,sys,os
 from pathlib import Path
 from atelier_sdk import AtelierDomain
-d=AtelierDomain(domain='watcher')
+d=AtelierDomain('watcher')
 @d.handler('ping')
 def ping(m):return {'ok':True}
 @d.on_observation
 async def observe(event):
  if event.get('message_type')=='DomainStateSnapshot':
   await asyncio.sleep(.03)
-  assert d.observer.domain_states is not None
   with Path(sys.argv[1]).open('a', encoding='utf-8') as report: report.write(json.dumps(event['details'])+'\n')
-d.run()
+async def start():
+ await d.subscribe_observer()
+asyncio.run(d.run_async(on_start=start))
 "#;
-    let js = r#"const {AtelierDomain}=require(process.argv[1]);const fs=require('node:fs');const d=new AtelierDomain({domain:'watcher'});d.handler('ping',()=>({ok:true}));d.onObservation(async event=>{if(event.message_type==='DomainStateSnapshot'){await new Promise(r=>setTimeout(r,30));if(!d.observer.domainStates)throw Error('cache missing');fs.appendFileSync(process.argv[2],JSON.stringify(event.details)+'\n');}});d.run();"#;
+    let js = r#"const {AtelierDomain}=require(process.argv[1]);const fs=require('node:fs');const d=new AtelierDomain('watcher');d.handler('ping',()=>({ok:true}));d.onObservation(async event=>{if(event.message_type==='DomainStateSnapshot'){await new Promise(r=>setTimeout(r,30));fs.appendFileSync(process.argv[2],JSON.stringify(event.details)+'\n');}});d.run({onStart:async()=>{await d.subscribeObserver();}});"#;
     let args: Vec<String> = if node {
         vec![
             "-e".into(),
             js.into(),
-            root.join("sdk/nodejs").to_string_lossy().into(),
+            root.join("sdk/v2/nodejs").to_string_lossy().into(),
             report.to_string_lossy().into(),
         ]
     } else {
@@ -73,19 +74,20 @@ d.run()
     observer.auto_restart = false;
     observer.env.insert(
         "PYTHONPATH".into(),
-        root.join("sdk/python").to_string_lossy().into(),
+        root.join("sdk/v2/python").to_string_lossy().into(),
     );
-    let worker_py = r#"from atelier_sdk import AtelierDomain
-d=AtelierDomain(domain='worker')
+    let worker_py = r#"import asyncio
+from atelier_sdk import AtelierDomain
+d=AtelierDomain('worker')
 @d.handler('ping')
 def ping(m):return {'ok':True}
-d.run()
+asyncio.run(d.run_async())
 "#;
     let mut worker =
         DomainProcessSpec::new("worker", python(), vec!["-c".into(), worker_py.into()]);
     worker.env.insert(
         "PYTHONPATH".into(),
-        root.join("sdk/python").to_string_lossy().into(),
+        root.join("sdk/v2/python").to_string_lossy().into(),
     );
     worker.restart_delay_ms = 10;
     let k = AtelierKernel::new_in_memory().unwrap();

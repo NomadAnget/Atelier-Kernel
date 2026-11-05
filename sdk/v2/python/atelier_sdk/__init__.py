@@ -305,7 +305,9 @@ class AtelierDomain:
     def _emit(self, kind, payload):
         for fn in list(self._events[kind]):
             try:
-                fn(payload)
+                result = fn(payload)
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -536,7 +538,7 @@ class AtelierDomain:
 SYSTEM_EVENTS = {
     "LogEvent": "log",
     "NotifyEvent": "notify",
-    "ObserverEvent": "observation",
+    "ObservationEvent": "observation",
     "TelemetryEvent": "telemetry",
 }
 

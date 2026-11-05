@@ -9,7 +9,8 @@
     "index.d.ts",
     "README.md",
     "runtime.js",
-    "messages.js"
+    "messages.js",
+    "files.js"
   ],
   "keywords": [
     "atelier-kernel",

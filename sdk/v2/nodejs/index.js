@@ -128,7 +128,7 @@ class AtelierDomain {
     this._closed = false;
     this._input = null;
     this._output = null;
-    this._fds = IPC_FDS;
+    this._paths = IPC_PATHS;
   }
 
   // 能力 2：注册处理器
@@ -438,8 +438,8 @@ class AtelierDomain {
 
   // 能力 1：生命周期
   async runAsync({ onStart, onClose } = {}) {
-    if (!this._fds) throw new Error("IPC pipes are not configured");
-    this._streams = openStreams(this._fds);
+    if (!this._paths) throw new Error("IPC endpoints are not configured (ATELIER_IPC_IN / ATELIER_IPC_OUT)");
+    this._streams = openStreams(this._paths);
     this._input = this._streams.input;
     this._output = this._streams.output;
     this._readLoop();
@@ -455,7 +455,8 @@ class AtelierDomain {
   shutdown() {
     this._closed = true;
     if (this._finish) this._finish();
-    if (this._streams?.bridge) this._streams.bridge.kill();
+    if (this._streams?.input) this._streams.input.destroy();
+    if (this._streams?.output) this._streams.output.destroy();
   }
 
   _write(frame) {
@@ -547,33 +548,21 @@ class Logger {
   error(message, fields) { this._log("error", message, fields); }
 }
 
-function claimIpcFds() {
-  const readRaw = process.env.ATELIER_IPC_READ_FD;
-  const writeRaw = process.env.ATELIER_IPC_WRITE_FD;
-  const handleMode = process.env.ATELIER_IPC_HANDLE_MODE || "";
-  delete process.env.ATELIER_IPC_READ_FD;
-  delete process.env.ATELIER_IPC_WRITE_FD;
-  delete process.env.ATELIER_IPC_HANDLE_MODE;
-  if (readRaw === undefined || writeRaw === undefined) return null;
-  return { readFd: Number.parseInt(readRaw, 10), writeFd: Number.parseInt(writeRaw, 10), handleMode };
+function claimIpcPaths() {
+  const inPath = process.env.ATELIER_IPC_IN;
+  const outPath = process.env.ATELIER_IPC_OUT;
+  delete process.env.ATELIER_IPC_IN;
+  delete process.env.ATELIER_IPC_OUT;
+  delete process.env.ATELIER_IPC_PIPE;
+  if (inPath === undefined || outPath === undefined) return null;
+  return { inPath, outPath };
 }
 
-function openStreams(fds) {
-  if (process.platform === "win32" && (fds.handleMode === "win32" || fds.handleMode === "win32_handle")) {
-    const python = process.env.PYTHON || process.env.PYTHON_BIN || "python";
-    const bridge = spawn(python, ["-u", "-c", BRIDGE_PY, String(fds.readFd), String(fds.writeFd), String(process.pid)], {
-      stdio: ["pipe", "pipe", "inherit"],
-      windowsHide: true,
-    });
-    bridge.stdout.pause();
-    bridge.on("spawn", () => process.stderr.write("v2 bridge spawned pid=" + bridge.pid + "\n"));
-    bridge.on("exit", (code) => process.stderr.write("v2 bridge exit " + code + "\n"));
-    bridge.on("error", (error) => process.stderr.write("v2 bridge error " + String(error && error.message) + "\n"));
-    return { input: bridge.stdout, output: bridge.stdin, bridge };
-  }
-  const input = new net.Socket({ fd: fds.readFd, readable: true, writable: false });
+function openStreams(paths) {
+  // 两条单向连接：input 读内核数据（内核→域），output 写内核数据（域→内核）。
+  const input = net.createConnection(paths.inPath);
   input.pause();
-  const output = new net.Socket({ fd: fds.writeFd, readable: false, writable: true });
+  const output = net.createConnection(paths.outPath);
   return { input, output, bridge: null };
 }
 
@@ -585,7 +574,7 @@ function withTimeout(promise, seconds) {
   ]);
 }
 
-// 与旧 SDK 一致：模块加载时就认领 IPC 句柄。
-const IPC_FDS = claimIpcFds();
+// 与旧 SDK 一致：模块加载时就认领 IPC 端点。
+const IPC_PATHS = claimIpcPaths();
 
 module.exports = { AtelierDomain, DomainRequestError, DomainExecutionFailed, FileNamespace };

@@ -24,9 +24,14 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 }
 
 const DOMAIN: &str = r#"
+import sys
+_trace = open(r"G:\Atelier\atelier-solo\tmp\v2_e2e_trace.log", "w", buffering=1)
+_trace.write("script start\n")
 from atelier_sdk import AtelierDomain
+_trace.write("imported\n")
 
 domain = AtelierDomain("v2test")
+_trace.write("constructed pipe=" + str(domain._pipe) + "\n")
 
 @domain.handler("echo")
 async def echo(msg):
@@ -54,6 +59,7 @@ async def storage_handler(msg):
     query = await domain.storage_query(record_id=record_id)
     return {"rows": len(query.get("items") or []), "count": query.get("count")}
 
+_trace.write("before run\n")
 import asyncio
 asyncio.run(domain.run_async())
 "#;
@@ -66,7 +72,13 @@ fn sdk_v2_round_trip() {
     let project_root = tmp.join("data");
     let k = AtelierKernel::open_with_db_and_root(&db, &project_root).unwrap();
 
-    let mut spec = DomainProcessSpec::new("v2test", python(), vec!["-c".into(), DOMAIN.to_string()]);
+    let script_path = tmp.join("domain.py");
+    std::fs::write(&script_path, DOMAIN).unwrap();
+    let mut spec = DomainProcessSpec::new(
+        "v2test",
+        python(),
+        vec![script_path.to_string_lossy().to_string()],
+    );
     spec.env.insert("PYTHONPATH".into(), v2.to_string_lossy().to_string());
     spec.env.insert("PYTHONIOENCODING".into(), "utf-8".into());
     spec.auto_restart = false;
@@ -85,7 +97,11 @@ fn sdk_v2_round_trip() {
         if k.router().active_routes().iter().any(|r| r == "v2test.echo") {
             break;
         }
-        assert!(Instant::now() < deadline, "v2 domain did not register");
+        if Instant::now() >= deadline {
+            let trace = std::fs::read_to_string(r"G:\Atelier\atelier-solo\tmp\v2_e2e_trace.log")
+                .unwrap_or_else(|_| "<no trace>".into());
+            panic!("v2 domain did not register; trace:\n{trace}");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 

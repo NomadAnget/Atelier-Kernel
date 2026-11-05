@@ -41,6 +41,9 @@ class AtelierDomain:
         self._handlers = {}
         self._pending = {}  # seq -> {"targets", "ids", "future"}
         self._results = {}  # message_id -> {"target", "future", "waiters", "evict"}
+        self._events = {kind: [] for kind in ("receipt", "log", "notify", "observation", "telemetry")}
+        self._logger = _Logger(self)
+        self._namespace = None
         self._seq = 1
         self._lock = threading.Lock()
 
@@ -273,6 +276,96 @@ class AtelierDomain:
             )
         )["data"]
 
+    # ── 能力 7：事件回调（唯一实现 `_emit`）────────────────────────────
+    def on_receipt(self, fn):
+        self._events["receipt"].append(fn)
+        return fn
+
+    def on_log(self, fn):
+        self._events["log"].append(fn)
+        return fn
+
+    def on_notify(self, fn):
+        self._events["notify"].append(fn)
+        return fn
+
+    def on_observation(self, fn):
+        self._events["observation"].append(fn)
+        return fn
+
+    def on_telemetry(self, fn):
+        self._events["telemetry"].append(fn)
+        return fn
+
+    def _emit(self, kind, payload):
+        for fn in list(self._events[kind]):
+            try:
+                fn(payload)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ── 能力 14：日志（唯一实例 `_logger`）─────────────────────────────
+    @property
+    def logger(self):
+        return self._logger
+
+    # ── 能力 15：端口 ─────────────────────────────────────────────────
+    @property
+    def bindings(self):
+        raw = os.environ.get("ATELIER_PORT_BINDINGS")
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return {}
+
+    # ── 能力 13：C4 对象（唯一命名空间实例 `_namespace`）────────────────
+    def enable_file_interception(self, root=None):
+        import builtins
+
+        base = root or os.environ.get("ATELIER_FILES_ROOT") or "."
+        self._namespace = _FileNamespace(base, self._register_object)
+        original = builtins.open
+        namespace = self._namespace
+
+        def patched(path, mode="r", *args, **kwargs):
+            if isinstance(path, int) or not namespace.matches(path):
+                return original(path, mode, *args, **kwargs)
+            physical = namespace.resolve(path, any(ch in mode for ch in "wax+"))
+            return original(physical, mode, *args, **kwargs)
+
+        builtins.open = patched
+        return self._namespace
+
+    def _register_object(self, virtual, object_id):
+        self._write(
+            {
+                "frame_type": "send",
+                "seq": self._next_seq(),
+                "targets": ["kernel.storage"],
+                "message_type": "StorageObjectPut",
+                "params": {"virtual_path": virtual, "object_id": object_id},
+                "data": {},
+            }
+        )
+
+    async def put_object(self, virtual_path):
+        return (await self.request("kernel.storage", "StorageObjectPut", {"virtual_path": virtual_path}))["data"]
+
+    async def get_object(self, object_id):
+        return (await self.request("kernel.storage", "StorageObjectGet", {"object_id": object_id}))["data"]
+
+    async def delete_object(self, object_id):
+        return (await self.request("kernel.storage", "StorageObjectDelete", {"object_id": object_id}))["data"]
+
+    def file_object_id(self, path):
+        return self._namespace.object_id(path) if self._namespace is not None else None
+
+    async def refresh_file_index(self):
+        data = (await self.request("kernel.storage", "StorageObjectList", {}))["data"]
+        return data
+
     # ── 能力 1：生命周期 ──────────────────────────────────────────────
     async def run_async(self, *, on_start=None, on_close=None):
         if self._reader is None or self._writer is None:
@@ -332,8 +425,13 @@ class AtelierDomain:
     async def _handle(self, frame):
         if frame.get("frame_type") == "receipt":
             self._receive_result(frame)
-        else:
-            await self._dispatch(frame)
+            self._emit("receipt", frame)
+            return
+        kind = SYSTEM_EVENTS.get(frame.get("message_type"))
+        if kind is not None:
+            self._emit(kind, frame.get("data") or {})
+            return
+        await self._dispatch(frame)
 
     def _receive_result(self, frame):
         message_id = frame.get("message_id")
@@ -384,3 +482,79 @@ class AtelierDomain:
                 "execution_failed",
                 {"error": "handler_exception", "reason": str(error)},
             )
+
+
+SYSTEM_EVENTS = {
+    "LogEvent": "log",
+    "NotifyEvent": "notify",
+    "ObserverEvent": "observation",
+    "TelemetryEvent": "telemetry",
+}
+
+
+class _Logger:
+    """唯一的日志实现：把记录发给 `kernel.logger`。"""
+
+    def __init__(self, domain):
+        self._domain = domain
+
+    def _log(self, level, message, **fields):
+        self._domain._write(
+            {
+                "frame_type": "send",
+                "seq": self._domain._next_seq(),
+                "targets": ["kernel.logger"],
+                "message_type": "Log",
+                "params": {"level": level, "component": self._domain.domain},
+                "data": {"message": message, **fields},
+            }
+        )
+
+    def debug(self, message, **fields):
+        self._log("debug", message, **fields)
+
+    def info(self, message, **fields):
+        self._log("info", message, **fields)
+
+    def warn(self, message, **fields):
+        self._log("warn", message, **fields)
+
+    def error(self, message, **fields):
+        self._log("error", message, **fields)
+
+
+class _FileNamespace:
+    """唯一的 C4 命名空间实现：虚拟路径 → `<域根>/<uuid>` 平铺文件。"""
+
+    def __init__(self, root, submit, prefix="vfs://"):
+        self.root = os.path.abspath(root)
+        self._submit = submit
+        self.prefix = prefix
+        self._cache = {}
+        self._by_physical = {}
+
+    def matches(self, path):
+        return isinstance(path, str) and path.startswith(self.prefix)
+
+    def normalize(self, path):
+        raw = str(path)[len(self.prefix) :].replace("\\", "/").lstrip("/")
+        parts = [part for part in raw.split("/") if part not in ("", ".", "..")]
+        return "/".join(parts) or "unnamed"
+
+    def resolve(self, path, for_write):
+        virtual = self.normalize(path)
+        physical = self._cache.get(virtual)
+        if physical is None:
+            if not for_write:
+                raise FileNotFoundError("virtual file not found: " + str(path))
+            object_id = uuid.uuid4().hex
+            physical = os.path.join(self.root, object_id)
+            os.makedirs(self.root, exist_ok=True)
+            self._cache[virtual] = physical
+            self._by_physical[os.path.abspath(physical)] = object_id
+            self._submit(virtual, object_id)
+        return physical
+
+    def object_id(self, path):
+        physical = self._cache.get(self.normalize(path))
+        return self._by_physical.get(os.path.abspath(physical)) if physical else None

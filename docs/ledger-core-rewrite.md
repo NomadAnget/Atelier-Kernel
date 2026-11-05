@@ -75,7 +75,8 @@ CREATE TABLE audit(
 ```
 
 - **`messages` 是唯一权威**：一条消息恰好一行，活消息常驻（Durable 落在磁盘 messages，Volatile/Ephemeral 落在内存 messages —— 同一 schema，只是连接不同）。
-- **`submissions` 有界**：每个 `dedup_key` 只保留最近 `SESSION_REPLAY_WINDOW` 个 seq，替换 `kernel_sessions`(两份) + `highwater` + `identities`。
+- **`submissions` 有界**：每个 `dedup_key` 只保留最近 `SESSION_REPLAY_WINDOW` 个 seq，替换 `kernel_sessions`(两份) + `identities`。
+- **`submission_high` 保留高水位语义（实测确认）**：`highwater` 是单调高水位标记，会话行被终态清理后仍须记住曾到过的最高 seq，否则重放已完成的老 seq 会被误判成新提交而重复执行。它**不能**从 `max(seq)` 推导——`submissions` 只保留有界窗口，窗口外的会话行已删，`max(seq)` 会回落。目标结构里它是独立单列表（或每-key 单行），不是可有可无的缓存。
 - **`audit` 只增**：Durable 终态结果追加，跨重启可查，永不删除（"留日志不留状态"）。
 
 删除的旧表：`identities`、`highwater`、`kernel_sessions`（含磁盘副本）、`identities.record` 缓存。

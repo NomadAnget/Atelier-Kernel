@@ -46,6 +46,54 @@ domain.handler("storage", async (msg) => {{
   const query = await domain.storageQuery({{ record_id: recordId }});
   return {{ rows: (query.items || []).length, count: query.count }};
 }});
+domain.handler("query", async () => {{
+  const handlers = await domain.queryHandlers();
+  const runtime = await domain.queryRuntime();
+  return {{ routes: handlers.routes || [], runtime_ok: !!runtime && typeof runtime === "object" }};
+}});
+domain.handler("notify", async () => {{
+  const result = await domain.notify("info", "hello from v2 node");
+  return {{ notified: !!result && typeof result === "object" }};
+}});
+domain.handler("c4", async () => {{
+  const fs = require("fs");
+  const put = await domain.putObject("e2e/obj-1");
+  fs.writeFileSync(put.physical_path, "c4-payload");
+  const got = await domain.getObject(put.object_id);
+  const deleted = await domain.deleteObject(put.object_id);
+  return {{ object_id: put.object_id, physical_path: put.physical_path, got_matches: got.physical_path === put.physical_path, size: got.size, deleted: !!deleted && typeof deleted === "object" }};
+}});
+domain.handler("wait", async () => {{
+  const mid = await domain.send("v2node.echo", "Echo", {{}}, {{ value: 7 }});
+  const receipt = await domain.waitResult(mid);
+  domain.forgetResult(mid);
+  return {{ echo: receipt.data.echo }};
+}});
+domain.handler("log", async () => {{
+  domain.logger.info("e2e log line", {{ tag: "v2node" }});
+  return {{ logged: true }};
+}});
+domain.handler("subscribe", async () => {{
+  await domain.subscribeLogs();
+  await domain.subscribeTelemetry();
+  await domain.subscribeNotify();
+  return {{ subscribed: true }};
+}});
+domain.handler("supervisor", async () => {{
+  try {{
+    await domain.supervisorRestart("no-such-domain");
+  }} catch (error) {{
+    return {{ routed: true, status: error && error.status || null }};
+  }}
+  return {{ routed: true, status: null }};
+}});
+domain.handler("stress", async () => {{
+  for (let i = 0; i < 20; i += 1) {{
+    const result = await domain.request("v2node.echo", "Echo", {{}}, {{ value: i }});
+    if (result.data.echo !== i) return {{ failed_at: i, got: result.data }};
+  }}
+  return {{ ok: true, pending: domain._pending.size, results: domain._results.size }};
+}});
 domain.run();
 "#,
         sdk.to_string_lossy().replace('\\', "/")
@@ -111,6 +159,56 @@ domain.run();
     assert_eq!(stored.status, atelier_kernel::ContractStatus::Completed, "{:?}", stored.data);
     let stored_data = stored.data.unwrap();
     assert!(stored_data["rows"].as_u64().unwrap_or(0) >= 1, "{stored_data}");
+
+    verifier.send(vec!["v2node.query".into()], "Query", json!({}), json!({}));
+    let queried = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(queried.status, atelier_kernel::ContractStatus::Completed, "{:?}", queried.data);
+    let queried_data = queried.data.unwrap();
+    let routes = queried_data["routes"].as_array().expect("routes");
+    assert!(routes.iter().any(|r| r == "v2node.echo"), "{queried_data}");
+    assert_eq!(queried_data["runtime_ok"], true, "{queried_data}");
+
+    verifier.send(vec!["v2node.notify".into()], "Notify", json!({}), json!({}));
+    let notified = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(notified.status, atelier_kernel::ContractStatus::Completed, "{:?}", notified.data);
+    assert_eq!(notified.data.unwrap()["notified"], true);
+
+    verifier.send(vec!["v2node.c4".into()], "C4", json!({}), json!({}));
+    let c4 = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(c4.status, atelier_kernel::ContractStatus::Completed, "{:?}", c4.data);
+    let c4_data = c4.data.unwrap();
+    assert!(c4_data["object_id"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
+    assert!(c4_data["physical_path"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
+    assert_eq!(c4_data["got_matches"], true, "{c4_data}");
+    assert_eq!(c4_data["size"], 10, "{c4_data}");
+    assert_eq!(c4_data["deleted"], true, "{c4_data}");
+
+    verifier.send(vec!["v2node.wait".into()], "Wait", json!({}), json!({}));
+    let waited = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(waited.status, atelier_kernel::ContractStatus::Completed, "{:?}", waited.data);
+    assert_eq!(waited.data.unwrap()["echo"], 7);
+
+    verifier.send(vec!["v2node.log".into()], "Log", json!({}), json!({}));
+    let logged = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(logged.status, atelier_kernel::ContractStatus::Completed, "{:?}", logged.data);
+
+    verifier.send(vec!["v2node.subscribe".into()], "Subscribe", json!({}), json!({}));
+    let subscribed = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(subscribed.status, atelier_kernel::ContractStatus::Completed, "{:?}", subscribed.data);
+    assert_eq!(subscribed.data.unwrap()["subscribed"], true);
+
+    verifier.send(vec!["v2node.supervisor".into()], "Supervisor", json!({}), json!({}));
+    let supervised = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(supervised.status, atelier_kernel::ContractStatus::Completed, "{:?}", supervised.data);
+    assert_eq!(supervised.data.unwrap()["routed"], true);
+
+    verifier.send(vec!["v2node.stress".into()], "Stress", json!({}), json!({}));
+    let stressed = terminal(&verifier, Duration::from_secs(30));
+    assert_eq!(stressed.status, atelier_kernel::ContractStatus::Completed, "{:?}", stressed.data);
+    let stress_data = stressed.data.unwrap();
+    assert_eq!(stress_data["ok"], true, "{stress_data}");
+    assert_eq!(stress_data["pending"], 0, "{stress_data}");
+    assert_eq!(stress_data["results"], 0, "{stress_data}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

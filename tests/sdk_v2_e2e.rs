@@ -59,6 +59,74 @@ async def storage_handler(msg):
     query = await domain.storage_query(record_id=record_id)
     return {"rows": len(query.get("items") or []), "count": query.get("count")}
 
+@domain.handler("query")
+async def query_handler(msg):
+    handlers = await domain.query_handlers()
+    runtime = await domain.query_runtime()
+    return {"routes": handlers.get("routes") or [], "runtime_ok": isinstance(runtime, dict)}
+
+@domain.handler("notify")
+async def notify_handler(msg):
+    result = await domain.notify("info", "hello from v2")
+    return {"notified": isinstance(result, dict)}
+
+@domain.handler("c4")
+async def c4_handler(msg):
+    stage = "put"
+    try:
+        put = await domain.put_object("e2e/obj-1")
+        stage = "write"
+        with open(put["physical_path"], "wb") as f:
+            f.write(b"c4-payload")
+        stage = "get"
+        got = await domain.get_object(put["object_id"])
+        stage = "delete"
+        deleted = await domain.delete_object(put["object_id"])
+    except Exception as error:  # noqa: BLE001
+        return {"failed_stage": stage, "error": str(error), "detail": getattr(error, "data", None)}
+    return {
+        "object_id": put["object_id"],
+        "physical_path": put["physical_path"],
+        "got_matches": got.get("physical_path") == put["physical_path"],
+        "size": got.get("size"),
+        "deleted": isinstance(deleted, dict),
+    }
+
+@domain.handler("wait")
+async def wait_handler(msg):
+    mid = await domain.send("v2test.echo", "Echo", {}, {"value": 7})
+    receipt = await domain.wait_result(mid)
+    domain.forget_result(mid)
+    return {"echo": receipt["data"]["echo"]}
+
+@domain.handler("log")
+async def log_handler(msg):
+    domain.logger.info("e2e log line", tag="v2")
+    return {"logged": True}
+
+@domain.handler("subscribe")
+async def subscribe_handler(msg):
+    await domain.subscribe_logs()
+    await domain.subscribe_telemetry()
+    await domain.subscribe_notify()
+    return {"subscribed": True}
+
+@domain.handler("supervisor")
+async def supervisor_handler(msg):
+    try:
+        await domain.supervisor_restart("no-such-domain")
+    except Exception as error:  # noqa: BLE001
+        return {"routed": True, "status": getattr(error, "status", None)}
+    return {"routed": True, "status": None}
+
+@domain.handler("stress")
+async def stress_handler(msg):
+    for i in range(20):
+        result = await domain.request("v2test.echo", "Echo", {}, {"value": i})
+        if result["data"].get("echo") != i:
+            return {"failed_at": i, "got": result["data"]}
+    return {"ok": True, "pending": len(domain._pending), "results": len(domain._results)}
+
 _trace.write("before run\n")
 import asyncio
 asyncio.run(domain.run_async())
@@ -139,6 +207,56 @@ fn sdk_v2_round_trip() {
     assert_eq!(stored.status, atelier_kernel::ContractStatus::Completed, "{:?}", stored.data);
     let stored_data = stored.data.unwrap();
     assert!(stored_data["rows"].as_u64().unwrap_or(0) >= 1, "{stored_data}");
+
+    verifier.send(vec!["v2test.query".into()], "Query", json!({}), json!({}));
+    let queried = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(queried.status, atelier_kernel::ContractStatus::Completed, "{:?}", queried.data);
+    let queried_data = queried.data.unwrap();
+    let routes = queried_data["routes"].as_array().expect("routes");
+    assert!(routes.iter().any(|r| r == "v2test.echo"), "{queried_data}");
+    assert_eq!(queried_data["runtime_ok"], true, "{queried_data}");
+
+    verifier.send(vec!["v2test.notify".into()], "Notify", json!({}), json!({}));
+    let notified = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(notified.status, atelier_kernel::ContractStatus::Completed, "{:?}", notified.data);
+    assert_eq!(notified.data.unwrap()["notified"], true);
+
+    verifier.send(vec!["v2test.c4".into()], "C4", json!({}), json!({}));
+    let c4 = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(c4.status, atelier_kernel::ContractStatus::Completed, "{:?}", c4.data);
+    let c4_data = c4.data.unwrap();
+    assert!(c4_data["object_id"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
+    assert!(c4_data["physical_path"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
+    assert_eq!(c4_data["got_matches"], true, "{c4_data}");
+    assert_eq!(c4_data["size"], 10, "{c4_data}");
+    assert_eq!(c4_data["deleted"], true, "{c4_data}");
+
+    verifier.send(vec!["v2test.wait".into()], "Wait", json!({}), json!({}));
+    let waited = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(waited.status, atelier_kernel::ContractStatus::Completed, "{:?}", waited.data);
+    assert_eq!(waited.data.unwrap()["echo"], 7);
+
+    verifier.send(vec!["v2test.log".into()], "Log", json!({}), json!({}));
+    let logged = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(logged.status, atelier_kernel::ContractStatus::Completed, "{:?}", logged.data);
+
+    verifier.send(vec!["v2test.subscribe".into()], "Subscribe", json!({}), json!({}));
+    let subscribed = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(subscribed.status, atelier_kernel::ContractStatus::Completed, "{:?}", subscribed.data);
+    assert_eq!(subscribed.data.unwrap()["subscribed"], true);
+
+    verifier.send(vec!["v2test.supervisor".into()], "Supervisor", json!({}), json!({}));
+    let supervised = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(supervised.status, atelier_kernel::ContractStatus::Completed, "{:?}", supervised.data);
+    assert_eq!(supervised.data.unwrap()["routed"], true);
+
+    verifier.send(vec!["v2test.stress".into()], "Stress", json!({}), json!({}));
+    let stressed = terminal(&verifier, Duration::from_secs(30));
+    assert_eq!(stressed.status, atelier_kernel::ContractStatus::Completed, "{:?}", stressed.data);
+    let stress_data = stressed.data.unwrap();
+    assert_eq!(stress_data["ok"], true, "{stress_data}");
+    assert_eq!(stress_data["pending"], 0, "{stress_data}");
+    assert_eq!(stress_data["results"], 0, "{stress_data}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

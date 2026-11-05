@@ -668,6 +668,7 @@ impl KernelLedger {
         msg: &KernelMessage,
         seq: u64,
         channel: &str,
+        channel_seq: u64,
     ) -> (DeliveryRecord, bool) {
         let now = now_millis();
         let r = DeliveryRecord {
@@ -712,6 +713,7 @@ impl KernelLedger {
                 crate::outbox::insert_frame(
                     &tx,
                     channel,
+                    channel_seq,
                     &crate::protocol::KernelToDomainFrame::Deliver(msg.clone()),
                 )?;
                 tx.commit()?;

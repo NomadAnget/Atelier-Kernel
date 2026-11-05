@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{RecvError, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
-pub const OUTBOX_COLUMNS: &[&str] = &["id", "channel", "delivery_id", "priority", "frame"];
+pub const OUTBOX_COLUMNS: &[&str] = &["id", "channel", "delivery_id", "priority", "seq", "frame"];
 
 const MEMORY_BYTES: usize = 2 * 1024 * 1024;
 const EVENT_BYTES: usize = 256 * 1024;
@@ -18,17 +18,18 @@ pub(crate) fn initialize(conn: &Connection) -> Result<(), crate::storage::Storag
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS kernel_outbox (
         id INTEGER PRIMARY KEY AUTOINCREMENT, channel TEXT NOT NULL,
-        delivery_id TEXT, priority INTEGER NOT NULL, frame TEXT NOT NULL);
+        delivery_id TEXT, priority INTEGER NOT NULL, seq INTEGER NOT NULL DEFAULT 0, frame TEXT NOT NULL);
         ",
     )?;
     crate::storage::verify_sqlite_table_columns(conn, "kernel_outbox", OUTBOX_COLUMNS)?;
-    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_kernel_outbox_channel ON kernel_outbox(channel,priority,id);")?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_kernel_outbox_channel ON kernel_outbox(channel,priority,seq,id);")?;
     Ok(())
 }
 
 pub(crate) fn insert_frame(
     db: &Connection,
     channel: &str,
+    seq: u64,
     frame: &KernelToDomainFrame,
 ) -> Result<(), crate::storage::StorageError> {
     let (_, lane) = classify(frame);
@@ -37,8 +38,8 @@ pub(crate) fn insert_frame(
         _ => None,
     };
     db.execute(
-        "INSERT INTO kernel_outbox(channel,delivery_id,priority,frame) VALUES(?1,?2,?3,?4)",
-        params![channel, id, lane as i64, serde_json::to_string(frame)?],
+        "INSERT INTO kernel_outbox(channel,delivery_id,priority,seq,frame) VALUES(?1,?2,?3,?4,?5)",
+        params![channel, id, lane as i64, seq as i64, serde_json::to_string(frame)?],
     )?;
     Ok(())
 }
@@ -49,12 +50,14 @@ struct MemoryItem {
     frame: KernelToDomainFrame,
     bytes: usize,
     lane: usize,
+    /// 业务帧（lane 1）的每通道单调序号；其他 lane 为 0。
+    seq: u64,
 }
 enum Lease {
-    Disk(i64, bool),
-    Memory(usize, usize),
+    Disk(i64, bool, u64),
+    Memory(usize, usize, u64),
     StateSnapshot,
-    Temporary(i64, usize),
+    Temporary(i64, usize, u64),
 }
 struct State {
     memory: [VecDeque<MemoryItem>; 3],
@@ -67,6 +70,9 @@ struct State {
     temporary_pending: [usize; 2],
     pending: usize,
     sent: [i64; 2],
+    /// 每通道业务帧单调序号：`business_seq` 为下一个待分配，`sent_business_seq` 为已投递到的序号。
+    business_seq: u64,
+    sent_business_seq: u64,
     pending_receipts: usize,
     turn: usize,
     lease: Option<Lease>,
@@ -111,6 +117,8 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
             temporary_pending: [0; 2],
             pending: 0,
             sent: [0; 2],
+            business_seq: 1,
+            sent_business_seq: 0,
             pending_receipts: 0,
             turn: 0,
             lease: None,
@@ -146,6 +154,7 @@ fn enqueue_transient(
     frame: KernelToDomainFrame,
     bytes: usize,
     lane: usize,
+    seq: u64,
 ) -> Result<(), QueueError> {
     let limit = if lane == 2 {
         EVENT_BYTES.saturating_sub(s.snapshot_bytes.saturating_add(s.snapshot_inflight))
@@ -161,15 +170,16 @@ fn enqueue_transient(
         if s.temporary.is_none() {
             let db = Connection::open("")
                 .map_err(|e| QueueError(format!("temporary transport open failed: {e}")))?;
-            db.execute_batch("PRAGMA cache_size=-512; CREATE TABLE frames(id INTEGER PRIMARY KEY, lane INTEGER NOT NULL, frame TEXT NOT NULL);")
+            db.execute_batch("PRAGMA cache_size=-512; CREATE TABLE frames(id INTEGER PRIMARY KEY, lane INTEGER NOT NULL, seq INTEGER NOT NULL, frame TEXT NOT NULL);")
                 .map_err(|e| QueueError(format!("temporary transport initialize failed: {e}")))?;
             s.temporary = Some(db);
         }
         let db = s.temporary.as_ref().unwrap();
         db.execute(
-            "INSERT INTO frames(lane,frame) VALUES(?1,?2)",
+            "INSERT INTO frames(lane,seq,frame) VALUES(?1,?2,?3)",
             params![
                 lane as i64,
+                seq as i64,
                 serde_json::to_string(&frame).map_err(|e| QueueError(e.to_string()))?
             ],
         )
@@ -179,9 +189,28 @@ fn enqueue_transient(
     }
     s.bytes[lane] += bytes;
     s.counts[lane] += 1;
-    s.memory[lane].push_back(MemoryItem { frame, bytes, lane });
+    s.memory[lane].push_back(MemoryItem { frame, bytes, lane, seq });
     Ok(())
 }
+
+/// 临时溢出区某 lane 的队首 seq（用于业务帧按 seq 出队比较）。
+fn peek_temp_seq(s: &State, lane: usize) -> Option<u64> {
+    if s.temporary_pending[lane] == 0 {
+        return None;
+    }
+    s.temporary
+        .as_ref()
+        .unwrap()
+        .query_row(
+            "SELECT seq FROM frames WHERE lane=?1 ORDER BY seq,id LIMIT 1",
+            [lane as i64],
+            |r| r.get::<_, i64>(0).map(|v| v as u64),
+        )
+        .optional()
+        .ok()
+        .flatten()
+}
+
 fn take_temporary(
     s: &mut State,
     lane: usize,
@@ -190,18 +219,18 @@ fn take_temporary(
         return Ok(None);
     }
     let result: Result<KernelToDomainFrame, String> = (|| {
-        let (id, text): (i64, String) = s
+        let (id, seq, text): (i64, i64, String) = s
             .temporary
             .as_ref()
             .unwrap()
             .query_row(
-                "SELECT id,frame FROM frames WHERE lane=?1 ORDER BY id LIMIT 1",
+                "SELECT id,seq,frame FROM frames WHERE lane=?1 ORDER BY seq,id LIMIT 1",
                 [lane as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .map_err(|e| e.to_string())?;
         let frame = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        s.lease = Some(Lease::Temporary(id, lane));
+        s.lease = Some(Lease::Temporary(id, lane, seq as u64));
         Ok(frame)
     })();
     match result {
@@ -224,8 +253,10 @@ impl PipeSender {
         if state.closed {
             return Err(QueueError("domain output disconnected".into()));
         }
-        let (record, created) = ledger.record_delivery(msg, seq, &self.0.channel);
+        let channel_seq = state.business_seq;
+        let (record, created) = ledger.record_delivery(msg, seq, &self.0.channel, channel_seq);
         if created {
+            state.business_seq += 1;
             if msg.delivery == DeliveryPolicy::Durable {
                 state.pending += 1;
                 self.0.wake.notify_one();
@@ -234,7 +265,7 @@ impl PipeSender {
                 let bytes = serde_json::to_string(&frame)
                     .map_err(|e| QueueError(e.to_string()))?
                     .len();
-                enqueue_transient(&mut state, frame, bytes, 1)?;
+                enqueue_transient(&mut state, frame, bytes, 1, channel_seq)?;
                 self.0.wake.notify_one();
             }
         }
@@ -304,7 +335,8 @@ impl PipeSender {
             durable = false;
         }
         if durable {
-            let result = insert_frame(&self.0.db.lock(), &self.0.channel, &frame);
+            let seq = if lane == 1 { s.business_seq } else { 0 };
+            let result = insert_frame(&self.0.db.lock(), &self.0.channel, seq, &frame);
             if let Err(e) = result {
                 let error = format!("kernel_outbox_persistence_failed: {e}");
                 s.failure = Some(error.clone());
@@ -312,12 +344,19 @@ impl PipeSender {
                 self.0.wake.notify_all();
                 return Err(QueueError(error));
             }
+            if lane == 1 {
+                s.business_seq += 1;
+            }
             s.pending += 1;
             if lane == 0 {
                 s.pending_receipts += 1;
             }
         } else {
-            enqueue_transient(&mut s, frame, encoded.len(), lane)?;
+            let seq = if lane == 1 { s.business_seq } else { 0 };
+            enqueue_transient(&mut s, frame, encoded.len(), lane, seq)?;
+            if lane == 1 {
+                s.business_seq += 1;
+            }
         }
         self.0.wake.notify_one();
         Ok(())
@@ -357,7 +396,7 @@ impl PipeReceiver {
             );
             // Control receipts have their own capacity and priority; preserve order within each lane.
             if let Some(item) = s.memory[0].pop_front() {
-                s.lease = Some(Lease::Memory(item.lane, item.bytes));
+                s.lease = Some(Lease::Memory(item.lane, item.bytes, item.seq));
                 return Ok(item.frame);
             }
             if let Some(frame) = take_temporary(&mut s, 0)? {
@@ -369,31 +408,33 @@ impl PipeReceiver {
                 s.lease = Some(Lease::StateSnapshot);
                 return Ok(frame);
             }
-            // Rotate persistent business, transient business and live events. A durable flood
-            // cannot indefinitely starve status responses or the live diagnostic stream.
+            // Rotate business (seq-ordered across memory/temp/sqlite) and lossy live events.
+            // A durable flood cannot indefinitely starve status responses or the live stream.
             s.turn = (s.turn + 1) % 3;
-            if s.pending > 0 && s.turn != 0 {
-                let lanes = if s.turn == 1 { [1, 2] } else { [2, 1] };
+            if s.turn != 0 {
+                let lanes = if s.turn == 1 { [1usize, 2] } else { [2, 1] };
                 for lane in lanes {
-                    if let Some(item) = s.memory[lane].pop_front() {
-                        s.lease = Some(Lease::Memory(item.lane, item.bytes));
-                        return Ok(item.frame);
-                    }
                     if lane == 1 {
-                        if let Some(frame) = take_temporary(&mut s, lane)? {
+                        if let Some(frame) = self.deliver_business(&mut s)? {
                             return Ok(frame);
                         }
+                    } else if let Some(item) = s.memory[2].pop_front() {
+                        s.lease = Some(Lease::Memory(item.lane, item.bytes, item.seq));
+                        return Ok(item.frame);
                     }
                 }
             }
-            if s.pending > 0 {
-                let row: rusqlite::Result<Option<(i64,String,i64)>>=self.0.db.lock().query_row(
-                    "SELECT id,frame,priority FROM kernel_outbox WHERE channel=?1 AND ((priority=0 AND id>?2) OR (priority=1 AND id>?3)) ORDER BY priority,id LIMIT 1",
-                    params![self.0.channel,s.sent[0],s.sent[1]],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional();
+            // Durable receipts spilled to SQLite (priority 0). Business is fully handled above.
+            if s.pending_receipts > 0 {
+                let row: rusqlite::Result<Option<(i64, String)>> = self.0.db.lock().query_row(
+                    "SELECT id,frame FROM kernel_outbox WHERE channel=?1 AND priority=0 AND id>?2 ORDER BY id LIMIT 1",
+                    params![self.0.channel, s.sent[0]],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional();
                 match row {
-                    Ok(Some((id, text, priority))) => match serde_json::from_str(&text) {
+                    Ok(Some((id, text))) => match serde_json::from_str(&text) {
                         Ok(frame) => {
-                            s.lease = Some(Lease::Disk(id, priority == 0));
+                            s.lease = Some(Lease::Disk(id, true, 0));
                             return Ok(frame);
                         }
                         Err(e) => {
@@ -412,14 +453,12 @@ impl PipeReceiver {
                 }
                 continue;
             }
-            for lane in [1, 2] {
-                if let Some(item) = s.memory[lane].pop_front() {
-                    s.lease = Some(Lease::Memory(item.lane, item.bytes));
-                    return Ok(item.frame);
-                }
-            }
-            if let Some(frame) = take_temporary(&mut s, 1)? {
+            if let Some(frame) = self.deliver_business(&mut s)? {
                 return Ok(frame);
+            }
+            if let Some(item) = s.memory[2].pop_front() {
+                s.lease = Some(Lease::Memory(item.lane, item.bytes, item.seq));
+                return Ok(item.frame);
             }
             if self.0.senders.load(Ordering::Acquire) == 0 {
                 return Err(RecvTimeoutError::Disconnected);
@@ -429,6 +468,63 @@ impl PipeReceiver {
                 return Err(RecvTimeoutError::Timeout);
             }
             self.0.wake.wait_for(&mut s, deadline - now);
+        }
+    }
+
+    /// 业务帧按每通道单调 seq 出队：Durable(SQLite) 与 Volatile/Ephemeral(memory/temp) 共享同一序号，
+    /// 跨策略乱序（审计 A2）从结构上消失。
+    fn deliver_business(
+        &self,
+        s: &mut State,
+    ) -> Result<Option<KernelToDomainFrame>, RecvTimeoutError> {
+        let mem_seq = s.memory[1].front().map(|i| i.seq);
+        let temp_seq = peek_temp_seq(s, 1);
+        let disk: Option<(u64, i64, String)> = {
+            let db = self.0.db.lock();
+            db.query_row(
+                "SELECT seq,id,frame FROM kernel_outbox WHERE channel=?1 AND priority=1 AND seq>?2 ORDER BY seq,id LIMIT 1",
+                params![self.0.channel, s.sent_business_seq as i64],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        };
+        let disk_seq = disk.as_ref().map(|(seq, _, _)| *seq);
+        let mut candidates: Vec<(u64, u8)> = Vec::new();
+        if let Some(seq) = mem_seq {
+            candidates.push((seq, 0));
+        }
+        if let Some(seq) = temp_seq {
+            candidates.push((seq, 1));
+        }
+        if let Some(seq) = disk_seq {
+            candidates.push((seq, 2));
+        }
+        let Some(&(_, which)) = candidates.iter().min_by_key(|(seq, _)| *seq) else {
+            return Ok(None);
+        };
+        match which {
+            0 => {
+                let item = s.memory[1].pop_front().unwrap();
+                s.lease = Some(Lease::Memory(item.lane, item.bytes, item.seq));
+                Ok(Some(item.frame))
+            }
+            1 => take_temporary(s, 1),
+            _ => {
+                let (seq, id, text) = disk.unwrap();
+                match serde_json::from_str::<KernelToDomainFrame>(&text) {
+                    Ok(frame) => {
+                        s.lease = Some(Lease::Disk(id, false, seq));
+                        Ok(Some(frame))
+                    }
+                    Err(e) => {
+                        s.failure = Some(format!("corrupt outbox: {e}"));
+                        s.closed = true;
+                        Err(RecvTimeoutError::Disconnected)
+                    }
+                }
+            }
         }
     }
     pub fn recv(&self) -> Result<KernelToDomainFrame, RecvError> {
@@ -452,7 +548,7 @@ impl PipeReceiver {
     pub fn acknowledge(&self) -> Result<(), QueueError> {
         let mut s = self.0.state.lock();
         match s.lease.take() {
-            Some(Lease::Disk(id, receipt)) => {
+            Some(Lease::Disk(id, receipt, seq)) => {
                 if let Err(e) = self.0.db.lock().execute(
                     "DELETE FROM kernel_outbox WHERE id=?1 AND channel=?2 AND (delivery_id IS NULL OR NOT EXISTS(SELECT 1 FROM messages WHERE message_id=delivery_id))",
                     params![id, self.0.channel],
@@ -462,13 +558,15 @@ impl PipeReceiver {
                     s.closed = true;
                     return Err(QueueError(error));
                 }
-                s.sent[if receipt { 0 } else { 1 }] = id;
-                s.pending -= 1;
                 if receipt {
+                    s.sent[0] = id;
                     s.pending_receipts -= 1;
+                } else {
+                    s.sent_business_seq = s.sent_business_seq.max(seq);
                 }
+                s.pending -= 1;
             }
-            Some(Lease::Temporary(id, lane)) => {
+            Some(Lease::Temporary(id, lane, seq)) => {
                 s.temporary
                     .as_ref()
                     .unwrap()
@@ -480,13 +578,19 @@ impl PipeReceiver {
                 if s.temporary_pending == [0; 2] {
                     s.temporary = None;
                 }
+                if lane == 1 {
+                    s.sent_business_seq = s.sent_business_seq.max(seq);
+                }
             }
             Some(Lease::StateSnapshot) => {
                 s.snapshot_inflight = 0;
             }
-            Some(Lease::Memory(lane, bytes)) => {
+            Some(Lease::Memory(lane, bytes, seq)) => {
                 s.bytes[lane] -= bytes;
                 s.counts[lane] -= 1;
+                if lane == 1 {
+                    s.sent_business_seq = s.sent_business_seq.max(seq);
+                }
             }
             None => {}
         }
@@ -547,6 +651,31 @@ mod tests {
             data: json!({"text":"x".repeat(8192)}),
         })
     }
+    /// 审计 A2：Durable 与 Volatile/Ephemeral 共享每通道单调 seq，跨策略 FIFO 按投递顺序，
+    /// 与存储层（SQLite / 内存）无关。
+    #[test]
+    fn cross_policy_business_fifo_is_preserved() {
+        let kernel = AtelierKernel::new_in_memory().unwrap();
+        let db = kernel.ledger().db_conn.as_ref().unwrap().clone();
+        let (tx, rx) = channel(db);
+        // Durable(0) → Volatile(1) → Durable(2) → Volatile(3) → Ephemeral(4)，交替入队。
+        let order = ["Durable", "Volatile", "Durable", "Volatile", "Ephemeral"];
+        for (i, kind) in order.iter().enumerate() {
+            tx.send(frame(kind, i)).unwrap();
+        }
+        let mut seen = Vec::new();
+        for _ in 0..order.len() {
+            match rx.try_recv().unwrap() {
+                KernelToDomainFrame::Deliver(m) => {
+                    seen.push(m.params["index"].as_u64().unwrap() as usize)
+                }
+                _ => panic!(),
+            }
+            rx.acknowledge().unwrap();
+        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4], "跨策略业务帧必须按投递顺序（A2）");
+    }
+
     #[test]
     fn durable_backlog_is_in_sqlite_and_no_payload_is_removed_before_write_ack() {
         let kernel = AtelierKernel::new_in_memory().unwrap();

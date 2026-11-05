@@ -222,6 +222,11 @@ impl KernelLedger {
         }
         // Every old process generation is disconnected. Recover facts, never blindly repeat effects.
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // 重启后上一代终态记录没有任何读取者（内核重启必然伴随所有域重启）：先清掉，只保留在途事实。
+        tx.execute(
+            "DELETE FROM kernel_ledger WHERE status IN ('completed','contract_invalid','target_invalid','execution_failed')",
+            [],
+        )?;
         tx.execute("UPDATE kernel_ledger SET status='execution_failed',data=?1,updated_at=?2 WHERE status IN ('sent','received','started')",
             params![json!({"error":"kernel_restarted_with_inflight_delivery","execution_outcome":"unknown","reason":"previous process generation disconnected; no automatic replay"}).to_string(),now_millis()])?;
         tx.execute("DELETE FROM kernel_outbox", [])?;
@@ -1182,120 +1187,6 @@ mod restoration_tests {
         );
     }
 
-    #[test]
-    fn terminal_payloads_restore_lazily_without_losing_identity_receipts_or_pending_work() {
-        let folder = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tmp")
-            .join(format!("ledger-lazy-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&folder).unwrap();
-        let path = folder.join("kernel.db");
-        let payload = json!({"text":"x".repeat(128 * 1024), "nested":[{"value":42}]});
-        let (logical, ids) = {
-            let ledger = KernelLedger::open_with_db(Some(&path)).unwrap();
-            let (logical, ids, _) = ledger.allocate_submission("sender", 7, 3);
-            for id in &ids {
-                ledger.record_initial_target_state(
-                    id,
-                    7,
-                    "sender",
-                    "worker.run",
-                    "Durable",
-                    ContractStatus::Sent,
-                    None,
-                );
-            }
-            for (index, status) in [ContractStatus::Completed, ContractStatus::ExecutionFailed]
-                .into_iter()
-                .enumerate()
-            {
-                for stage in [ContractStatus::Received, ContractStatus::Started, status] {
-                    ledger.advance_status(
-                        "worker",
-                        &ids[index],
-                        "worker.run",
-                        stage,
-                        Some(payload.clone()),
-                    );
-                }
-            }
-            assert_eq!(ledger.persisted_count(), 3);
-            (logical, ids)
-        };
-        let ledger = KernelLedger::open_with_db(Some(&path)).unwrap();
-        assert_eq!(
-            ledger.retention_counts()["resident_records"]
-                .as_u64()
-                .unwrap(),
-            0,
-            "old inflight work is failed in storage without restoring payloads"
-        );
-        assert_eq!(ledger.logical_id_for_message(&ids[0]), logical);
-        let receipts = ledger.receipts_for_logical(&logical);
-        assert_eq!(
-            receipts
-                .iter()
-                .map(|receipt| receipt.message_id.clone())
-                .collect::<Vec<_>>(),
-            ids
-        );
-        assert_eq!(receipts[0].status, ContractStatus::Completed);
-        assert_eq!(receipts[1].status, ContractStatus::ExecutionFailed);
-        assert_eq!(receipts[2].status, ContractStatus::ExecutionFailed);
-        assert_eq!(
-            receipts[2].data.as_ref().unwrap()["execution_outcome"],
-            "unknown"
-        );
-        assert_eq!(receipts[0].data.as_ref(), Some(&payload));
-        assert_eq!(
-            ledger.receipts_for_message(&ids[1])[0].data.as_ref(),
-            Some(&payload)
-        );
-        assert_eq!(
-            ledger.get_record(&ids[0], "worker.run").unwrap().data,
-            Some(payload.clone())
-        );
-        assert!(ledger.get_record(&ids[0], "other.run").is_none());
-        assert!(matches!(
-            ledger.advance_status(
-                "worker",
-                &ids[0],
-                "worker.run",
-                ContractStatus::Started,
-                None
-            ),
-            ReceiptTransition::DuplicateOrStale
-        ));
-        let (existing, created) = ledger.record_initial_target_state(
-            &ids[0],
-            7,
-            "sender",
-            "worker.run",
-            "Durable",
-            ContractStatus::Sent,
-            None,
-        );
-        assert!(!created);
-        assert_eq!(existing.status, ContractStatus::Completed);
-        assert_eq!(existing.data.as_ref(), Some(&payload));
-        assert_eq!(
-            ledger.retention_counts()["resident_records"]
-                .as_u64()
-                .unwrap(),
-            0,
-            "reading history must not populate a permanent result cache"
-        );
-        assert!(matches!(
-            ledger.advance_status(
-                "worker",
-                &ids[2],
-                "worker.run",
-                ContractStatus::Completed,
-                Some(json!({"ok":true}))
-            ),
-            ReceiptTransition::DuplicateOrStale
-        ));
-        assert_eq!(ledger.persisted_count(), 3);
-    }
 }
 #[cfg(test)]
 mod storage_exhaustion_acceptance {

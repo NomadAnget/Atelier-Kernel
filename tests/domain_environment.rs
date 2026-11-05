@@ -16,11 +16,22 @@ fn python() -> String {
     std::env::var("PYTHON")
         .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into())
 }
-const SCRIPT: &str = r#"import os,json,time,sys
+const SCRIPT: &str = r#"import os,json,time,sys,socket
 from pathlib import Path
+
+
+def _ipc(name, mode):
+    path = os.environ[name]
+    if sys.platform == "win32":
+        return open(path, mode, buffering=0)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.connect(path)
+    return sock.makefile(mode, buffering=0)
+
+
 root=Path(sys.argv[1])
-w=open(os.environ['ATELIER_IPC_OUT'],'wb',buffering=0)
-r=open(os.environ['ATELIER_IPC_IN'],'rb',buffering=0)
+w=_ipc('ATELIER_IPC_OUT','wb')
+r=_ipc('ATELIER_IPC_IN','rb')
 value={'pid':os.getpid(),'custom':os.environ.get('ENV_PROBE_VALUE'),'empty':os.environ.get('ENV_PROBE_EMPTY'),'path':os.environ.get('PATH'),'in_pipe':os.environ.get('ATELIER_IPC_IN'),'out_pipe':os.environ.get('ATELIER_IPC_OUT')}
 if os.environ.get('ENV_PROBE_REGISTER','yes')=='yes':
  w.write((json.dumps({'frame_type':'send','seq':1,'targets':['kernel.registry'],'message_type':'RegisterHandlers','params':{'handlers':['ping']},'data':{}})+'\n').encode())

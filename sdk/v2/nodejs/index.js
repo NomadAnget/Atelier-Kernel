@@ -338,9 +338,8 @@ class AtelierDomain {
     this._streams = openStreams(this._fds);
     this._input = this._streams.input;
     this._output = this._streams.output;
-    process.stderr.write("v2 transport fds=" + JSON.stringify(this._fds) + " bridge=" + !!this._streams.bridge + "\n");
-    this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: {} }, data: {} });
     this._readLoop();
+    this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: {} }, data: {} });
     if (onStart) await onStart();
     this._done = new Promise((resolve) => { this._finish = resolve; });
     await this._done;
@@ -361,19 +360,18 @@ class AtelierDomain {
   }
 
   _readLoop() {
-    let buffer = "";
-    this._input.setEncoding("utf8");
-    this._input.on("data", (chunk) => {
-      buffer += chunk;
-      let index;
-      while ((index = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, index).trim();
-        buffer = buffer.slice(index + 1);
-        if (!line) continue;
-        let frame;
-        try { frame = JSON.parse(line); } catch (_) { continue; }
-        this._handle(frame);
+    const readline = require("readline");
+    this._rl = readline.createInterface({ input: this._input, terminal: false });
+    this._rl.on("line", (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let frame;
+      try {
+        frame = JSON.parse(trimmed);
+      } catch (_) {
+        return;
       }
+      this._handle(frame);
     });
   }
 

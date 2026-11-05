@@ -39,6 +39,7 @@ class AtelierDomain:
         self._result_ttl = result_ttl
 
         self._handlers = {}
+        self._descriptions = {}
         self._pending = {}  # seq -> {"targets", "ids", "future"}
         self._results = {}  # message_id -> {"target", "future", "waiters", "evict"}
         self._events = {kind: [] for kind in ("receipt", "log", "notify", "observation", "telemetry")}
@@ -67,6 +68,9 @@ class AtelierDomain:
             if not isinstance(name, str) or not name or "." in name:
                 raise ValueError("invalid handler name")
             self._handlers[name] = fn
+            doc = (fn.__doc__ or "").strip()
+            if doc:
+                self._descriptions[name] = doc.splitlines()[0].strip()
             return fn
 
         return register
@@ -414,7 +418,7 @@ class AtelierDomain:
                 "seq": self._next_seq(),
                 "targets": ["kernel.registry"],
                 "message_type": "RegisterHandlers",
-                "params": {"handlers": list(self._handlers), "descriptions": {}},
+                "params": {"handlers": list(self._handlers), "descriptions": self._descriptions},
                 "data": {},
             }
         )

@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use crate::ledger::{KernelLedger, ReceiptTransition};
 use crate::logging::{KernelLogHub, LogQuery, LogRecord};
+use crate::object_hub::{DeleteOutcome, ObjectHub};
 use crate::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
@@ -18,6 +19,7 @@ use crate::protocol::{
     KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_DOMAIN_ASSEMBLY,
     MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
+    MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET, MSG_STORAGE_OBJECT_PUT,
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
@@ -171,6 +173,7 @@ pub struct KernelRouter {
     observer: Arc<KernelObserver>,
     storage: Arc<DomainStorageEngine>,
     logger: Arc<KernelLogHub>,
+    object_hub: Arc<Mutex<ObjectHub>>,
     /// In-memory ring buffer of recent notifications and telemetry frames for observation consoles.
     ui_inbox: RwLock<Vec<KernelMessage>>,
     /// Active domain subscriptions for kernel log events.
@@ -198,6 +201,7 @@ impl KernelRouter {
         observer: Arc<KernelObserver>,
         storage: Arc<DomainStorageEngine>,
         logger: Arc<KernelLogHub>,
+        object_hub: Arc<Mutex<ObjectHub>>,
     ) -> Self {
         let domains = Arc::new(RwLock::new(HashMap::<String, DomainEntry>::new()));
         let log_subscribers =
@@ -340,6 +344,7 @@ impl KernelRouter {
             observer,
             storage,
             logger,
+            object_hub,
             ui_inbox: RwLock::new(Vec::new()),
             log_subscribers,
             telemetry_subscribers,
@@ -1434,26 +1439,131 @@ impl KernelRouter {
             return;
         }
 
-        match self.storage.execute_message(msg) {
-            Ok(result_data) => {
-                self.complete_kernel_internal_target(
-                    source_domain,
-                    msg,
-                    ContractStatus::Completed,
-                    Some(result_data),
-                );
+        // C4 对象接口：大文件走对象目录索引，不进消息 data（域只拿 object_id）。
+        match msg.message_type.as_str() {
+            MSG_STORAGE_OBJECT_PUT => {
+                let Some(path) = msg.params.get("path").and_then(Value::as_str) else {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ContractInvalid,
+                        Some(json!({"error": "missing_object_path"})),
+                    );
+                    return;
+                };
+                match self
+                    .object_hub
+                    .lock()
+                    .register_file(source_domain, std::path::Path::new(path))
+                {
+                    Ok(obj_ref) => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::Completed,
+                        Some(json!({
+                            "object_id": obj_ref.object_id,
+                            "size": obj_ref.size,
+                            "checksum": obj_ref.checksum,
+                        })),
+                    ),
+                    Err(e) => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({"error": "object_put_failed", "reason": e})),
+                    ),
+                }
             }
-            Err(err) => {
-                self.complete_kernel_internal_target(
-                    source_domain,
-                    msg,
-                    ContractStatus::ExecutionFailed,
-                    Some(json!({
-                        "error": "storage_execution_failed",
-                        "reason": err.to_string(),
-                    })),
-                );
+            MSG_STORAGE_OBJECT_GET => {
+                let Some(object_id) = msg.params.get("object_id").and_then(Value::as_str) else {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ContractInvalid,
+                        Some(json!({"error": "missing_object_id"})),
+                    );
+                    return;
+                };
+                match self.object_hub.lock().resolve(object_id).cloned() {
+                    Some(obj) => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::Completed,
+                        Some(json!({
+                            "object_id": obj.object_id,
+                            "size": obj.size,
+                            "checksum": obj.checksum,
+                            "path": obj.path,
+                            "owner": obj.owner,
+                        })),
+                    ),
+                    None => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({"error": "object_not_found"})),
+                    ),
+                }
             }
+            MSG_STORAGE_OBJECT_DELETE => {
+                let Some(object_id) = msg.params.get("object_id").and_then(Value::as_str) else {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ContractInvalid,
+                        Some(json!({"error": "missing_object_id"})),
+                    );
+                    return;
+                };
+                let outcome = self.object_hub.lock().delete(object_id, source_domain);
+                match outcome {
+                    DeleteOutcome::Deleted => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::Completed,
+                        Some(json!({"deleted": true})),
+                    ),
+                    DeleteOutcome::Unknown => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({"error": "object_not_found"})),
+                    ),
+                    DeleteOutcome::Forbidden => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({"error": "cross_domain_delete_forbidden"})),
+                    ),
+                    DeleteOutcome::Referenced => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({"error": "object_referenced"})),
+                    ),
+                }
+            }
+            _ => match self.storage.execute_message(msg) {
+                Ok(result_data) => {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::Completed,
+                        Some(result_data),
+                    );
+                }
+                Err(err) => {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({
+                            "error": "storage_execution_failed",
+                            "reason": err.to_string(),
+                        })),
+                    );
+                }
+            },
         }
     }
 

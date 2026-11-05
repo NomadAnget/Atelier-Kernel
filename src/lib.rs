@@ -20,9 +20,12 @@ pub mod web_frontend;
 use std::path::Path;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
 pub use frontend::InteractiveFrontendDomain;
 pub use ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
+pub use object_hub::{DeleteOutcome, Object, ObjectHub, ObjectRef};
 pub use logging::{
     KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore, ProgressState,
 };
@@ -35,7 +38,8 @@ pub use protocol::{
     MSG_DELIVERY_EPHEMERAL, MSG_DELIVERY_VOLATILE, MSG_QUERY_DOMAIN_ASSEMBLY, MSG_QUERY_HANDLERS,
     MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
-    MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
+    MSG_STORAGE_DELETE, MSG_STORAGE_INSERT, MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET,
+    MSG_STORAGE_OBJECT_PUT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE,
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
@@ -64,6 +68,7 @@ pub struct AtelierKernel {
     logger: Arc<KernelLogHub>,
     router: Arc<KernelRouter>,
     supervisor: Arc<DomainSupervisor>,
+    object_hub: Arc<Mutex<ObjectHub>>,
 }
 
 impl AtelierKernel {
@@ -72,7 +77,8 @@ impl AtelierKernel {
         let ledger = Arc::new(KernelLedger::open_with_db(None)?);
         let storage = Arc::new(DomainStorageEngine::new_in_memory()?);
         let logger = Arc::new(KernelLogHub::new(None)?);
-        Ok(Self::from_components(ledger, storage, logger))
+        let object_hub = Arc::new(Mutex::new(ObjectHub::new()));
+        Ok(Self::from_components(ledger, storage, logger, object_hub))
     }
 
     /// Creates a new Atelier Kernel backed by a persistent SQLite database file.
@@ -81,13 +87,23 @@ impl AtelierKernel {
         let path = ledger.database_path().expect("file-backed database path");
         let storage = Arc::new(DomainStorageEngine::open_file(&path)?);
         let logger = Arc::new(KernelLogHub::new(Some(&path))?);
-        Ok(Self::from_components(ledger, storage, logger))
+        let object_root = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join("objects");
+        let object_hub = Arc::new(Mutex::new(ObjectHub::with_db(
+            object_root,
+            ledger.db_conn.as_ref().unwrap().clone(),
+        )?));
+        Ok(Self::from_components(ledger, storage, logger, object_hub))
     }
 
     fn from_components(
         ledger: Arc<KernelLedger>,
         storage: Arc<DomainStorageEngine>,
         logger: Arc<KernelLogHub>,
+        object_hub: Arc<Mutex<ObjectHub>>,
     ) -> Self {
         let observer = Arc::new(KernelObserver::default());
         let router = Arc::new(KernelRouter::new(
@@ -95,6 +111,7 @@ impl AtelierKernel {
             Arc::clone(&observer),
             Arc::clone(&storage),
             Arc::clone(&logger),
+            Arc::clone(&object_hub),
         ));
         let supervisor = Arc::new(DomainSupervisor::new(Arc::clone(&router)));
         router.set_supervisor(Arc::downgrade(&supervisor));
@@ -106,11 +123,16 @@ impl AtelierKernel {
             logger,
             router,
             supervisor,
+            object_hub,
         }
     }
 
     pub fn ledger(&self) -> &Arc<KernelLedger> {
         &self.ledger
+    }
+
+    pub fn object_hub(&self) -> &Arc<Mutex<ObjectHub>> {
+        &self.object_hub
     }
 
     pub fn observer(&self) -> &Arc<KernelObserver> {

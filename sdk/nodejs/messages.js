@@ -9,8 +9,10 @@ module.exports=function messageMethods(RequestError){
    if(this._closed||this._state==='new')throw new RequestError('connection_closed');
    if(!Number.isFinite(timeout)||timeout<=0)throw Error('invalid timeout');
    if(signal?.aborted)throw new RequestError('cancelled');
+   const control=options.control===true;
    const reserved=[...this._pending.values()].reduce((n,e)=>n+e.targets.length-e.ids.size,0);
-   if(this._results.size+reserved+unique.length>this._limits.maxPending)throw new RequestError('busy');
+   // 控制面保留通道：运维/监督消息不受数据面 _results 预算限制，数据面饱和不得堵死控制面。
+   if(!control&&this._results.size+reserved+unique.length>this._limits.maxPending)throw new RequestError('busy');
    const seq=this._seqCounter++;let resolve,reject;
    const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});promise.catch(()=>{});
    const entry={targets:unique,ids:new Map(),resolve,reject};this._pending.set(seq,entry);let accepted=false;

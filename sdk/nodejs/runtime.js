@@ -150,10 +150,10 @@ function enhance(Base,RequestError,ExecutionFailed) {
     async queryObserverAsync({limit=100,messageId,message_id,target,sourceDomain,source_domain}={},options={}){const params={limit};const mid=messageId??message_id;if(mid!==undefined)params.message_id=mid;if(target!==undefined)params.target=target;const sd=sourceDomain??source_domain;if(sd!==undefined)params.source_domain=sd;return (await this.request('kernel.observer','QueryObserver',params,{},options)).data;}
     async subscribeObserverAsync(options={}){return (await this.request('kernel.observer','SubscribeObserver',{},{},options)).data;}
     async unsubscribeObserverAsync(options={}){return (await this.request('kernel.observer','UnsubscribeObserver',{},{},options)).data;}
-    async supervisorStartAsync({domain,spec}={},options={}){const params={domain};if(spec!==undefined)params.spec=spec;return (await this.request('kernel.supervisor','StartDomain',params,{},options)).data;}
-    async supervisorStopAsync({domain}={},options={}){const params={domain};return (await this.request('kernel.supervisor','StopDomain',params,{},options)).data;}
-    async supervisorRestartAsync({domain}={},options={}){const params={domain};return (await this.request('kernel.supervisor','RestartDomain',params,{},options)).data;}
-    async supervisorUpdateAsync({domain,spec,probeHandler,probe_handler,timeoutMs,timeout_ms=5000}={},options={}){const params={domain,timeout_ms:timeoutMs??timeout_ms};if(spec!==undefined&&spec!==null)params.spec=spec;const ph=probeHandler??probe_handler;if(ph!==undefined)params.probe_handler=ph;return (await this.request('kernel.supervisor','UpdateDomain',params,{},options)).data;}
+    async supervisorStartAsync({domain,spec}={},options={}){const params={domain};if(spec!==undefined)params.spec=spec;return (await this.request('kernel.supervisor','StartDomain',params,{}, {...options,control:true})).data;}
+    async supervisorStopAsync({domain}={},options={}){const params={domain};return (await this.request('kernel.supervisor','StopDomain',params,{}, {...options,control:true})).data;}
+    async supervisorRestartAsync({domain}={},options={}){const params={domain};return (await this.request('kernel.supervisor','RestartDomain',params,{}, {...options,control:true})).data;}
+    async supervisorUpdateAsync({domain,spec,probeHandler,probe_handler,timeoutMs,timeout_ms=5000}={},options={}){const params={domain,timeout_ms:timeoutMs??timeout_ms};if(spec!==undefined&&spec!==null)params.spec=spec;const ph=probeHandler??probe_handler;if(ph!==undefined)params.probe_handler=ph;return (await this.request('kernel.supervisor','UpdateDomain',params,{}, {...options,control:true})).data;}
     _writeFrame(frame) {
       if(this._state==='closed')throw new RequestError('connection_closed');
       let line;

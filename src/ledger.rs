@@ -745,7 +745,7 @@ impl KernelLedger {
                 // 非持久账本容量是软上限：先淘汰最旧的已终结记录，绝不因为容量拒绝新消息。
                 let size = r.data.as_ref().map_or(0, |v| v.to_string().len() as i64);
                 let mut need = bytes + size - MAX_TRANSIENT_BYTES;
-                let victims: Vec<(String, i64)> = {
+                let victims: Vec<(String, i64, String, String)> = {
                     let mut stmt = mem
                         .prepare(
                             "SELECT message_id, coalesce(length(data),0), target, message_type FROM kernel_ledger \

@@ -93,7 +93,7 @@ pub enum DeliveryPolicy {
     /// Persisted in SQLite; only bounded live metadata and explicit failures reside in memory.
     #[default]
     Durable,
-    /// Tracked in the in-memory ledger and observer only; never written to SQLite `kernel_ledger`.
+    /// Tracked in the in-memory ledger and observer only; never written to SQLite `messages`.
     Volatile,
     /// High-frequency transient stream: tracked in-memory only while in-flight, never written to SQLite,
     /// and automatically evicted from the in-memory ledger upon reaching a terminal status.

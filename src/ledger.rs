@@ -1,19 +1,31 @@
-use std::collections::HashMap;
+//! 账本 —— 三表一入口（messages / audit + 内存 submissions 去重），由 `nucleus` 派生。
+//!
+//! 旧"四表六出口"（`kernel_ledger` / `identities` / `kernel_sessions` / `highwater`）已删除。
+//! 现在只有核（`Nucleus`）持有消息权威状态；本模块是核的一个门面（facade）：
+//!   - 内存活跃 + 内存审计 + 提交去重（SubmissionCache）全部在 `Nucleus` 内；
+//!   - Durable 子集镜像到 SQLite `messages`（活）与 `audit`（终态，只增）；
+//!   - 代际绑定（origin / channel / persistence_failed）是核外的路由推导，不参与状态机。
+//!
+//! 对外方法签名不变（见 docs/ledger-core-rewrite.md §1 的 29 个能力），语义按宪法收敛。
+
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::nucleus::{AuditRecord, Message, Nucleus};
 use crate::protocol::{
-    ContractStatus, DeliveryPolicy, MessageReceipt, now_millis, parse_target_address,
+    ContractStatus, DeliveryPolicy, KernelMessage, MessageReceipt, now_millis, parse_target_address,
 };
 use crate::storage::{StorageError, verify_sqlite_table_columns};
 
-pub const KERNEL_LEDGER_TABLE: &str = "kernel_ledger";
+/// 权威活消息表（唯一表名，M7 检查用）。
+pub const KERNEL_LEDGER_TABLE: &str = "messages";
 pub const KERNEL_LEDGER_COLUMNS: &[&str] = &[
     "message_id",
     "logical_id",
@@ -27,8 +39,67 @@ pub const KERNEL_LEDGER_COLUMNS: &[&str] = &[
     "created_at",
     "updated_at",
 ];
+/// Durable 终态审计表（只增）。
+pub const AUDIT_TABLE: &str = "audit";
+pub const AUDIT_COLUMNS: &[&str] = &[
+    "id",
+    "message_id",
+    "logical_id",
+    "seq",
+    "source_domain",
+    "target",
+    "message_type",
+    "policy",
+    "status",
+    "data",
+    "created_at",
+];
 
-/// Authoritative per-target delivery record stored in the Kernel Ledger.
+const MAX_LIVE: usize = 65_536;
+const MAX_CHILDREN_PER_SUBMISSION: usize = 1_024;
+
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS messages(
+  message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,source_domain TEXT NOT NULL,
+  target TEXT NOT NULL,message_type TEXT NOT NULL,policy TEXT NOT NULL DEFAULT 'durable',status TEXT NOT NULL,
+  data TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS idx_messages_logical ON messages(logical_id);
+  CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
+  CREATE TABLE IF NOT EXISTS audit(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,message_id TEXT NOT NULL,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,
+    source_domain TEXT NOT NULL,target TEXT NOT NULL,message_type TEXT NOT NULL,policy TEXT NOT NULL,
+    status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL);";
+
+fn policy_str(p: DeliveryPolicy) -> &'static str {
+    match p {
+        DeliveryPolicy::Durable => "durable",
+        DeliveryPolicy::Volatile => "volatile",
+        DeliveryPolicy::Ephemeral => "ephemeral",
+    }
+}
+
+fn status_str(s: ContractStatus) -> &'static str {
+    match s {
+        ContractStatus::Sent => "sent",
+        ContractStatus::Received => "received",
+        ContractStatus::Started => "started",
+        ContractStatus::Completed => "completed",
+        ContractStatus::TargetInvalid => "target_invalid",
+        ContractStatus::ContractInvalid => "contract_invalid",
+        ContractStatus::ExecutionFailed => "execution_failed",
+    }
+}
+
+fn parse_policy(raw: &str) -> Result<DeliveryPolicy, StorageError> {
+    serde_json::from_value(Value::String(raw.to_string()))
+        .map_err(|e| StorageError::CorruptLedgerRecord(e.to_string()))
+}
+
+fn parse_status(raw: &str) -> Result<ContractStatus, StorageError> {
+    serde_json::from_value(Value::String(raw.to_string()))
+        .map_err(|e| StorageError::CorruptLedgerRecord(e.to_string()))
+}
+
+/// Authoritative per-target delivery record (the facade's public row view).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeliveryRecord {
     pub logical_id: String,
@@ -46,7 +117,6 @@ pub struct DeliveryRecord {
 }
 
 impl DeliveryRecord {
-    /// Converts the current ledger record into a `MessageReceipt`.
     pub fn to_receipt(&self) -> MessageReceipt {
         MessageReceipt {
             logical_id: self.logical_id.clone(),
@@ -62,61 +132,102 @@ impl DeliveryRecord {
     }
 }
 
-/// Outcome of attempting to advance a `message_id` record via an inbound receipt.
+/// Outcome of advancing a `message_id` record via an inbound receipt.
 #[derive(Debug, Clone)]
 pub enum ReceiptTransition {
-    /// State advanced monotonically; contains `(source_domain, MessageReceipt)` to forward to sender.
     Advanced {
         source_domain: String,
         receipt: MessageReceipt,
     },
-    /// Receipt was a duplicate or older than current state; safely absorbed by kernel idempotency.
     DuplicateOrStale,
-    /// `message_id` does not exist in the ledger.
     UnknownDelivery,
-    /// Target domain attempted to report a receipt for another domain's handler.
     UnauthorizedTarget,
 }
 
-/// The ledger is the sole owner of message facts. Durable records and session indexes
-/// live in SQLite; a private in-memory database owns nonpersistent records and live aliases.
-/// No historical result or child index is restored into Rust collections.
+/// 代际绑定（路由推导，非状态机的一部分）：origin=进程代际，channel=目标管道。
+#[derive(Default, Clone)]
+struct Binding {
+    logical_id: String,
+    origin: u64,
+    channel: Option<String>,
+    persistence_failed: bool,
+}
+
 pub struct KernelLedger {
     next_id_seq: AtomicU64,
     instance_id: String,
-    memory: Mutex<Connection>,
+    nucleus: Mutex<Nucleus>,
+    bindings: Mutex<HashMap<String, Binding>>,
     pub(crate) db_conn: Option<Arc<Mutex<Connection>>>,
     gates: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     evicted: AtomicU64,
     _owner: Option<std::fs::File>,
 }
-const MAX_LIVE: i64 = 65_536;
-const MAX_TRANSIENT_BYTES: i64 = 64 * 1024 * 1024;
-/// How many recent submission sequences keep their session index for idempotent replay.
-const SESSION_REPLAY_WINDOW: i64 = 2_048;
-const SELECT_RECORD: &str = "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at FROM kernel_ledger";
-const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kernel_ledger(
- message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,source_domain TEXT NOT NULL,
- target TEXT NOT NULL,message_type TEXT NOT NULL,policy TEXT NOT NULL DEFAULT 'durable',status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
- CREATE INDEX IF NOT EXISTS idx_kernel_ledger_logical ON kernel_ledger(logical_id);
- CREATE INDEX IF NOT EXISTS idx_kernel_ledger_status ON kernel_ledger(status);
- CREATE TABLE IF NOT EXISTS kernel_sessions(source TEXT NOT NULL,seq INTEGER NOT NULL,logical_id TEXT NOT NULL,children TEXT NOT NULL,PRIMARY KEY(source,seq));";
+
 impl Default for KernelLedger {
     fn default() -> Self {
         Self::new()
     }
 }
+
+fn record_from_message(m: &Message) -> DeliveryRecord {
+    DeliveryRecord {
+        logical_id: m.logical_id.clone(),
+        message_id: m.message_id.clone(),
+        seq: m.seq,
+        source_domain: m.source.clone(),
+        target: m.target.clone(),
+        message_type: m.message_type.clone(),
+        policy: m.policy,
+        status: m.status,
+        data: m.data.clone(),
+        created_at: m.created_at,
+        updated_at: m.updated_at,
+    }
+}
+
+fn record_from_audit(a: &AuditRecord) -> DeliveryRecord {
+    DeliveryRecord {
+        logical_id: a.logical_id.clone(),
+        message_id: a.message_id.clone(),
+        seq: a.seq,
+        source_domain: a.source.clone(),
+        target: a.target.clone(),
+        message_type: a.message_type.clone(),
+        policy: a.policy,
+        status: a.status,
+        data: a.data.clone(),
+        created_at: a.created_at,
+        updated_at: a.created_at,
+    }
+}
+
+fn audit_from_record(r: &DeliveryRecord) -> AuditRecord {
+    AuditRecord {
+        message_id: r.message_id.clone(),
+        logical_id: r.logical_id.clone(),
+        source: r.source_domain.clone(),
+        seq: r.seq,
+        target: r.target.clone(),
+        message_type: r.message_type.clone(),
+        policy: r.policy,
+        status: r.status,
+        data: r.data.clone(),
+        created_at: r.created_at,
+    }
+}
+
 impl KernelLedger {
     pub fn new() -> Self {
         Self::open_with_db(None).expect("cannot initialize kernel ledger")
     }
+
     pub fn open_with_db(path: Option<&Path>) -> Result<Self, StorageError> {
         let prepared = path
             .map(|path| -> Result<_, StorageError> {
                 if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Creating an empty file is safe; no SQLite/recovery mutation precedes the guard.
                 std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -124,8 +235,7 @@ impl KernelLedger {
                     .truncate(false)
                     .open(path)?;
                 let canonical = path.canonicalize()?;
-                // SQLite WAL databases must have a single filesystem name. A hard-link alias
-                // has a different WAL/lock filename, so reject it rather than recover it.
+                // SQLite WAL 数据库必须是单一文件系统名；硬链接别名有不同 WAL/lock 名，拒绝。
                 #[cfg(unix)]
                 let metadata = std::fs::metadata(&canonical)?;
                 #[cfg(unix)]
@@ -136,15 +246,15 @@ impl KernelLedger {
                     #[repr(C)]
                     #[derive(Default)]
                     struct FileInformation {
-                        attributes: u32, creation: [u32;2], access: [u32;2], write: [u32;2],
+                        attributes: u32, creation: [u32; 2], access: [u32; 2], write: [u32; 2],
                         volume: u32, size_high: u32, size_low: u32, links: u32, index_high: u32, index_low: u32,
                     }
-                    #[link(name="kernel32")]
+                    #[link(name = "kernel32")]
                     unsafe extern "system" {
                         fn GetFileInformationByHandle(handle: *mut std::ffi::c_void, info: *mut FileInformation) -> i32;
                     }
-                    let file=std::fs::File::open(&canonical)?;
-                    let mut info=FileInformation::default();
+                    let file = std::fs::File::open(&canonical)?;
+                    let mut info = FileInformation::default();
                     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
                         return Err(std::io::Error::last_os_error().into());
                     }
@@ -153,7 +263,9 @@ impl KernelLedger {
                 #[cfg(not(any(unix, windows)))]
                 let links = 1;
                 if links > 1 {
-                    return Err(StorageError::Io(std::io::Error::other("hard-linked SQLite database is unsafe; use its canonical path or a symbolic link")));
+                    return Err(StorageError::Io(std::io::Error::other(
+                        "hard-linked SQLite database is unsafe; use its canonical path or a symbolic link",
+                    )));
                 }
                 let mut lock_path = canonical.as_os_str().to_os_string();
                 lock_path.push(".kernel-owner.lock");
@@ -172,6 +284,7 @@ impl KernelLedger {
                 Ok((canonical, owner))
             })
             .transpose()?;
+
         let mut db = match prepared.as_ref().map(|(path, _)| path) {
             Some(p) => {
                 if let Some(parent) = p.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -186,17 +299,10 @@ impl KernelLedger {
         )?;
         db.execute_batch(SCHEMA)?;
         verify_sqlite_table_columns(&db, KERNEL_LEDGER_TABLE, KERNEL_LEDGER_COLUMNS)?;
-        verify_sqlite_table_columns(
-            &db,
-            "kernel_sessions",
-            &["source", "seq", "logical_id", "children"],
-        )?;
-        let bad:Option<String>=db.query_row("SELECT message_id FROM kernel_ledger WHERE (data IS NOT NULL AND NOT json_valid(data)) OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",[],|r|r.get(0)).optional()?;
-        if let Some(id) = bad {
-            return Err(StorageError::CorruptLedgerRecord(id));
-        }
+        verify_sqlite_table_columns(&db, AUDIT_TABLE, AUDIT_COLUMNS)?;
         crate::outbox::initialize(&db)?;
-        // Use the same protocol decoder as live IPC; do not maintain a second JSON schema.
+
+        // 损坏的持久传输在启动清理前显式拒绝（沿用协议解码器，不维护第二套 JSON schema）。
         {
             let mut statement =
                 db.prepare("SELECT id,delivery_id,priority,frame FROM kernel_outbox ORDER BY id")?;
@@ -226,36 +332,80 @@ impl KernelLedger {
                 }
             }
         }
-        // Every old process generation is disconnected. Recover facts, never blindly repeat effects.
+
+        // 损坏显式拒绝（C3）：非法状态或 JSON 直接报错，不回退为 Sent。
+        let bad: Option<String> = db
+            .query_row(
+                "SELECT message_id FROM messages WHERE (data IS NOT NULL AND NOT json_valid(data)) \
+                 OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = bad {
+            return Err(StorageError::CorruptLedgerRecord(id));
+        }
+        let bad_audit: Option<String> = db
+            .query_row(
+                "SELECT message_id FROM audit WHERE (data IS NOT NULL AND NOT json_valid(data)) \
+                 OR status NOT IN ('completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = bad_audit {
+            return Err(StorageError::CorruptLedgerRecord(id));
+        }
+
+        // 启动恢复（旧出口 5 坍缩为一个事务）：活消息按终态/非终态收敛进 audit，messages 清空。
+        // "留日志不留状态"——历史终态结果保留于 audit，非终态明确终结为 ExecutionFailed。
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // 重启后上一代终态记录没有任何读取者（内核重启必然伴随所有域重启）：先清掉，只保留在途事实。
-        tx.execute(
-            "DELETE FROM kernel_ledger WHERE status IN ('completed','contract_invalid','target_invalid','execution_failed')",
-            [],
-        )?;
-        tx.execute("UPDATE kernel_ledger SET status='execution_failed',data=?1,updated_at=?2 WHERE status IN ('sent','received','started')",
-            params![json!({"error":"kernel_restarted_with_inflight_delivery","execution_outcome":"unknown","reason":"previous process generation disconnected; no automatic replay"}).to_string(),now_millis()])?;
-        tx.execute("DELETE FROM kernel_outbox", [])?;
-        tx.execute("DELETE FROM kernel_sessions", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at FROM messages",
+            )?;
+            let rows = stmt
+                .query_map([], messages_row_to_record)?
+                .collect::<Result<Vec<_>, _>>()?;
+            for mut rec in rows {
+                if !rec.status.is_terminal() {
+                    rec.status = ContractStatus::ExecutionFailed;
+                    rec.updated_at = now_millis();
+                    rec.data = Some(json!({
+                        "error": "kernel_restarted_with_inflight_delivery",
+                        "execution_outcome": "unknown",
+                        "reason": "previous process generation disconnected; no automatic replay"
+                    }));
+                }
+                tx.execute("DELETE FROM messages WHERE message_id=?1", [&rec.message_id])?;
+                insert_audit_tx(&tx, &rec)?;
+            }
+        }
         tx.commit()?;
-        let memory = Connection::open_in_memory()?;
-        memory.execute_batch(SCHEMA)?;
-        memory.execute_batch(
-            "ALTER TABLE kernel_sessions ADD COLUMN durable INTEGER NOT NULL DEFAULT 0;",
-        )?;
-        memory.execute_batch("CREATE TABLE identities(message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,source TEXT NOT NULL,seq INTEGER NOT NULL,origin INTEGER NOT NULL DEFAULT 0,channel TEXT,record TEXT,persistence_failed INTEGER NOT NULL DEFAULT 0);
-            CREATE INDEX identities_logical ON identities(logical_id);
-            CREATE TABLE highwater(source TEXT PRIMARY KEY,seq INTEGER NOT NULL);")?;
+
+        // 载入历史审计到核（核是唯一权威，磁盘只是镜像）。
+        let audit_records: Vec<AuditRecord> = {
+            let mut stmt = db.prepare(
+                "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at FROM audit ORDER BY id",
+            )?;
+            stmt.query_map([], audit_row_to_record)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut nucleus = Nucleus::new();
+        nucleus.load_audit(audit_records);
+
         Ok(Self {
             next_id_seq: AtomicU64::new(1),
             instance_id: uuid::Uuid::new_v4().simple().to_string(),
-            memory: Mutex::new(memory),
+            nucleus: Mutex::new(nucleus),
+            bindings: Mutex::new(HashMap::new()),
             db_conn: Some(Arc::new(Mutex::new(db))),
             gates: Mutex::new(HashMap::new()),
             evicted: AtomicU64::new(0),
             _owner: prepared.map(|(_, owner)| owner),
         })
     }
+
     pub(crate) fn database_path(&self) -> Option<std::path::PathBuf> {
         self.db_conn
             .as_ref()
@@ -264,6 +414,7 @@ impl KernelLedger {
             .path()
             .map(std::path::PathBuf::from)
     }
+
     pub(crate) fn message_gate(&self, id: &str) -> Arc<Mutex<()>> {
         let mut gates = self.gates.lock();
         if let Some(gate) = gates.get(id).and_then(|w| w.upgrade()) {
@@ -276,64 +427,7 @@ impl KernelLedger {
         gates.insert(id.into(), Arc::downgrade(&gate));
         gate
     }
-    fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
-        let status: String = row.get(7)?;
-        let raw: Option<String> = row.get(8)?;
-        let policy: String = row.get(6)?;
-        let error = |e: serde_json::Error| {
-            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
-        };
-        let target: String = row.get(4)?;
-        let message_type: String = row.get(5)?;
-        Ok(DeliveryRecord {
-            message_id: row.get(0)?,
-            logical_id: row.get(1)?,
-            seq: row.get::<_, i64>(2)? as u64,
-            source_domain: row.get(3)?,
-            target,
-            message_type,
-            policy: serde_json::from_value(Value::String(policy)).map_err(error)?,
-            status: serde_json::from_value(Value::String(status)).map_err(error)?,
-            data: raw
-                .map(|s| serde_json::from_str(&s).map_err(error))
-                .transpose()?,
-            created_at: row.get(9)?,
-            updated_at: row.get(10)?,
-        })
-    }
-    fn read(db: &Connection, id: &str) -> rusqlite::Result<Option<DeliveryRecord>> {
-        db.query_row(
-            &format!("{SELECT_RECORD} WHERE message_id=?1"),
-            [id],
-            Self::row_to_record,
-        )
-        .optional()
-    }
-    fn write(db: &Connection, r: &DeliveryRecord) -> Result<(), StorageError> {
-        db.execute("INSERT INTO kernel_ledger(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,data=excluded.data,updated_at=excluded.updated_at",
-            params![r.message_id,r.logical_id,r.seq as i64,r.source_domain,r.target,r.message_type,serde_json::to_value(r.policy)?.as_str(),serde_json::to_value(r.status)?.as_str(),r.data.as_ref().map(serde_json::to_string).transpose()?,r.created_at,r.updated_at])?;
-        Ok(())
-    }
-    fn failure(r: &DeliveryRecord, error: impl ToString) -> DeliveryRecord {
-        let mut failed = r.clone();
-        failed.status = ContractStatus::ExecutionFailed;
-        failed.updated_at = now_millis();
-        failed.data = Some(
-            json!({"error":"kernel_persistence_failed","reason":error.to_string().chars().take(2048).collect::<String>(),"persisted":false,"previous_status":r.status,"execution_outcome":"unknown"}),
-        );
-        failed
-    }
-    fn remember_failure(&self, r: &DeliveryRecord) {
-        // Failure feedback never depends on the disk which failed. Space is reserved at ingress.
-        let mem = self.memory.lock();
-        Self::write(&mem, r).expect("kernel cannot retain reserved failure state");
-        mem.execute(
-            "UPDATE identities SET persistence_failed=1 WHERE message_id=?1",
-            [&r.message_id],
-        )
-        .expect("failure provenance");
-    }
+
     pub fn generate_message_id(&self) -> String {
         format!(
             "msg_{}_{}_{:020}",
@@ -342,6 +436,7 @@ impl KernelLedger {
             self.next_id_seq.fetch_add(1, Ordering::Relaxed)
         )
     }
+
     pub fn allocate_submission(
         &self,
         source: &str,
@@ -351,274 +446,140 @@ impl KernelLedger {
         self.try_allocate_submission(source, seq, count, false)
             .expect("kernel submission resources exhausted")
     }
+
     pub(crate) fn try_allocate_submission(
         &self,
         source: &str,
         seq: u64,
         count: usize,
-        durable: bool,
+        _durable: bool,
     ) -> Result<(String, Vec<String>, bool), StorageError> {
-        let allocation_gate = self.message_gate(&format!("submission:{source}:{seq}"));
-        let _allocation = allocation_gate.lock();
-        let older = {
-            let mem = self.memory.lock();
-            if seq > 0 {
-                if let Some(found) = Self::submission(&mem, source, seq)? {
-                    return Ok((found.0, found.1, true));
-                }
-            }
-            let high: i64 = mem.query_row(
-                "SELECT coalesce((SELECT seq FROM highwater WHERE source=?1),0)",
-                [source],
-                |r| r.get(0),
-            )?;
-            seq > 0 && seq <= high as u64
-        };
-        if older {
-            if let Some(found) =
-                Self::submission(&self.db_conn.as_ref().unwrap().lock(), source, seq)?
-            {
-                return Ok((found.0, found.1, true));
-            }
+        if count > MAX_CHILDREN_PER_SUBMISSION {
+            return Err(StorageError::ResourceExhausted(
+                "live message identities".into(),
+            ));
         }
+        // 全局唯一 id 由 facade 生成（含 UUID + 时间 + 单调序号），核只做去重窗口。
         let logical = self.generate_message_id().replacen("msg_", "logical_", 1);
-        let ids: Vec<_> = (0..count).map(|_| self.generate_message_id()).collect();
-        {
-            let mut mem = self.memory.lock();
-            let used:i64=mem.query_row("SELECT (SELECT count(*) FROM identities)+(SELECT count(*) FROM kernel_sessions)+(SELECT count(*) FROM kernel_ledger WHERE status IN ('completed','execution_failed','contract_invalid','target_invalid'))",[],|r|r.get(0))?;
-            if count > 1024 || used + count as i64 > MAX_LIVE {
-                return Err(StorageError::ResourceExhausted(
-                    "live message identities".into(),
-                ));
-            }
-            let tx = mem.transaction()?;
-            if seq > 0 {
-                tx.execute(
-                    "INSERT INTO kernel_sessions VALUES(?1,?2,?3,?4,?5)",
-                    params![
-                        source,
-                        seq as i64,
-                        logical,
-                        serde_json::to_string(&ids)?,
-                        durable
-                    ],
-                )?;
-            }
-            for id in &ids {
-                tx.execute(
-                    "INSERT INTO identities(message_id,logical_id,source,seq) VALUES(?1,?2,?3,?4)",
-                    params![id, logical, source, seq as i64],
-                )?;
-            }
-            tx.execute("INSERT INTO highwater VALUES(?1,?2) ON CONFLICT(source) DO UPDATE SET seq=max(seq,excluded.seq)",params![source,seq as i64])?;
-            tx.commit()?;
+        let ids: Vec<String> = (0..count).map(|_| self.generate_message_id()).collect();
+        let mut n = self.nucleus.lock();
+        if n.retention().0.saturating_add(count) > MAX_LIVE {
+            return Err(StorageError::ResourceExhausted(
+                "live message identities".into(),
+            ));
         }
-        Ok((logical, ids, false))
+        Ok(n.allocate_submission_with_ids(source, seq, logical, ids))
     }
-    fn submission(
-        db: &Connection,
-        source: &str,
-        seq: u64,
-    ) -> Result<Option<(String, Vec<String>)>, StorageError> {
-        let row: Option<(String, String)> = db
-            .query_row(
-                "SELECT logical_id,children FROM kernel_sessions WHERE source=?1 AND seq=?2",
-                params![source, seq as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        row.map(|(id, text)| Ok((id, serde_json::from_str(&text)?)))
-            .transpose()
-    }
+
     pub fn logical_id_for_message(&self, id: &str) -> String {
-        let found: Option<String> = self
-            .memory
-            .lock()
-            .query_row(
-                "SELECT logical_id FROM identities WHERE message_id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()
-            .expect("memory identity query failed");
-        found
-            .or_else(|| {
-                Self::read(&self.memory.lock(), id)
-                    .expect("memory identity receipt")
-                    .map(|r| r.logical_id)
-            })
-            .or_else(|| self.get_persisted_record(id).map(|r| r.logical_id))
+        self.record_for_message(id)
+            .map(|r| r.logical_id)
+            .or_else(|| self.nucleus.lock().logical_id_for(id))
             .unwrap_or_else(|| id.into())
     }
+
     pub(crate) fn bind_origin(&self, ids: &[String], instance: u64) {
-        let mem = self.memory.lock();
+        let mut b = self.bindings.lock();
         for id in ids {
-            mem.execute(
-                "UPDATE identities SET origin=?1 WHERE message_id=?2",
-                params![instance as i64, id],
-            )
-            .expect("memory origin binding");
+            b.entry(id.clone()).or_default().origin = instance;
         }
     }
+
     pub(crate) fn source_instance(&self, id: &str) -> Option<u64> {
-        self.memory
-            .lock()
-            .query_row(
-                "SELECT origin FROM identities WHERE message_id=?1",
-                [id],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()
-            .expect("memory origin lookup")
-            .map(|v| v as u64)
+        self.bindings.lock().get(id).map(|b| b.origin)
     }
-    fn metadata(&self, id: &str) -> Option<DeliveryRecord> {
-        let raw: Option<String> = self
-            .memory
-            .lock()
-            .query_row(
-                "SELECT record FROM identities WHERE message_id=?1",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()
-            .expect("live metadata lookup")
-            .flatten();
-        raw.map(|text| serde_json::from_str(&text).expect("internal live record encoding"))
-    }
-    fn update_metadata(&self, r: &DeliveryRecord) {
-        let mut meta = r.clone();
-        meta.data = None;
-        self.memory
-            .lock()
-            .execute(
-                "UPDATE identities SET record=?1 WHERE message_id=?2",
-                params![
-                    serde_json::to_string(&meta).expect("live metadata encoding"),
-                    r.message_id
-                ],
-            )
-            .expect("live metadata update");
-    }
+
     pub(crate) fn accepts_channel(&self, id: &str, channel: &str) -> bool {
-        self.memory
+        self.bindings
             .lock()
-            .query_row(
-                "SELECT coalesce(channel=?1,0) FROM identities WHERE message_id=?2",
-                params![channel, id],
-                |r| r.get::<_, bool>(0),
-            )
-            .optional()
-            .expect("live channel lookup")
-            .unwrap_or(false)
+            .get(id)
+            .is_some_and(|b| b.channel.as_deref() == Some(channel))
     }
+
     pub(crate) fn has_unpersisted_failure(&self, id: &str) -> bool {
-        self.memory
+        self.bindings
             .lock()
-            .query_row(
-                "SELECT persistence_failed FROM identities WHERE message_id=?1",
-                [id],
-                |row| row.get::<_, bool>(0),
-            )
-            .optional()
-            .expect("failure provenance lookup")
-            .unwrap_or(false)
+            .get(id)
+            .is_some_and(|b| b.persistence_failed)
     }
+
     pub(crate) fn finish_publication(&self, r: &MessageReceipt) {
         if !r.status.is_terminal() {
             return;
         }
-        let policy = r.policy;
-        let mem = self.memory.lock();
-        let abandoned:bool=mem.query_row("SELECT NOT EXISTS(SELECT 1 FROM identities i JOIN highwater h ON h.source=i.source WHERE i.message_id=?1)",[&r.message_id],|row|row.get(0)).expect("source lifetime query");
-        let unpersisted: bool = mem.query_row("SELECT coalesce((SELECT persistence_failed FROM identities WHERE message_id=?1),0)",[&r.message_id], |row|row.get(0)).expect("publication provenance");
-        if unpersisted && !abandoned {
+        // 未持久化失败的活行身份保留：源仍活着时，后续回执需要它重放失败结果；
+        // 由 clear_session_dedup_for_domain 在代际退役时清理。
+        if self.has_unpersisted_failure(&r.message_id) {
             return;
         }
-        if abandoned {
-            mem.execute(
-                "DELETE FROM kernel_ledger WHERE message_id=?1 AND message_id IN (SELECT message_id FROM identities WHERE persistence_failed=1)",
-                [&r.message_id],
-            )
-            .expect("exited source result cleanup");
-        }
-        mem.execute(
-            "DELETE FROM identities WHERE message_id=?1",
-            [&r.message_id],
-        )
-        .expect("live context cleanup");
-        // 会话索引只为幂等重放服务，且必须有界：
-        // Ephemeral 只删自己这一条（?3 限定 logical，避免一次查询清空所有来源的重放窗口）；
-        // Durable 终态即删（结果已在磁盘）；其余只保留最近 `SESSION_REPLAY_WINDOW` 个序号。
-        mem.execute(
-            "DELETE FROM kernel_sessions WHERE NOT EXISTS(SELECT 1 FROM identities WHERE identities.logical_id=kernel_sessions.logical_id) AND ((?2 AND logical_id=?3) OR durable=1 OR seq <= (SELECT coalesce((SELECT max(s.seq) FROM kernel_sessions s WHERE s.source=kernel_sessions.source),0) - ?1))",
-            params![
-                SESSION_REPLAY_WINDOW,
-                policy == DeliveryPolicy::Ephemeral,
-                r.logical_id
-            ],
-        )
-        .expect("finished session cleanup");
+        // 回执已发布：活行身份随终态回收，Durable 结果留在 audit，不依赖任何已删除行。
+        self.bindings.lock().remove(&r.message_id);
     }
-    fn retire(&self, r: &DeliveryRecord, _policy: DeliveryPolicy) {
-        // Router retains origin through terminal publication; standalone ledger users have no pipe.
-        if r.status.is_terminal() && self.source_instance(&r.message_id).unwrap_or(0) == 0 {
-            self.finish_publication(&r.to_receipt());
-        }
-    }
+
     pub fn clear_session_dedup_for_domain(&self, source: &str) {
-        {
-            let mem = self.memory.lock();
-            mem.execute("DELETE FROM kernel_ledger WHERE message_id IN (SELECT message_id FROM identities WHERE source=?1 AND persistence_failed=1)",[source]).expect("finished source results cleanup");
-            mem.execute("DELETE FROM identities WHERE source=?1 AND record IS NOT NULL AND json_extract(record,'$.status') IN ('completed','execution_failed','contract_invalid','target_invalid')",[source]).expect("finished source context cleanup");
-            mem.execute("DELETE FROM kernel_sessions WHERE source=?1", [source])
-                .expect("memory session cleanup");
-            mem.execute("DELETE FROM highwater WHERE source=?1", [source])
-                .expect("memory session cleanup");
-        }
-        if let Err(e) = self
-            .db_conn
-            .as_ref()
-            .unwrap()
-            .lock()
-            .execute("DELETE FROM kernel_sessions WHERE source=?1", [source])
-        {
-            eprintln!("kernel session cleanup failed; admission will remain explicit: {e}");
-        }
-    }
-    pub fn retention_counts(&self) -> Value {
-        let mem = self.memory.lock();
-        let count = |sql: &str| {
-            mem.query_row(sql, [], |r| r.get::<_, i64>(0))
-                .expect("ledger diagnostic query")
+        self.nucleus.lock().retire_dedup(source);
+        let generation = source
+            .rsplit_once('#')
+            .and_then(|(_, g)| g.parse::<u64>().ok());
+        let Some(g) = generation else {
+            return;
         };
-        let records = count("SELECT count(*) FROM kernel_ledger");
-        let ids = count("SELECT count(*) FROM identities");
-        let mut durable = 0;
-        let mut volatile = 0;
-        let mut ephemeral = 0;
-        let mut statement = mem
-            .prepare("SELECT policy,status FROM kernel_ledger")
-            .expect("resident policy query");
-        for row in statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .expect("resident policies")
-        {
-            let (policy, status) = row.expect("resident policy metadata");
-            match policy.as_str() {
-                "durable" => durable += 1,
-                "volatile" => volatile += 1,
-                "ephemeral" => {
-                    if matches!(status.as_str(), "sent" | "received" | "started") {
+        // 只清理"未持久化失败"或"已终态"的绑定；在途/孤儿绑定保留，杜绝旧回执误入新代际。
+        let snapshot: Vec<(String, Binding)> = {
+            let b = self.bindings.lock();
+            b.iter()
+                .filter(|(_, bind)| bind.origin == g)
+                .map(|(id, bind)| (id.clone(), bind.clone()))
+                .collect()
+        };
+        let mut to_remove = HashSet::new();
+        for (id, bind) in snapshot {
+            let terminal = self
+                .record_for_message(&id)
+                .is_some_and(|r| r.status.is_terminal());
+            if bind.persistence_failed || terminal {
+                to_remove.insert(id);
+            }
+        }
+        self.bindings.lock().retain(|id, _| !to_remove.contains(id));
+    }
+
+    pub fn retention_counts(&self) -> Value {
+        let n = self.nucleus.lock();
+        let (active, submissions, _audit) = n.retention();
+        let mut durable = 0usize;
+        let mut volatile = 0usize;
+        let mut ephemeral = 0usize;
+        let mut logical_groups = HashSet::new();
+        for m in n.active_snapshot() {
+            logical_groups.insert(m.logical_id.clone());
+            match m.policy {
+                DeliveryPolicy::Durable => durable += 1,
+                DeliveryPolicy::Volatile => volatile += 1,
+                DeliveryPolicy::Ephemeral => {
+                    if !m.status.is_terminal() {
                         ephemeral += 1;
                     }
                 }
-                _ => {}
             }
         }
-        json!({"resident_records":records,"record_capacity":records,"durable_records":durable,"volatile_records":volatile,"ephemeral_inflight":ephemeral,"nonpersistent_evicted":self.evicted.load(Ordering::Relaxed),
-            "submissions":count("SELECT count(*) FROM kernel_sessions"),"submission_capacity":MAX_LIVE,"logical_groups":count("SELECT count(DISTINCT logical_id) FROM identities"),"logical_capacity":ids,"child_links":ids,"child_capacity":ids})
+        let child_links = self.bindings.lock().len();
+        json!({
+            "resident_records": active,
+            "record_capacity": active,
+            "durable_records": durable,
+            "volatile_records": volatile,
+            "ephemeral_inflight": ephemeral,
+            "nonpersistent_evicted": self.evicted.load(Ordering::Relaxed),
+            "submissions": submissions,
+            "submission_capacity": MAX_LIVE,
+            "logical_groups": logical_groups.len(),
+            "logical_capacity": child_links,
+            "child_links": child_links,
+            "child_capacity": child_links,
+        })
     }
+
     pub fn record_initial_target_state(
         &self,
         id: &str,
@@ -634,6 +595,7 @@ impl KernelLedger {
         let policy = DeliveryPolicy::resolve(target, kind);
         self.record_initial_target_state_locked(id, seq, source, target, kind, policy, status, data)
     }
+
     pub(crate) fn record_initial_target_state_locked(
         &self,
         id: &str,
@@ -645,9 +607,13 @@ impl KernelLedger {
         status: ContractStatus,
         data: Option<Value>,
     ) -> (DeliveryRecord, bool) {
+        if let Some(existing) = self.record_for_message(id) {
+            return (existing, false);
+        }
         let now = now_millis();
+        let logical_id = self.logical_id_for_message(id);
         let r = DeliveryRecord {
-            logical_id: self.logical_id_for_message(id),
+            logical_id,
             message_id: id.into(),
             seq,
             source_domain: source.into(),
@@ -655,15 +621,51 @@ impl KernelLedger {
             message_type: kind.into(),
             policy,
             status,
-            data,
+            data: data.clone(),
             created_at: now,
             updated_at: now,
         };
-        self.record_initial(r, None)
+        self.bindings
+            .lock()
+            .entry(id.to_string())
+            .or_default()
+            .logical_id = r.logical_id.clone();
+
+        if r.status.is_terminal() {
+            // 入口即终态（TargetInvalid / ContractInvalid）：不建活跃行。
+            if r.policy == DeliveryPolicy::Durable {
+                if let Err(e) = self.append_audit_disk(&r) {
+                    self.set_persistence_failed(id);
+                    return (Self::failure(&r, e), false);
+                }
+                self.nucleus.lock().record_terminal(audit_from_record(&r));
+            }
+            self.maybe_retire_binding(id);
+            return (r, true);
+        }
+
+        self.nucleus.lock().put(
+            id.to_string(),
+            r.logical_id.clone(),
+            source.to_string(),
+            seq,
+            target.to_string(),
+            kind.to_string(),
+            policy,
+            status,
+            data,
+        );
+        if r.policy == DeliveryPolicy::Durable {
+            if let Err(e) = self.persist_live(&r) {
+                return (self.mark_unpersisted_failure(&r, e), false);
+            }
+        }
+        (r, true)
     }
+
     pub(crate) fn record_delivery(
         &self,
-        msg: &crate::protocol::KernelMessage,
+        msg: &KernelMessage,
         seq: u64,
         channel: &str,
     ) -> (DeliveryRecord, bool) {
@@ -681,150 +683,47 @@ impl KernelLedger {
             created_at: now,
             updated_at: now,
         };
-        self.memory
-            .lock()
-            .execute(
-                "UPDATE identities SET channel=?1 WHERE message_id=?2",
-                params![channel, msg.message_id],
-            )
-            .expect("target generation binding");
-        self.record_initial(r, Some((channel, msg)))
-    }
-    fn record_initial(
-        &self,
-        r: DeliveryRecord,
-        out: Option<(&str, &crate::protocol::KernelMessage)>,
-    ) -> (DeliveryRecord, bool) {
-        let policy = r.policy;
-        if self.source_instance(&r.message_id).is_none() && !r.status.is_terminal() {
-            let mem = self.memory.lock();
-            let used: i64 = mem
-                .query_row("SELECT count(*) FROM identities", [], |row| row.get(0))
-                .expect("live capacity");
-            if used >= MAX_LIVE {
-                return (Self::failure(&r, "live message capacity exhausted"), false);
-            }
-            mem.execute("INSERT OR IGNORE INTO identities(message_id,logical_id,source,seq) VALUES(?1,?2,?3,?4)",params![r.message_id,r.logical_id,r.source_domain,r.seq as i64]).expect("standalone live context");
-        }
-        if let Some(existing) =
-            Self::read(&self.memory.lock(), &r.message_id).expect("memory ledger query")
         {
+            let mut b = self.bindings.lock();
+            let binding = b.entry(msg.message_id.clone()).or_default();
+            binding.channel = Some(channel.to_string());
+            binding.logical_id = msg.logical_id.clone();
+        }
+        if let Some(existing) = self.record_for_message(&msg.message_id) {
             return (existing, false);
         }
-        if policy == DeliveryPolicy::Durable {
-            let session: Option<(String, i64, String, String)> = {
-                let mem = self.memory.lock();
-                mem.query_row("SELECT source,seq,logical_id,children FROM kernel_sessions WHERE logical_id=?1 AND durable=1",[&r.logical_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional().expect("live submission lookup")
-            };
-            let result = (|| -> Result<Option<DeliveryRecord>, StorageError> {
+        self.nucleus.lock().put(
+            msg.message_id.clone(),
+            msg.logical_id.clone(),
+            msg.source_domain.clone(),
+            seq,
+            msg.target.clone(),
+            msg.message_type.clone(),
+            msg.delivery,
+            ContractStatus::Sent,
+            None,
+        );
+        if msg.delivery == DeliveryPolicy::Durable {
+            // 持久化成功先于投递（C3）：账本行与完整信封同一事务落盘。
+            let result = (|| -> Result<(), StorageError> {
                 let mut db = self.db_conn.as_ref().unwrap().lock();
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                if let Some(existing) = Self::read(&tx, &r.message_id)? {
-                    return Ok(Some(existing));
-                }
-                Self::write(&tx, &r)?;
-                if let Some((source, seq, logical, children)) = &session {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO kernel_sessions VALUES(?1,?2,?3,?4)",
-                        params![source, seq, logical, children],
-                    )?;
-                }
-                if let Some((channel, msg)) = out {
-                    crate::outbox::insert_frame(
-                        &tx,
-                        channel,
-                        &crate::protocol::KernelToDomainFrame::Deliver(msg.clone()),
-                    )?;
-                }
+                write_messages_tx(&tx, &r)?;
+                crate::outbox::insert_frame(
+                    &tx,
+                    channel,
+                    &crate::protocol::KernelToDomainFrame::Deliver(msg.clone()),
+                )?;
                 tx.commit()?;
-                Ok(None)
+                Ok(())
             })();
-            match result {
-                Ok(Some(old)) => return (old, false),
-                Err(e) => {
-                    let failed = Self::failure(&r, e);
-                    self.remember_failure(&failed);
-                    self.update_metadata(&failed);
-                    return (failed, false);
-                }
-                Ok(None) => {}
+            if let Err(e) = result {
+                return (self.mark_unpersisted_failure(&r, e), false);
             }
-        } else if !r.status.is_terminal() {
-            // 非持久消息在入口即终态（TargetInvalid / ContractInvalid / 输出不可用）时不落账本：
-            // 该行走不到 commit_transition 的终态清理，也不会被淘汰（淘汰只选 Ephemeral），
-            // 留下来只会无限占用 MAX_LIVE 准入预算。
-            let mem = self.memory.lock();
-            let bytes: i64 = mem
-                .query_row(
-                    "SELECT coalesce(sum(length(data)),0) FROM kernel_ledger",
-                    [],
-                    |r| r.get(0),
-                )
-                .expect("memory quota query");
-            if bytes + r.data.as_ref().map_or(0, |v| v.to_string().len() as i64)
-                > MAX_TRANSIENT_BYTES
-            {
-                // 非持久账本容量是软上限：先淘汰最旧的已终结记录，绝不因为容量拒绝新消息。
-                let size = r.data.as_ref().map_or(0, |v| v.to_string().len() as i64);
-                let mut need = bytes + size - MAX_TRANSIENT_BYTES;
-                let victims: Vec<(String, i64, String)> = {
-                    let mut stmt = mem
-                        .prepare(
-                            "SELECT message_id, coalesce(length(data),0), policy FROM kernel_ledger \
-                             ORDER BY created_at ASC",
-                        )
-                        .expect("quota victim query");
-                    let rows = stmt
-                        .query_map([], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        })
-                        .expect("quota victim rows");
-                    rows.filter_map(Result::ok).collect()
-                };
-                for (id, len, policy) in victims {
-                    if need <= 0 {
-                        break;
-                    }
-                    // 非持久（Ephemeral）是尽力而为：终态与在途都可以丢；Durable/Volatile 一律不动。
-                    if policy != "ephemeral" {
-                        continue;
-                    }
-                    let victim_logical = Self::read(&mem, &id).ok().flatten().map(|v| v.logical_id);
-                    mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1", [&id])
-                        .expect("quota eviction");
-                    // 身份行必须一起回收：MAX_LIVE 统计的是 identities，漏删会让淘汰形同虚设。
-                    mem.execute("DELETE FROM identities WHERE message_id=?1", [&id])
-                        .expect("quota identity cleanup");
-                    // 该 logical 下已无身份时，会话索引同样是纯历史，必须回收。
-                    if let Some(logical) = victim_logical {
-                        mem.execute(
-                            "DELETE FROM kernel_sessions WHERE logical_id=?1 AND NOT EXISTS(SELECT 1 FROM identities WHERE logical_id=?1)",
-                            [&logical],
-                        )
-                        .expect("evicted session cleanup");
-                    }
-                    self.evicted.fetch_add(1, Ordering::Relaxed);
-                    need -= len.max(1);
-                }
-                if need > 0 {
-                    let failed = Self::failure(&r, "nonpersistent ledger capacity exhausted");
-                    drop(mem);
-                    // 不能走 remember_failure：它会把失败行写回账本并标记 persistence_failed，
-                    // 而 finish_publication 对这种情况故意不回收 —— 等于每次拒收都永久占用它刚刚失败的那份预算。
-                    self.update_metadata(&failed);
-                    return (failed, false);
-                }
-            }
-            Self::write(&mem, &r).expect("cannot write in-memory ledger");
         }
-        self.update_metadata(&r);
-        self.retire(&r, policy);
         (r, true)
     }
+
     pub fn advance_status(
         &self,
         domain: &str,
@@ -837,6 +736,7 @@ impl KernelLedger {
         let _mutation = gate.lock();
         self.advance_status_locked(domain, id, target, status, data)
     }
+
     pub(crate) fn advance_status_locked(
         &self,
         domain: &str,
@@ -850,158 +750,130 @@ impl KernelLedger {
         if !kernel_alias && parse_target_address(target).is_none_or(|(owner, _)| owner != domain) {
             return ReceiptTransition::UnauthorizedTarget;
         }
-        let resident_terminal = Self::read(&self.memory.lock(), id)
-            .expect("memory receipt query")
-            .is_some_and(|r| r.status.is_terminal());
         let Some(old) = self.record_for_message(id) else {
             return ReceiptTransition::UnknownDelivery;
         };
         if old.target != target {
             return ReceiptTransition::UnauthorizedTarget;
         }
-        if !resident_terminal
-            && old.status == ContractStatus::ExecutionFailed
-            && self.has_unpersisted_failure(id)
-        {
-            return ReceiptTransition::Advanced {
-                source_domain: old.source_domain.clone(),
-                receipt: old.to_receipt(),
-            };
-        }
-        if old.target != target {
-            return ReceiptTransition::UnauthorizedTarget;
-        }
         if old.status.is_terminal() || status.stage_rank() <= old.status.stage_rank() {
             return ReceiptTransition::DuplicateOrStale;
         }
+        let r = self.commit_advance(id, &old, status, data);
+        ReceiptTransition::Advanced {
+            source_domain: r.source_domain.clone(),
+            receipt: r.to_receipt(),
+        }
+    }
+
+    /// 唯一的状态推进出口：终态 = 转审计（Durable）/ 清除（其余）+ 回收去重窗口。
+    fn commit_advance(
+        &self,
+        id: &str,
+        old: &DeliveryRecord,
+        status: ContractStatus,
+        data: Option<Value>,
+    ) -> DeliveryRecord {
         let mut r = old.clone();
         r.status = status;
         r.updated_at = now_millis();
         if data.is_some() {
             r.data = data;
         }
-        self.commit_transition(&mut r, &old);
-        ReceiptTransition::Advanced {
-            source_domain: r.source_domain.clone(),
-            receipt: r.to_receipt(),
-        }
-    }
-    fn commit_transition(&self, r: &mut DeliveryRecord, old: &DeliveryRecord) {
-        let policy = r.policy;
-        if policy == DeliveryPolicy::Durable {
-            let result = (|| -> Result<(), StorageError> {
-                let mut db = self.db_conn.as_ref().unwrap().lock();
-                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                Self::write(&tx, r)?;
-                if r.status.is_terminal() {
-                    tx.execute(
-                        "DELETE FROM kernel_outbox WHERE delivery_id=?1",
-                        [&r.message_id],
-                    )?;
-                }
-                tx.commit()?;
-                Ok(())
-            })();
-            if let Err(e) = result {
-                *r = Self::failure(old, e);
-                self.remember_failure(r);
-            }
-        } else {
-            let mem = self.memory.lock();
-            if r.status.is_terminal() {
-                // 非持久记录（Ephemeral + Volatile）终态即清理：两者都不落盘，也不承担事后结果查询。
-                mem.execute(
-                    "DELETE FROM kernel_ledger WHERE message_id=?1",
-                    [&r.message_id],
-                )
-                .expect("transient record cleanup");
-            } else {
-                let used:i64=mem.query_row("SELECT coalesce(sum(length(data)),0) FROM kernel_ledger WHERE message_id<>?1",[&r.message_id],|row|row.get(0)).expect("memory data budget");
-                if used + r.data.as_ref().map_or(0, |v| v.to_string().len() as i64)
-                    > MAX_TRANSIENT_BYTES
-                {
-                    *r = Self::failure(old, "nonpersistent result capacity exhausted");
-                    // 容量失败本身已是终态：不要再写回账本，否则这一行永远没有回收路径。
-                    mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1", [&r.message_id])
-                        .expect("transient result cleanup");
-                } else {
-                    Self::write(&mem, r).expect("memory transition");
-                }
+        if old.policy == DeliveryPolicy::Durable {
+            if let Err(e) = self.persist_advance(&r) {
+                return self.mark_unpersisted_failure(&r, e);
             }
         }
-        self.update_metadata(r);
-        self.retire(r, policy);
+        self.nucleus
+            .lock()
+            .advance(id, status, r.data.clone());
+        if status.is_terminal() {
+            // 独立账本使用（无路由器 origin 绑定）时，终态即回收活行身份。
+            self.maybe_retire_binding(id);
+        }
+        r
     }
-    fn record_for_message(&self, id: &str) -> Option<DeliveryRecord> {
-        let resident = { Self::read(&self.memory.lock(), id).expect("memory ledger query") };
-        resident.or_else(|| self.get_persisted_record(id))
+
+    fn maybe_retire_binding(&self, id: &str) {
+        if self.source_instance(id).unwrap_or(0) == 0 {
+            self.bindings.lock().remove(id);
+        }
     }
+
     pub fn get_record(&self, id: &str, target: &str) -> Option<DeliveryRecord> {
         self.record_for_message(id).filter(|r| r.target == target)
     }
+
     pub fn get_persisted_record(&self, id: &str) -> Option<DeliveryRecord> {
-        let result = Self::read(&self.db_conn.as_ref().unwrap().lock(), id);
-        match result {
-            Ok(record) => record,
-            Err(error) => {
-                let meta = self.metadata(id).unwrap_or_else(|| {
-                    panic!("cannot read persistent historical delivery {id}: {error}")
-                });
-                let failed = Self::failure(&meta, error);
-                self.remember_failure(&failed);
-                Some(failed)
-            }
-        }
+        self.read_disk(id)
     }
+
     pub fn persisted_count(&self) -> usize {
-        self.db_conn
-            .as_ref()
-            .unwrap()
-            .lock()
-            .query_row("SELECT count(*) FROM kernel_ledger", [], |r| {
-                r.get::<_, i64>(0)
-            })
-            .expect("cannot count persistent ledger") as usize
+        let db = self.db_conn.as_ref().unwrap().lock();
+        let messages: i64 = db
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap_or(0);
+        let audit: i64 = db
+            .query_row("SELECT count(*) FROM audit", [], |r| r.get(0))
+            .unwrap_or(0);
+        (messages + audit) as usize
     }
+
     pub fn receipts_for_message(&self, id: &str) -> Vec<MessageReceipt> {
         self.record_for_message(id)
             .map(|r| vec![r.to_receipt()])
             .unwrap_or_default()
     }
+
     pub fn receipts_for_logical(&self, logical: &str) -> Vec<MessageReceipt> {
-        let ids: Vec<String> = {
-            let mem = self.memory.lock();
-            let mut stmt = mem
-                .prepare("SELECT message_id FROM identities WHERE logical_id=?1 ORDER BY rowid")
-                .expect("identity lookup");
-            stmt.query_map([logical], |r| r.get(0))
-                .expect("identity query")
-                .collect::<Result<_, _>>()
-                .expect("identity decode")
-        };
-        let mut records: Vec<_> = ids
-            .iter()
-            .filter_map(|id| self.record_for_message(id))
-            .collect();
-        for connection in [&self.memory, &**self.db_conn.as_ref().unwrap()] {
-            let db = connection.lock();
-            let mut stmt = db
-                .prepare(&format!(
-                    "{SELECT_RECORD} WHERE logical_id=?1 ORDER BY rowid"
-                ))
-                .expect("logical lookup");
-            for item in stmt
-                .query_map([logical], Self::row_to_record)
-                .expect("logical query")
-            {
-                let r = item.expect("logical decode");
-                if !records.iter().any(|old| old.message_id == r.message_id) {
-                    records.push(r);
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        {
+            let n = self.nucleus.lock();
+            for m in n.active_snapshot() {
+                if m.logical_id == logical && seen.insert(m.message_id.clone()) {
+                    out.push(record_from_message(&m).to_receipt());
+                }
+            }
+            for a in n.audit_snapshot() {
+                if a.logical_id == logical && seen.insert(a.message_id.clone()) {
+                    out.push(record_from_audit(&a).to_receipt());
                 }
             }
         }
-        records.into_iter().map(|r| r.to_receipt()).collect()
+        if let Some(db) = self.db_conn.as_ref() {
+            let db = db.lock();
+            for table in ["messages", "audit"] {
+                let mut stmt = db
+                    .prepare(&format!(
+                        "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,{} FROM {table} WHERE logical_id=?1",
+                        if table == "messages" { "updated_at" } else { "created_at" }
+                    ))
+                    .ok();
+                if let Some(mut s) = stmt.take() {
+                    let rows = s
+                        .query_map([logical], |row| {
+                            if table == "messages" {
+                                messages_row_to_record(row)
+                            } else {
+                                audit_row_to_record(row).map(|a| record_from_audit(&a))
+                            }
+                        })
+                        .ok();
+                    if let Some(rows) = rows {
+                        for item in rows.flatten() {
+                            if seen.insert(item.message_id.clone()) {
+                                out.push(item.to_receipt());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
+
     pub fn fail_inflight_for_domain(
         &self,
         domain: &str,
@@ -1009,6 +881,7 @@ impl KernelLedger {
     ) -> Vec<(String, MessageReceipt)> {
         self.fail_live(domain, None, reason)
     }
+
     pub(crate) fn fail_inflight_for_channel(
         &self,
         domain: &str,
@@ -1017,308 +890,322 @@ impl KernelLedger {
     ) -> Vec<(String, MessageReceipt)> {
         self.fail_live(domain, Some(channel), reason)
     }
+
     fn fail_live(
         &self,
         domain: &str,
         channel: Option<&str>,
         reason: &str,
     ) -> Vec<(String, MessageReceipt)> {
-        // Only bounded live metadata is needed to close a dead generation, even if disk is unavailable.
-        let pending: Vec<String> = {
-            let mem = self.memory.lock();
-            let mut stmt=mem.prepare("SELECT message_id FROM identities WHERE record IS NOT NULL AND (?1 IS NULL OR channel=?1)").expect("live failure lookup");
-            stmt.query_map([channel], |r| r.get(0))
-                .expect("live failure query")
-                .collect::<Result<_, _>>()
-                .expect("live failure decode")
+        let ids: Vec<String> = {
+            let b = self.bindings.lock();
+            b.iter()
+                .filter(|(_, b)| channel.is_none_or(|c| b.channel.as_deref() == Some(c)))
+                .map(|(id, _)| id.clone())
+                .collect()
         };
         let mut notifications = Vec::new();
-        for id in pending {
+        for id in ids {
             let gate = self.message_gate(&id);
             let _guard = gate.lock();
-            let Some(meta) = self.metadata(&id) else {
+            let Some(old) = self.record_for_message(&id) else {
                 continue;
             };
-            if meta.status.is_terminal()
-                || parse_target_address(&meta.target).is_none_or(|(d, _)| d != domain)
+            if old.status.is_terminal()
+                || parse_target_address(&old.target).is_none_or(|(d, _)| d != domain)
             {
                 continue;
             }
-            if let Some(old) = self.record_for_message(&id) {
-                let mut failed = old.clone();
-                if !old.status.is_terminal() {
-                    failed.status = ContractStatus::ExecutionFailed;
-                    failed.updated_at = now_millis();
-                    failed.data = Some(
-                        json!({"error":"target_domain_faulted","domain":domain,"reason":reason,"execution_outcome":"unknown"}),
-                    );
-                    self.commit_transition(&mut failed, &old);
-                }
-                notifications.push((failed.source_domain.clone(), failed.to_receipt()));
-            }
+            let data = Some(json!({
+                "error": "target_domain_faulted",
+                "domain": domain,
+                "reason": reason,
+                "execution_outcome": "unknown"
+            }));
+            let r = self.commit_advance(&id, &old, ContractStatus::ExecutionFailed, data);
+            notifications.push((r.source_domain.clone(), r.to_receipt()));
         }
         notifications
     }
-}
-#[cfg(test)]
-mod restoration_tests {
-    use super::*;
 
-    #[test]
-    fn ephemeral_identity_indexes_live_only_while_children_are_inflight() {
-        let ledger = KernelLedger::new();
-        for seq in 1..=100 {
-            let (logical, ids, duplicate) = ledger.allocate_submission("sender", seq, 2);
-            assert!(!duplicate);
-            assert_eq!(
-                ledger.allocate_submission("sender", seq, 2),
-                (logical.clone(), ids.clone(), true)
-            );
-            for id in &ids {
-                ledger.record_initial_target_state(
-                    id,
-                    seq,
-                    "sender",
-                    "worker.run",
-                    "Ephemeral",
-                    ContractStatus::Sent,
-                    None,
-                );
-            }
-            for (index, id) in ids.iter().enumerate() {
-                let ReceiptTransition::Advanced { receipt, .. } = ledger.advance_status(
-                    "worker",
-                    id,
-                    "worker.run",
-                    ContractStatus::Completed,
-                    Some(json!({"ok":true})),
-                ) else {
-                    panic!("completion rejected")
-                };
-                assert_eq!(receipt.logical_id, logical);
-                assert_eq!(receipt.message_id, *id);
-                if index == 0 {
-                    assert_eq!(
-                        ledger.allocate_submission("sender", seq, 2),
-                        (logical.clone(), ids.clone(), true),
-                        "a completed sibling must not retire an in-flight submission"
-                    );
-                }
-            }
-            assert_eq!(
-                ledger.retention_counts()["resident_records"]
-                    .as_u64()
-                    .unwrap(),
-                0
-            );
-            assert_eq!(
-                ledger.retention_counts()["submissions"].as_u64().unwrap(),
-                0,
-                "terminal Ephemeral submissions leaked dedup metadata"
-            );
-            assert_eq!(
-                ledger.retention_counts()["child_links"].as_u64().unwrap(),
-                0
-            );
-            assert_eq!(
-                ledger.retention_counts()["logical_groups"]
-                    .as_u64()
-                    .unwrap(),
-                0
-            );
+    /// 统一读路径：核（活跃 → 审计）是唯一权威，磁盘是镜像，读不回退到第二真相源。
+    fn record_for_message(&self, id: &str) -> Option<DeliveryRecord> {
+        let n = self.nucleus.lock();
+        if let Some(m) = n.get(id) {
+            return Some(record_from_message(m));
         }
-        let (_, ids, duplicate) = ledger.allocate_submission("sender", 100, 1);
-        assert!(
-            !duplicate,
-            "completed Ephemeral sequence no longer reserves session dedup state"
-        );
-        ledger.record_initial_target_state(
-            &ids[0],
-            100,
-            "sender",
-            "worker.missing",
-            "Ephemeral",
-            ContractStatus::TargetInvalid,
-            None,
-        );
-        assert!(
-            ledger.retention_counts()["submissions"] == 0,
-            "invalid targets also retire transient identities"
-        );
-        let (logical, ids, _) = ledger.allocate_submission("sender", 101, 1);
-        ledger.record_initial_target_state(
-            &ids[0],
-            101,
-            "sender",
-            "worker.run",
-            "Ephemeral",
-            ContractStatus::Sent,
-            None,
-        );
-        let failures = ledger.fail_inflight_for_domain("worker", "crash");
-        assert_eq!(failures[0].1.logical_id, logical);
-        assert!(ledger.retention_counts()["submissions"] == 0);
-        assert!(ledger.retention_counts()["child_links"] == 0);
-        assert!(ledger.retention_counts()["logical_groups"] == 0);
+        if let Some(a) = n.get_audit(id) {
+            return Some(record_from_audit(a));
+        }
+        None
     }
 
-    #[test]
-    fn mixed_and_non_ephemeral_submissions_keep_original_identity_and_replay() {
-        let ledger = KernelLedger::new();
-        let (logical, ids, _) = ledger.allocate_submission("sender", 1, 2);
-        for (id, target) in ids.iter().zip(["kernel.storage", "worker.run"]) {
-            ledger.record_initial_target_state(
-                id,
-                1,
-                "sender",
-                target,
-                "StorageQuery",
-                ContractStatus::Sent,
-                None,
-            );
-        }
-        ledger.advance_status(
-            "kernel",
-            &ids[0],
-            "kernel.storage",
-            ContractStatus::Completed,
-            Some(json!({"items":[]})),
-        );
-        ledger.advance_status(
-            "worker",
-            &ids[1],
-            "worker.run",
-            ContractStatus::Completed,
-            Some(json!({"ok":true})),
-        );
-        assert_eq!(
-            ledger.allocate_submission("sender", 1, 2),
-            (logical.clone(), ids.clone(), true)
-        );
-        let replay = ledger.receipts_for_logical(&logical);
-        assert_eq!(replay.len(), 1);
-        assert_eq!(replay[0].message_id, ids[1]);
-        assert_eq!(replay[0].logical_id, logical);
-        assert_eq!(replay[0].data, Some(json!({"ok":true})));
-        let (logical, ids, _) = ledger.allocate_submission("sender", 2, 1);
-        ledger.record_initial_target_state(
-            &ids[0],
-            2,
-            "sender",
-            "worker.run",
-            "Volatile",
-            ContractStatus::Sent,
-            None,
-        );
-        ledger.advance_status(
-            "worker",
-            &ids[0],
-            "worker.run",
-            ContractStatus::Completed,
-            Some(json!({"ok":true})),
-        );
-        assert_eq!(
-            ledger.allocate_submission("sender", 2, 1),
-            (logical.clone(), ids.clone(), true)
-        );
-        // Volatile 终态从内存账本清理，不再提供事后结果查询；会话索引仍保留用于重放。
-        assert!(ledger.receipts_for_logical(&logical).is_empty());
-    }
-
-}
-#[cfg(test)]
-mod storage_exhaustion_acceptance {
-    use super::*;
-    #[test]
-    fn real_sqlite_full_rejects_entire_admission_without_delivery_or_partial_ledger() {
-        let k = crate::AtelierKernel::new_in_memory().unwrap();
-        let sender = k.attach_domain("sender");
-        let worker = k.attach_domain("worker");
-        worker.register_handlers(&["run"]);
-        worker.drain_frames();
-        {
-            let db = k.ledger().db_conn.as_ref().unwrap().lock();
-            let pages: i64 = db
-                .query_row("PRAGMA page_count", [], |row| row.get(0))
-                .unwrap();
-            db.execute_batch(&format!("PRAGMA max_page_count={pages}"))
-                .unwrap();
-        }
-        let id = sender.send_one(
-            vec!["worker.run".into()],
-            "Durable",
-            serde_json::json!({}),
-            serde_json::json!({"large":"x".repeat(1024*1024)}),
-        );
-        assert!(worker.drain_frames().is_empty());
-        assert!(k.ledger().get_persisted_record(&id).is_none());
-        assert!(sender.drain_frames().iter().any(|f|matches!(f,crate::KernelToDomainFrame::Receipt(r) if r.message_id==id && r.status==ContractStatus::ExecutionFailed && r.data.as_ref().unwrap()["persisted"]==false)));
-    }
-    #[test]
-    fn corrupted_live_result_fails_explicitly_without_overwriting_unsafe_disk_fact() {
-        let k = crate::AtelierKernel::new_in_memory().unwrap();
-        let sender = k.attach_domain("sender");
-        let worker = k.attach_domain("worker");
-        worker.register_handlers(&["run"]);
-        worker.drain_frames();
-        let id = sender.send_one(
-            vec!["worker.run".into()],
-            "Durable",
-            serde_json::json!({}),
-            serde_json::json!({"original":"input"}),
-        );
-        worker.drain_frames();
-        sender.drain_frames();
-        k.ledger()
-            .db_conn
-            .as_ref()
-            .unwrap()
-            .lock()
-            .execute(
-                "UPDATE kernel_ledger SET data='{broken' WHERE message_id=?1",
-                [&id],
-            )
-            .unwrap();
-        worker.report_receipt(
-            &id,
-            "worker.run",
-            ContractStatus::Completed,
-            Some(serde_json::json!({"should_not_be_success":true})),
-        );
-        let frames = sender.drain_frames();
-        assert!(frames.iter().any(|f|matches!(f,crate::KernelToDomainFrame::Receipt(r) if r.message_id==id && r.status==ContractStatus::ExecutionFailed && r.data.as_ref().unwrap()["persisted"]==false)));
-        assert!(!frames.iter().any(|f|matches!(f,crate::KernelToDomainFrame::Receipt(r) if r.status==ContractStatus::Completed)));
-        let raw: String = k
-            .ledger()
-            .db_conn
-            .as_ref()
-            .unwrap()
-            .lock()
+    fn read_disk(&self, id: &str) -> Option<DeliveryRecord> {
+        let db = self.db_conn.as_ref()?.lock();
+        let msg: Option<DeliveryRecord> = db
             .query_row(
-                "SELECT data FROM kernel_ledger WHERE message_id=?1",
-                [&id],
-                |row| row.get(0),
+                "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at FROM messages WHERE message_id=?1",
+                [id],
+                messages_row_to_record,
             )
-            .unwrap();
-        assert_eq!(raw, "{broken");
+            .optional()
+            .ok()
+            .flatten();
+        if msg.is_some() {
+            return msg;
+        }
+        db.query_row(
+            "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at FROM audit WHERE message_id=?1",
+            [id],
+            audit_row_to_record,
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|a| record_from_audit(&a))
+    }
+
+    fn persist_live(&self, r: &DeliveryRecord) -> Result<(), StorageError> {
+        let db = self.db_conn.as_ref().unwrap().lock();
+        write_messages_tx(&db, r)
+    }
+
+    fn persist_advance(&self, r: &DeliveryRecord) -> Result<(), StorageError> {
+        let mut db = self.db_conn.as_ref().unwrap().lock();
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if r.status.is_terminal() {
+            tx.execute("DELETE FROM messages WHERE message_id=?1", [&r.message_id])?;
+            tx.execute("DELETE FROM kernel_outbox WHERE delivery_id=?1", [&r.message_id])?;
+            insert_audit_tx(&tx, r)?;
+        } else {
+            tx.execute(
+                "UPDATE messages SET status=?1,data=?2,updated_at=?3 WHERE message_id=?4",
+                params![
+                    status_str(r.status),
+                    r.data.as_ref().map(serde_json::to_string).transpose()?,
+                    r.updated_at,
+                    r.message_id
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn append_audit_disk(&self, r: &DeliveryRecord) -> Result<(), StorageError> {
+        let db = self.db_conn.as_ref().unwrap().lock();
+        insert_audit_tx(&db, r)
+    }
+
+    fn set_persistence_failed(&self, id: &str) {
+        if let Some(b) = self.bindings.lock().get_mut(id) {
+            b.persistence_failed = true;
+        }
+    }
+
+    fn mark_unpersisted_failure(&self, r: &DeliveryRecord, e: impl ToString) -> DeliveryRecord {
+        let failed = Self::failure(r, e);
+        self.set_persistence_failed(&r.message_id);
+        let mut n = self.nucleus.lock();
+        if n.get(&r.message_id).is_some() {
+            let _ = n.advance(
+                &r.message_id,
+                ContractStatus::ExecutionFailed,
+                failed.data.clone(),
+            );
+        }
+        failed
+    }
+
+    fn failure(r: &DeliveryRecord, error: impl ToString) -> DeliveryRecord {
+        let mut failed = r.clone();
+        failed.status = ContractStatus::ExecutionFailed;
+        failed.updated_at = now_millis();
+        failed.data = Some(json!({
+            "error": "kernel_persistence_failed",
+            "reason": error.to_string().chars().take(2048).collect::<String>(),
+            "persisted": false,
+            "previous_status": r.status,
+            "execution_outcome": "unknown"
+        }));
+        failed
     }
 }
 
+fn messages_row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
+    let status: String = row.get(7)?;
+    let policy: String = row.get(6)?;
+    let data: Option<String> = row.get(8)?;
+    Ok(DeliveryRecord {
+        message_id: row.get(0)?,
+        logical_id: row.get(1)?,
+        seq: row.get::<_, i64>(2)? as u64,
+        source_domain: row.get(3)?,
+        target: row.get(4)?,
+        message_type: row.get(5)?,
+        policy: parse_policy(&policy).map_err(to_sql_error)?,
+        status: parse_status(&status).map_err(to_sql_error)?,
+        data: data
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(to_sql_json_error)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn audit_row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditRecord> {
+    let status: String = row.get(7)?;
+    let policy: String = row.get(6)?;
+    let data: Option<String> = row.get(8)?;
+    Ok(AuditRecord {
+        message_id: row.get(0)?,
+        logical_id: row.get(1)?,
+        seq: row.get::<_, i64>(2)? as u64,
+        source: row.get(3)?,
+        target: row.get(4)?,
+        message_type: row.get(5)?,
+        policy: parse_policy(&policy).map_err(to_sql_error)?,
+        status: parse_status(&status).map_err(to_sql_error)?,
+        data: data
+            .map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(to_sql_json_error)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn to_sql_error(e: StorageError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+}
+
+fn to_sql_json_error(e: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+}
+
+fn write_messages_tx(db: &Connection, r: &DeliveryRecord) -> Result<(), StorageError> {
+    db.execute(
+        "INSERT INTO messages(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
+         ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,data=excluded.data,updated_at=excluded.updated_at",
+        params![
+            r.message_id,
+            r.logical_id,
+            r.seq as i64,
+            r.source_domain,
+            r.target,
+            r.message_type,
+            policy_str(r.policy),
+            status_str(r.status),
+            r.data.as_ref().map(serde_json::to_string).transpose()?,
+            r.created_at,
+            r.updated_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_audit_tx(db: &Connection, r: &DeliveryRecord) -> Result<(), StorageError> {
+    db.execute(
+        "INSERT INTO audit(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at) \
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            r.message_id,
+            r.logical_id,
+            r.seq as i64,
+            r.source_domain,
+            r.target,
+            r.message_type,
+            policy_str(r.policy),
+            status_str(r.status),
+            r.data.as_ref().map(serde_json::to_string).transpose()?,
+            r.created_at
+        ],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
-mod receipt_channel_acceptance {
+mod tests {
     use super::*;
+
     #[test]
-    fn domain_receipt_cannot_claim_internal_delivery_without_target_channel() {
+    fn terminal_ingress_durable_lands_in_audit_only() {
         let ledger = KernelLedger::new();
-        let (_, ids, _) = ledger.allocate_submission("sender", 1, 1);
-        ledger.record_initial_target_state(
+        let (logical, ids, dup) = ledger.allocate_submission("sender#1", 1, 1);
+        assert!(!dup);
+        ledger.bind_origin(&ids, 1);
+        let (rec, created) = ledger.record_initial_target_state_locked(
             &ids[0],
             1,
             "sender",
-            "kernel.supervisor",
-            "RestartDomain",
-            ContractStatus::Sent,
-            None,
+            "worker.missing",
+            "Run",
+            DeliveryPolicy::Durable,
+            ContractStatus::TargetInvalid,
+            Some(json!({"error": "target_not_found"})),
+        );
+        assert!(created);
+        assert_eq!(rec.status, ContractStatus::TargetInvalid);
+        // 不占活跃行，只在审计里
+        assert_eq!(ledger.retention_counts()["resident_records"], 0);
+        assert_eq!(
+            ledger.get_persisted_record(&ids[0]).unwrap().logical_id,
+            logical
+        );
+    }
+
+    #[test]
+    fn ephemeral_submission_retires_dedup_after_all_terminal() {
+        let ledger = KernelLedger::new();
+        for seq in 1..=100u64 {
+            let (logical, ids, dup) = ledger.allocate_submission("sender#1", seq, 2);
+            assert!(!dup);
+            ledger.bind_origin(&ids, 1);
+            for id in &ids {
+                ledger.record_initial_target_state_locked(
+                    id, seq, "sender", "worker.run", "Ephemeral",
+                    DeliveryPolicy::Ephemeral, ContractStatus::Sent, None,
+                );
+            }
+            for id in &ids {
+                assert!(matches!(
+                    ledger.advance_status("worker", id, "worker.run", ContractStatus::Completed, Some(json!({"ok": true}))),
+                    ReceiptTransition::Advanced { .. }
+                ));
+            }
+            assert_eq!(ledger.retention_counts()["resident_records"], 0);
+            let _ = logical;
+        }
+        // 终态 Ephemeral 去重已回收
+        assert_eq!(ledger.retention_counts()["submissions"], 0);
+    }
+
+    #[test]
+    fn durable_replay_survives_terminal_and_reads_audit() {
+        let ledger = KernelLedger::new();
+        let (logical, ids, _) = ledger.allocate_submission("sender#1", 1, 1);
+        ledger.bind_origin(&ids, 1);
+        ledger.record_initial_target_state_locked(
+            &ids[0], 1, "sender", "worker.run", "Run",
+            DeliveryPolicy::Durable, ContractStatus::Sent, None,
+        );
+        ledger.advance_status("worker", &ids[0], "worker.run", ContractStatus::Completed, Some(json!({"kept": true})));
+        // Durable 终态从审计读回，唯一且不可覆盖
+        let replay = ledger.receipts_for_message(&ids[0]);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].status, ContractStatus::Completed);
+        assert_eq!(replay[0].data, Some(json!({"kept": true})));
+        assert_eq!(replay[0].logical_id, logical);
+    }
+
+    #[test]
+    fn domain_receipt_cannot_claim_internal_delivery_without_channel() {
+        let ledger = KernelLedger::new();
+        let (_, ids, _) = ledger.allocate_submission("sender#1", 1, 1);
+        ledger.record_initial_target_state(
+            &ids[0], 1, "sender", "kernel.supervisor", "RestartDomain",
+            ContractStatus::Sent, None,
         );
         assert!(!ledger.accepts_channel(&ids[0], "unrelated-domain-pipe"));
     }

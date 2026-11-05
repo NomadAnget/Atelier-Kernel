@@ -89,8 +89,11 @@ fn process_recovery_closes_every_old_nonterminal_and_clears_old_terminal_rows() 
         assert_eq!(r.status, ContractStatus::ExecutionFailed);
         assert_eq!(r.data.unwrap()["execution_outcome"], "unknown");
     }
-    // 上一代终态记录在启动时清理：内核重启必然伴随所有域重启，重启后没有读取者。
-    assert!(k.ledger().get_persisted_record(&ids[2]).is_none());
+    // Durable 终态结果跨重启保留于 audit（宪法 C3:54），不再清理。
+    assert_eq!(
+        k.ledger().get_persisted_record(&ids[2]).unwrap().status,
+        ContractStatus::Completed
+    );
     let worker = k.attach_domain("worker");
     worker.register_handlers(&["run"]);
     assert!(
@@ -122,7 +125,7 @@ fn outbox_and_ledger_admission_are_one_transaction_and_failure_replay_does_not_e
     assert!(sender.drain_frames().iter().any(|f|matches!(f,Frame::Receipt(r) if r.message_id==ids[0] && r.status==ContractStatus::ExecutionFailed && r.data.as_ref().unwrap()["persisted"]==false)));
     let persisted: i64 = db
         .query_row(
-            "SELECT count(*) FROM kernel_ledger WHERE message_id=?1",
+            "SELECT count(*) FROM messages WHERE message_id=?1",
             [&ids[0]],
             |r| r.get(0),
         )
@@ -207,7 +210,11 @@ fn completed_durable_history_keeps_results_on_disk_without_live_identity_growth(
     let after = k.ledger().retention_counts();
     assert_eq!(after["durable_records"], 0);
     assert_eq!(after["child_links"], before["child_links"]);
-    assert_eq!(after["submissions"], before["submissions"]);
+    // Durable/Volatile 保留有界去重窗口（宪法 C3:56），不无限增长即可。
+    assert!(
+        after["submissions"].as_u64().unwrap() <= 2_048,
+        "{after}"
+    );
     assert_eq!(after["resident_records"], before["resident_records"]);
     assert_eq!(
         k.ledger().get_persisted_record(&last).unwrap().data,

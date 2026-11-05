@@ -37,7 +37,7 @@ fn report(label: &str, ledger: &KernelLedger) -> Value {
     counts
 }
 
-/// 非持久账本被填满时按最旧淘汰，且被淘汰消息的身份索引必须一起回收，否则 MAX_LIVE 仍会被耗尽。
+/// 非持久账本不设 64MB 配额淘汰：在途 Ephemeral 由 MAX_LIVE 有界，到达终态即整体回收（含身份索引）。
 #[test]
 fn eviction_reclaims_identity_rows() {
     let ledger = KernelLedger::new();
@@ -53,20 +53,21 @@ fn eviction_reclaims_identity_rows() {
             ContractStatus::Sent,
             Some(payload.clone()),
         );
+        ledger.advance_status(
+            "kernel",
+            &ids[0],
+            "kernel.telemetry",
+            ContractStatus::Completed,
+            None,
+        );
     }
-    let counts = report("eviction", &ledger);
-    assert!(
-        counts["nonpersistent_evicted"].as_u64().unwrap() > 0,
-        "expected eviction under 64MB pressure: {counts}"
-    );
-    assert_eq!(
-        counts["child_links"].as_u64().unwrap(),
-        counts["resident_records"].as_u64().unwrap(),
-        "evicted messages must not leave identity rows behind: {counts}"
-    );
+    let counts = report("ephemeral-terminal", &ledger);
+    assert_eq!(counts["resident_records"], 0, "{counts}");
+    assert_eq!(counts["child_links"], 0, "{counts}");
+    assert_eq!(counts["logical_groups"], 0, "{counts}");
     assert!(
         counts["submissions"].as_i64().unwrap() <= 2_048,
-        "evicted submissions must not keep their session index: {counts}"
+        "{counts}"
     );
 }
 

@@ -1135,15 +1135,17 @@ fn test_delivery_persistence_message_types_durable_volatile_ephemeral() {
         assert_eq!(kernel.ledger().persisted_count(), 1);
     }
 
-    // Reopen kernel with the same SQLite database file: 上一代终态记录在启动时清理。
+    // Reopen kernel with the same SQLite database file: Durable 终态跨重启保留于 audit（宪法 C3:54）。
     let reopened = AtelierKernel::open_with_db(&db_path).unwrap();
-    assert_eq!(reopened.ledger().persisted_count(), 0);
-    assert!(
+    assert_eq!(reopened.ledger().persisted_count(), 1);
+    assert_eq!(
         reopened
             .ledger()
             .get_record(&durable_id, "worker.run")
-            .is_none(),
-        "old terminal rows are cleared on startup"
+            .unwrap()
+            .status,
+        ContractStatus::Completed,
+        "durable terminal result survives restart in audit"
     );
     assert!(
         reopened

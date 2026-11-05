@@ -454,7 +454,7 @@ impl PipeReceiver {
         match s.lease.take() {
             Some(Lease::Disk(id, receipt)) => {
                 if let Err(e) = self.0.db.lock().execute(
-                    "DELETE FROM kernel_outbox WHERE id=?1 AND channel=?2 AND (delivery_id IS NULL OR NOT EXISTS(SELECT 1 FROM kernel_ledger WHERE message_id=delivery_id))",
+                    "DELETE FROM kernel_outbox WHERE id=?1 AND channel=?2 AND (delivery_id IS NULL OR NOT EXISTS(SELECT 1 FROM messages WHERE message_id=delivery_id))",
                     params![id, self.0.channel],
                 ) {
                     let error = format!("outbox acknowledgement failed: {e}");
@@ -508,7 +508,7 @@ fn close(inner: &Inner) {
     // Only already committed terminal envelopes are cleaned here. The ledger closes live
     // deliveries after transport closure and removes their envelopes in the terminal transaction.
     if let Err(e) = inner.db.lock().execute(
-        "DELETE FROM kernel_outbox WHERE channel=?1 AND (delivery_id IS NULL OR EXISTS(SELECT 1 FROM kernel_ledger WHERE message_id=delivery_id AND status IN ('completed','execution_failed','contract_invalid','target_invalid')))",
+        "DELETE FROM kernel_outbox WHERE channel=?1 AND (delivery_id IS NULL OR NOT EXISTS(SELECT 1 FROM messages WHERE message_id=delivery_id))",
         [&inner.channel],
     ) {
         s.failure.get_or_insert_with(|| format!("outbox cleanup failed: {e}"));
@@ -671,10 +671,10 @@ mod tests {
     #[test]
     fn transport_schema_initialization_does_not_mutate_ledger_facts() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE kernel_ledger(message_id TEXT,status TEXT,data TEXT); INSERT INTO kernel_ledger VALUES('pending','sent',NULL);").unwrap();
+        conn.execute_batch("CREATE TABLE messages(message_id TEXT,status TEXT,data TEXT); INSERT INTO messages VALUES('pending','sent',NULL);").unwrap();
         initialize(&conn).unwrap();
         let status: String = conn
-            .query_row("SELECT status FROM kernel_ledger", [], |row| row.get(0))
+            .query_row("SELECT status FROM messages", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
             status, "sent",

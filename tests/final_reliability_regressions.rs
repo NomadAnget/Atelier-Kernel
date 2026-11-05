@@ -66,8 +66,11 @@ fn exclusive_database_owner_releases_after_exit_and_clears_old_terminal_rows() {
     drop(s);
     drop(k);
     let reopened = AtelierKernel::open_with_db(&path).unwrap();
-    // 上一代终态记录在启动时清理：重启后不再可查。
-    assert!(reopened.ledger().get_persisted_record(&id).is_none());
+    // Durable 终态跨重启保留于 audit（宪法 C3:54），不再清理。
+    assert_eq!(
+        reopened.ledger().get_persisted_record(&id).unwrap().status,
+        S::Completed
+    );
     drop(reopened);
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "owner_process_fixture", "--ignored"])
@@ -209,7 +212,8 @@ fn user_failure_shaped_payloads_do_not_control_terminal_retention() {
     assert_eq!(terminal(s.drain_frames()).data, Some(data));
     let after = k.ledger().retention_counts();
     assert_eq!(after["child_links"], baseline["child_links"]);
-    assert_eq!(after["submissions"], baseline["submissions"]);
+    // Durable/Volatile 保留有界去重窗口（宪法 C3:56），不无限增长即可。
+    assert!(after["submissions"].as_u64().unwrap() <= 2_048);
 }
 #[test]
 fn dropped_host_cancels_long_update_and_closes_retained_supervisor() {

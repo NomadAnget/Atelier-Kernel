@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::protocol::{ContractStatus, DeliveryPolicy};
+use crate::protocol::{ContractStatus, DeliveryPolicy, now_millis};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -26,6 +26,8 @@ pub struct Message {
     pub policy: DeliveryPolicy,
     pub status: ContractStatus,
     pub data: Option<serde_json::Value>,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,14 +35,18 @@ pub struct AuditRecord {
     pub message_id: String,
     pub logical_id: String,
     pub source: String,
+    pub seq: u64,
     pub target: String,
+    pub message_type: String,
+    pub policy: DeliveryPolicy,
     pub status: ContractStatus,
     pub data: Option<serde_json::Value>,
+    pub created_at: i64,
 }
 
 /// 持久层：核本身只做状态机，持久化是核外的一个 backend。
 /// Durable 活行与审计由它保存/读取；Volatile/Ephemeral 永不过它。
-pub trait Store {
+pub trait Store: Send + Sync {
     fn load_active(&self) -> Vec<Message> {
         Vec::new()
     }
@@ -126,21 +132,47 @@ impl SubmissionCache {
     }
 
     /// 分配提交身份：去重命中窗口则复用原身份，否则分配新 id。
+    /// `seq == 0` 表示调用方不提供序号去重，每次都分配新身份（旧 `try_allocate_submission` 语义）。
     /// 返回 `(logical_id, ids, replayed)`。
     pub fn allocate(&mut self, dedup_key: &str, seq: u64, count: usize) -> (String, Vec<String>, bool) {
-        if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
-            return (existing.logical_id.clone(), existing.ids.clone(), true);
+        if seq > 0 {
+            if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
+                return (existing.logical_id.clone(), existing.ids.clone(), true);
+            }
         }
         let logical_id = self.generate_id().replacen("msg_", "logical_", 1);
         let ids: Vec<String> = (0..count).map(|_| self.generate_id()).collect();
-        let sub = Submission { logical_id: logical_id.clone(), ids: ids.clone(), replayed: false };
-        self.submissions.insert((dedup_key.to_string(), seq), sub);
-        self.high_water
-            .entry(dedup_key.to_string())
-            .and_modify(|h| *h = (*h).max(seq))
-            .or_insert(seq);
-        self.trim_window(dedup_key);
+        self.insert_submission(dedup_key, seq, logical_id.clone(), ids.clone());
         (logical_id, ids, false)
+    }
+
+    /// 用调用方预生成的全局唯一 id 分配（facade 走这条路径，id 由 `KernelLedger::generate_message_id` 生成）。
+    pub fn allocate_with(
+        &mut self,
+        dedup_key: &str,
+        seq: u64,
+        logical_id: String,
+        ids: Vec<String>,
+    ) -> (String, Vec<String>, bool) {
+        if seq > 0 {
+            if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
+                return (existing.logical_id.clone(), existing.ids.clone(), true);
+            }
+        }
+        self.insert_submission(dedup_key, seq, logical_id.clone(), ids.clone());
+        (logical_id, ids, false)
+    }
+
+    fn insert_submission(&mut self, dedup_key: &str, seq: u64, logical_id: String, ids: Vec<String>) {
+        if seq > 0 {
+            let sub = Submission { logical_id, ids, replayed: false };
+            self.submissions.insert((dedup_key.to_string(), seq), sub);
+            self.high_water
+                .entry(dedup_key.to_string())
+                .and_modify(|h| *h = (*h).max(seq))
+                .or_insert(seq);
+            self.trim_window(dedup_key);
+        }
     }
 
     /// 某 logical 的全部子消息终态后，回收其提交身份。
@@ -255,6 +287,7 @@ impl Nucleus {
         status: ContractStatus,
         data: Option<serde_json::Value>,
     ) {
+        let now = now_millis();
         self.active.insert(
             message_id.clone(),
             Message {
@@ -267,8 +300,63 @@ impl Nucleus {
                 policy,
                 status,
                 data,
+                created_at: now,
+                updated_at: now,
             },
         );
+    }
+
+    /// 只分配提交身份，不建活跃行（旧 `allocate_submission` 的核级映射）。
+    pub fn allocate_submission(
+        &mut self,
+        dedup_key: &str,
+        seq: u64,
+        count: usize,
+    ) -> (String, Vec<String>, bool) {
+        self.cache.allocate(dedup_key, seq, count)
+    }
+
+    /// 用调用方预生成的全局唯一 id 分配（facade 的 `try_allocate_submission` 走这里）。
+    pub fn allocate_submission_with_ids(
+        &mut self,
+        dedup_key: &str,
+        seq: u64,
+        logical_id: String,
+        ids: Vec<String>,
+    ) -> (String, Vec<String>, bool) {
+        self.cache.allocate_with(dedup_key, seq, logical_id, ids)
+    }
+
+    /// 由子消息 id 反查提交 logical_id。
+    pub fn logical_id_for(&self, message_id: &str) -> Option<String> {
+        self.cache
+            .submissions
+            .values()
+            .find(|s| s.ids.iter().any(|id| id == message_id))
+            .map(|s| s.logical_id.clone())
+    }
+
+    pub fn active_snapshot(&self) -> Vec<Message> {
+        self.active.values().cloned().collect()
+    }
+
+    pub fn audit_snapshot(&self) -> Vec<AuditRecord> {
+        self.audit.clone()
+    }
+
+    /// 退役去重键（只清提交身份/高水位，不动消息状态）。
+    pub fn retire_dedup(&mut self, dedup_key: &str) {
+        self.cache.retire(dedup_key);
+    }
+
+    /// 直接追加一条终态审计（入口即终态 Durable 走这里，不经过 active）。
+    pub fn record_terminal(&mut self, r: AuditRecord) {
+        self.audit.push(r);
+    }
+
+    /// 启动恢复时批量载入历史审计。
+    pub fn load_audit(&mut self, records: Vec<AuditRecord>) {
+        self.audit.extend(records);
     }
 
     /// 收进一个提交。`dedup_key` 是 source 的去重键（`{domain}#{generation}`），
@@ -327,6 +415,7 @@ impl Nucleus {
         }
         let mut next = current.clone();
         next.status = status;
+        next.updated_at = now_millis();
         if data.is_some() {
             next.data = data;
         }
@@ -337,9 +426,13 @@ impl Nucleus {
                     message_id: next.message_id.clone(),
                     logical_id: next.logical_id.clone(),
                     source: next.source.clone(),
+                    seq: next.seq,
                     target: next.target.clone(),
+                    message_type: next.message_type.clone(),
+                    policy: next.policy,
                     status,
                     data: next.data.clone(),
+                    created_at: now_millis(),
                 };
                 self.audit.push(rec.clone());
                 if let Some(store) = self.store.as_mut() {
@@ -348,11 +441,14 @@ impl Nucleus {
                 }
             }
             self.active.remove(message_id);
-            // 回收该 logical 的去重窗口：所有子消息都终态后删除提交身份。
-            let logical = next.logical_id.clone();
-            let all_children_done = !self.active.values().any(|m| m.logical_id == logical);
-            if all_children_done {
-                self.cache.reclaim_logical(&logical);
+            // 回收该 logical 的去重窗口：仅 Ephemeral 到达终态即回收；
+            // Durable/Volatile 保留去重与重放契约，由 REPLAY_WINDOW 有界化（宪法 C3:56）。
+            if next.policy == DeliveryPolicy::Ephemeral {
+                let logical = next.logical_id.clone();
+                let all_children_done = !self.active.values().any(|m| m.logical_id == logical);
+                if all_children_done {
+                    self.cache.reclaim_logical(&logical);
+                }
             }
         } else {
             self.active.insert(message_id.to_string(), next.clone());
@@ -466,9 +562,13 @@ mod tests {
             message_id: "m1".into(),
             logical_id: "l1".into(),
             source: "d".into(),
+            seq: 1,
             target: "w.run".into(),
+            message_type: "Run".into(),
+            policy: DeliveryPolicy::Durable,
             status: ContractStatus::Completed,
             data: Some(json!({"ok": true})),
+            created_at: 0,
         });
         store.active.push(Message {
             message_id: "m2".into(),
@@ -480,6 +580,8 @@ mod tests {
             policy: DeliveryPolicy::Durable,
             status: ContractStatus::Sent,
             data: None,
+            created_at: 0,
+            updated_at: 0,
         });
 
         let n = Nucleus::recover(store);

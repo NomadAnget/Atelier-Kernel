@@ -125,7 +125,9 @@ fn corrupt_durable_rows_must_not_be_silently_reinterpreted_on_restore() {
         );
         drop(ledger);
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute(&format!("UPDATE kernel_ledger SET {field}=?1"), [value])
+        // 非终态 Durable 在 messages，终态 Durable 在 audit；按状态定位权威表。
+        let table = if status.is_terminal() { "audit" } else { "messages" };
+        conn.execute(&format!("UPDATE {table} SET {field}=?1"), [value])
             .unwrap();
         drop(conn);
         if let Ok(restored) = KernelLedger::open_with_db(Some(&path)) {

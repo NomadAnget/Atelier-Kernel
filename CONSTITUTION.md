@@ -21,7 +21,7 @@
 - **内层为业务数据包（`data`）**：标准 JSON 格式。业务数据结构演进、字段校验、前端数据脱敏等均由对应业务域自治，**内核行为与数据库表结构完全零感知**。
 - **`message_type` 与内置基础设施契约**：
   1. **跨域业务消息投递策略（`target = "<domain>.<handler>"`，严格 4-stage 回执闭环）**：
-     - `Durable`：写入 SQLite 持久投递账本（`kernel_ledger`）；内存仅保留有界在途身份与故障反馈元信息，支持跨重启状态恢复与审计（未显式指定时默认按 `Durable` 处理）；
+     - `Durable`：写入 SQLite 持久投递账本（`messages` 活行 + `audit` 终态审计）；内存仅保留有界在途身份与故障反馈元信息，支持跨重启状态恢复与审计（未显式指定时默认按 `Durable` 处理）；
      - `Volatile`：仅进入内存账本与实时观察器（`KernelObserver`），**不写持久业务账本**；
      - `Ephemeral`：瞬态流式投递，不写持久业务账本，仅在途（In-Flight）驻留内存账本以完成四阶段回执，到达终态后立即自动从内存账本驱逐（不随已完成数量增长）。
   2. **内核 8 大内置基础设施（`target = "kernel.*"`，SDK 原生方法调用，不对外作为业务路由暴露）**：
@@ -97,7 +97,7 @@ atelier-kernel --check .
 | **M4** | **进程即边界律（禁跨域私调与直连库）** | 各域为独立子进程，严禁在域源码中跨目录相对 `import` / `require` 其他域的私有文件，严禁业务域绕过 `kernel.storage` 直接读写内核 SQLite 数据库文件 | ✓ AST/源码扫描跨域相对导入与直连 SQLite | OS 独立进程地址空间物理隔离 |
 | **M5** | **协议管道纯净律（独立双匿名管道专管）** | 内核与域通过独立双匿名管道（`ATELIER_IPC_READ_FD` / `ATELIER_IPC_WRITE_FD`）收发 JSON-Lines 协议帧，与 `stdout/stderr` 物理隔离；严禁业务域代码绕过 SDK 私自读取或篡改专用 IPC 描述符 | ✓ 静态扫描业务域源码私自访问 `ATELIER_IPC_*_FD` | SDK 启动即锁定描述符不可继承并擦除环境变量，运行时非法帧立即拦截返回 `ContractInvalid` |
 | **M6** | **配置显式律** | `kernel_boot.json` 严禁包含未知字段（`deny_unknown_fields`），`domain_id` 不得重复，工作目录与入口脚本路径必须真实存在 | ✓ 严格反序列化与入口文件存在性校验 | 启动期 [`KernelBootConfig::load_from_file`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/src/supervisor.rs) 即刻报错 |
-| **M7** | **两层存储防漂移律** | 内核核心表（`kernel_ledger`、`hub_logs`、`store_<domain>`）固定为上层契约列结构，启动时校验实表列结构完整性；实表结构漂移立即报错，绝不静默改表 | ✓ 若存在数据库文件则校验表结构 | 启动期与建表期 `PRAGMA table_info` 结构防漂移校验 |
+| **M7** | **两层存储防漂移律** | 内核核心表（`messages`、`audit`、`hub_logs`、`store_<domain>`）固定为上层契约列结构，启动时校验实表列结构完整性；实表结构漂移立即报错，绝不静默改表 | ✓ 若存在数据库文件则校验表结构 | 启动期与建表期 `PRAGMA table_info` 结构防漂移校验 |
 
 ### 第二级 · 行为规范（B1–B6）
 

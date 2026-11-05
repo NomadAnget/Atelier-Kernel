@@ -7,7 +7,7 @@ use ruff_python_ast::{self as ast, Stmt};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::{KERNEL_LEDGER_COLUMNS, KERNEL_LEDGER_TABLE};
+use crate::ledger::{AUDIT_COLUMNS, AUDIT_TABLE, KERNEL_LEDGER_COLUMNS, KERNEL_LEDGER_TABLE};
 use crate::storage::{DOMAIN_TABLE_COLUMNS, verify_sqlite_table_columns};
 use crate::supervisor::{KernelBootConfig, SupervisorError};
 
@@ -198,16 +198,12 @@ fn check_sqlite_schema_drift(
         return;
     };
 
-    if table_exists(&conn, "kernel_sessions") {
+    if table_exists(&conn, AUDIT_TABLE) {
         report.checked_tables += 1;
-        if let Err(err) = verify_sqlite_table_columns(
-            &conn,
-            "kernel_sessions",
-            &["source", "seq", "logical_id", "children"],
-        ) {
+        if let Err(err) = verify_sqlite_table_columns(&conn, AUDIT_TABLE, AUDIT_COLUMNS) {
             report.violations.push(ConstitutionViolation {
                 rule: "M7".into(),
-                location: format!("{}::kernel_sessions", db_path.display()),
+                location: format!("{}::{}", db_path.display(), AUDIT_TABLE),
                 detail: err.to_string(),
             });
         }
@@ -238,7 +234,7 @@ fn check_sqlite_schema_drift(
             });
         }
     }
-    // Check `kernel_ledger` if it exists
+    // Check `messages` if it exists
     if table_exists(&conn, KERNEL_LEDGER_TABLE) {
         report.checked_tables += 1;
         if let Err(err) =

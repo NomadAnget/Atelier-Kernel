@@ -3005,7 +3005,7 @@ mod receipt_publication_failure_tests {
         sender.drain_frames();
         k.ledger().bind_origin(&[id.clone()], u64::MAX / 2);
         k.ledger().db_conn.as_ref().unwrap().lock().execute_batch(
-            "CREATE TRIGGER reject_terminal BEFORE UPDATE ON kernel_ledger BEGIN SELECT RAISE(FAIL,'injected terminal write failure'); END;"
+            "CREATE TRIGGER reject_terminal BEFORE INSERT ON audit BEGIN SELECT RAISE(FAIL,'injected terminal write failure'); END;"
         ).unwrap();
         worker.report_receipt(
             &id,

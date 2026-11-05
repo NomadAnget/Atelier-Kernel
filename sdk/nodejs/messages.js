@@ -1,6 +1,8 @@
 // Client-side receipt waits only. IDs and execution state are authoritative in the kernel.
 module.exports=function messageMethods(RequestError){
  const terminal=['completed','execution_failed','target_invalid','contract_invalid'];
+ // 基础设施目标（控制面 + 观察面）走保留通道，不被业务数据面饱和堵死。kernel.storage 属业务，不在此列。
+ const INFRA=new Set(['kernel.supervisor','kernel.logger','kernel.observer','kernel.telemetry','kernel.registry','kernel.runtime','kernel.notify','kernel.contract']);
  return {
   async send(targets,type,params={},data={},options={}){
    const single=typeof targets==='string',names=single?[targets]:targets;
@@ -9,7 +11,7 @@ module.exports=function messageMethods(RequestError){
    if(this._closed||this._state==='new')throw new RequestError('connection_closed');
    if(!Number.isFinite(timeout)||timeout<=0)throw Error('invalid timeout');
    if(signal?.aborted)throw new RequestError('cancelled');
-   const control=options.control===true;
+   const control=options.control===true||unique.every(t=>INFRA.has(t));
    const reserved=[...this._pending.values()].reduce((n,e)=>n+e.targets.length-e.ids.size,0);
    // 控制面保留通道：运维/监督消息不受数据面 _results 预算限制，数据面饱和不得堵死控制面。
    if(!control&&this._results.size+reserved+unique.length>this._limits.maxPending)throw new RequestError('busy');

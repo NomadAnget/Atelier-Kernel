@@ -3,6 +3,7 @@ pub mod frontend;
 pub mod ledger;
 mod log_spool;
 pub mod logging;
+pub mod nucleus;
 pub mod observer;
 pub mod outbox;
 pub mod port_forwarder;

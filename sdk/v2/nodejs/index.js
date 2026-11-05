@@ -118,6 +118,7 @@ class AtelierDomain {
     this._maxPending = options.maxPending ?? 1024;
     this._resultTtlMs = options.resultTtlMs ?? 30000;
     this._handlers = new Map();
+    this._descriptions = new Map();
     this._pending = new Map();
     this._results = new Map();
     this._events = { receipt: [], log: [], notify: [], observation: [], telemetry: [] };
@@ -132,8 +133,11 @@ class AtelierDomain {
   }
 
   // 能力 2：注册处理器
-  handler(name, fn) {
+  handler(name, fn, description) {
     this._handlers.set(name, fn);
+    if (typeof description === "string" && description.trim()) {
+      this._descriptions.set(name, description.trim());
+    }
     return this;
   }
 
@@ -443,7 +447,7 @@ class AtelierDomain {
     this._input = this._streams.input;
     this._output = this._streams.output;
     this._readLoop();
-    this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: {} }, data: {} });
+    this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: Object.fromEntries(this._descriptions) }, data: {} });
     if (onStart) await onStart();
     this._done = new Promise((resolve) => { this._finish = resolve; });
     await this._done;

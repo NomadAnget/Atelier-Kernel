@@ -26,6 +26,10 @@ use crate::protocol::{
 };
 use crate::storage::DomainStorageEngine;
 
+/// Hard ceiling for one `QueryObserver` reply. The observer history itself approaches the
+/// 16 MiB IPC frame limit, so an unbounded `limit` turns a read into a transport failure.
+const OBSERVER_QUERY_LIMIT_MAX: u64 = 1_000;
+
 struct ControlPermit {
     count: Arc<AtomicUsize>,
 }
@@ -955,10 +959,33 @@ impl KernelRouter {
         if duplicate {
             // Snapshot and replay under the publication gate too: otherwise a
             // stale replay can arrive after a newer live receipt.
-            for id in &ids {
+            for (target, id) in targets.iter().zip(&ids) {
                 let gate = self.ledger.message_gate(id);
                 let _guard = gate.lock();
-                for receipt in self.ledger.receipts_for_message(id) {
+                let receipts = self.ledger.receipts_for_message(id);
+                if receipts.is_empty() {
+                    // 重放的提交已终结且结果被回收：必须给出明确结论，不能让发送端干等超时。
+                    self.send_to_instance(
+                        authenticated_domain,
+                        Some(instance_id),
+                        KernelToDomainFrame::Receipt(MessageReceipt {
+                            logical_id: logical_id.clone(),
+                            message_id: id.clone(),
+                            seq: outbound.seq,
+                            target: target.clone(),
+                            message_type: outbound.message_type.clone(),
+                            status: ContractStatus::ExecutionFailed,
+                            data: Some(json!({
+                                "error": "kernel_result_expired",
+                                "reason": "replayed submission already completed; its result was reclaimed",
+                                "persisted": false
+                            })),
+                            timestamp: now_millis(),
+                        }),
+                    );
+                    continue;
+                }
+                for receipt in receipts {
                     self.send_to_instance(
                         authenticated_domain,
                         Some(instance_id),
@@ -1857,11 +1884,13 @@ impl KernelRouter {
                 let msg_id_filter = msg.params.get("message_id").and_then(Value::as_str);
                 let target_filter = msg.params.get("target").and_then(Value::as_str);
                 let source_filter = msg.params.get("source_domain").and_then(Value::as_str);
+                // 上限必须收敛：观察历史本身接近 16MiB 帧上限，无界 limit 会把回复撑爆成传输失败。
                 let limit = msg
                     .params
                     .get("limit")
                     .and_then(Value::as_u64)
-                    .unwrap_or(100) as usize;
+                    .unwrap_or(100)
+                    .min(OBSERVER_QUERY_LIMIT_MAX) as usize;
 
                 let all_events = self.observer.snapshot();
                 let mut filtered: Vec<ObservationEvent> = all_events

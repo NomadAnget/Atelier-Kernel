@@ -174,3 +174,60 @@ fn duplicate_submission_replay_cannot_regress_live_receipts() {
     }
     responder.join().unwrap();
 }
+
+/// 重放一个已终结、结果已被回收的提交时，必须立刻拿到明确终态回执，绝不能静默。
+#[test]
+fn replay_after_terminal_returns_definite_receipt_instead_of_silence() {
+    let kernel = AtelierKernel::new_in_memory().unwrap();
+    let sender = kernel.attach_domain("replay_expired_sender");
+    let worker = kernel.attach_domain("replay_expired_worker");
+    worker.register_handlers(&["run"]);
+    worker.drain_frames();
+
+    let id = sender.send_one_with_seq(
+        7,
+        vec!["replay_expired_worker.run".into()],
+        MSG_DELIVERY_VOLATILE,
+        json!({}),
+        json!({}),
+    );
+    let F::Deliver(msg) = worker.recv_frame_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected delivery")
+    };
+    for stage in [S::Received, S::Started, S::Completed] {
+        worker.report_receipt(&msg.message_id, &msg.target, stage, Some(json!({"ok": true})));
+    }
+    let mut saw_terminal = false;
+    while let Ok(frame) = sender.recv_frame_timeout(Duration::from_millis(300)) {
+        if let F::Receipt(receipt) = frame {
+            if receipt.status.is_terminal() {
+                saw_terminal = true;
+            }
+        }
+    }
+    assert!(saw_terminal, "first submission must publish a terminal receipt");
+
+    // 结果已随终态回收；重放同一 seq 必须得到明确结论
+    let replayed = sender.send_one_with_seq(
+        7,
+        vec!["replay_expired_worker.run".into()],
+        MSG_DELIVERY_VOLATILE,
+        json!({}),
+        json!({}),
+    );
+    assert_eq!(replayed, id, "replay must return the original identities");
+    let receipt = loop {
+        let frame = sender
+            .recv_frame_timeout(Duration::from_secs(5))
+            .expect("replay must produce a receipt, not silence");
+        if let F::Receipt(receipt) = frame {
+            break receipt;
+        }
+    };
+    assert!(receipt.status.is_terminal(), "replay receipt must be terminal: {receipt:?}");
+    assert_eq!(receipt.message_id, id);
+    assert!(
+        worker.recv_frame_timeout(Duration::from_millis(300)).is_err(),
+        "a replayed completed submission must not execute again"
+    );
+}

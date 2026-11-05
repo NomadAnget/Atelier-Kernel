@@ -88,6 +88,8 @@ pub struct KernelLedger {
 }
 const MAX_LIVE: i64 = 65_536;
 const MAX_TRANSIENT_BYTES: i64 = 64 * 1024 * 1024;
+/// How many recent submission sequences keep their session index for idempotent replay.
+const SESSION_REPLAY_WINDOW: i64 = 2_048;
 const SELECT_RECORD: &str = "SELECT message_id,logical_id,seq,source_domain,target,message_type,status,data,created_at,updated_at FROM kernel_ledger";
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kernel_ledger(
  message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,source_domain TEXT NOT NULL,
@@ -537,7 +539,18 @@ impl KernelLedger {
             [&r.message_id],
         )
         .expect("live context cleanup");
-        mem.execute("DELETE FROM kernel_sessions WHERE logical_id=?1 AND (?2 OR durable=1) AND NOT EXISTS(SELECT 1 FROM identities WHERE logical_id=?1)",params![r.logical_id,policy==DeliveryPolicy::Ephemeral]).expect("finished session cleanup");
+        // 会话索引只为幂等重放服务，且必须有界：
+        // Ephemeral 只删自己这一条（?3 限定 logical，避免一次查询清空所有来源的重放窗口）；
+        // Durable 终态即删（结果已在磁盘）；其余只保留最近 `SESSION_REPLAY_WINDOW` 个序号。
+        mem.execute(
+            "DELETE FROM kernel_sessions WHERE NOT EXISTS(SELECT 1 FROM identities WHERE identities.logical_id=kernel_sessions.logical_id) AND ((?2 AND logical_id=?3) OR durable=1 OR seq <= (SELECT coalesce((SELECT max(s.seq) FROM kernel_sessions s WHERE s.source=kernel_sessions.source),0) - ?1))",
+            params![
+                SESSION_REPLAY_WINDOW,
+                policy == DeliveryPolicy::Ephemeral,
+                r.logical_id
+            ],
+        )
+        .expect("finished session cleanup");
     }
     fn retire(&self, r: &DeliveryRecord, _policy: DeliveryPolicy) {
         // Router retains origin through terminal publication; standalone ledger users have no pipe.
@@ -729,7 +742,10 @@ impl KernelLedger {
                 }
                 Ok(None) => {}
             }
-        } else if !(policy == DeliveryPolicy::Ephemeral && r.status.is_terminal()) {
+        } else if !r.status.is_terminal() {
+            // 非持久消息在入口即终态（TargetInvalid / ContractInvalid / 输出不可用）时不落账本：
+            // 该行走不到 commit_transition 的终态清理，也不会被淘汰（淘汰只选 Ephemeral），
+            // 留下来只会无限占用 MAX_LIVE 准入预算。
             let mem = self.memory.lock();
             let bytes: i64 = mem
                 .query_row(
@@ -771,15 +787,28 @@ impl KernelLedger {
                     if DeliveryPolicy::resolve(&target, &kind) != DeliveryPolicy::Ephemeral {
                         continue;
                     }
+                    let victim_logical = Self::read(&mem, &id).ok().flatten().map(|v| v.logical_id);
                     mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1", [&id])
                         .expect("quota eviction");
+                    // 身份行必须一起回收：MAX_LIVE 统计的是 identities，漏删会让淘汰形同虚设。
+                    mem.execute("DELETE FROM identities WHERE message_id=?1", [&id])
+                        .expect("quota identity cleanup");
+                    // 该 logical 下已无身份时，会话索引同样是纯历史，必须回收。
+                    if let Some(logical) = victim_logical {
+                        mem.execute(
+                            "DELETE FROM kernel_sessions WHERE logical_id=?1 AND NOT EXISTS(SELECT 1 FROM identities WHERE logical_id=?1)",
+                            [&logical],
+                        )
+                        .expect("evicted session cleanup");
+                    }
                     self.evicted.fetch_add(1, Ordering::Relaxed);
                     need -= len.max(1);
                 }
                 if need > 0 {
                     let failed = Self::failure(&r, "nonpersistent ledger capacity exhausted");
                     drop(mem);
-                    self.remember_failure(&failed);
+                    // 不能走 remember_failure：它会把失败行写回账本并标记 persistence_failed，
+                    // 而 finish_publication 对这种情况故意不回收 —— 等于每次拒收都永久占用它刚刚失败的那份预算。
                     self.update_metadata(&failed);
                     return (failed, false);
                 }
@@ -886,8 +915,12 @@ impl KernelLedger {
                     > MAX_TRANSIENT_BYTES
                 {
                     *r = Self::failure(old, "nonpersistent result capacity exhausted");
+                    // 容量失败本身已是终态：不要再写回账本，否则这一行永远没有回收路径。
+                    mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1", [&r.message_id])
+                        .expect("transient result cleanup");
+                } else {
+                    Self::write(&mem, r).expect("memory transition");
                 }
-                Self::write(&mem, r).expect("memory transition");
             }
         }
         self.update_metadata(r);
@@ -1182,7 +1215,7 @@ mod restoration_tests {
             ledger.allocate_submission("sender", 2, 1),
             (logical.clone(), ids.clone(), true)
         );
-        // Volatile 终态同样从内存账本清理，不再提供事后结果查询。
+        // Volatile 终态从内存账本清理，不再提供事后结果查询；会话索引仍保留用于重放。
         assert!(ledger.receipts_for_logical(&logical).is_empty());
     }
 

@@ -1,4 +1,4 @@
-use crate::outbox::PipeSender;
+use crate::services::outbox::PipeSender;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
@@ -9,9 +9,9 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::services::ledger::{KernelLedger, ReceiptTransition};
-use crate::logging::{KernelLogHub, LogQuery, LogRecord};
+use crate::services::logs::logging::{KernelLogHub, LogQuery, LogRecord};
 use crate::services::objects::{DeleteOutcome, ObjectHub};
-use crate::observer::KernelObserver;
+use crate::services::observer::KernelObserver;
 use crate::protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
     InboundReceipt, KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET,
@@ -3058,7 +3058,7 @@ mod generation_acceptance_tests {
         );
         old.drain_frames();
         sender.drain_frames();
-        let (tx, rx) = crate::outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
+        let (tx, rx) = crate::services::outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
         let candidate = k.router().attach_candidate_pipe("worker", tx);
         let ids = register(k.router(), candidate, "new");
         assert!(k.router().is_candidate_ready("worker", candidate));
@@ -3140,7 +3140,7 @@ mod generation_acceptance_tests {
         let old = k.attach_domain("worker");
         old.register_handlers(&["old"]);
         old.drain_frames();
-        let (tx, _rx) = crate::outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
+        let (tx, _rx) = crate::services::outbox::channel(k.ledger().db_conn.as_ref().unwrap().clone());
         let candidate = k.router().attach_candidate_pipe("worker", tx);
         register(k.router(), candidate, "new");
         assert!(k.router().is_candidate_ready("worker", candidate));

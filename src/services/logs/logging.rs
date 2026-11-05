@@ -223,7 +223,7 @@ pub struct LogPage {
 /// - Real-time subscriber drops never remove pending persistence records.
 pub struct LogStore {
     tx: SyncSender<()>,
-    spool: Arc<crate::log_spool::LogSpool>,
+    spool: Arc<crate::services::logs::log_spool::LogSpool>,
     stop: Arc<AtomicBool>,
     writer_handle: Option<thread::JoinHandle<()>>,
     query_conn: Mutex<Connection>,
@@ -287,7 +287,7 @@ impl LogStore {
             conn_writer.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;")?;
         }
 
-        let spool = crate::log_spool::LogSpool::open(db_path, &conn_writer)?;
+        let spool = crate::services::logs::log_spool::LogSpool::open(db_path, &conn_writer)?;
         let (tx, rx) = mpsc::sync_channel::<()>(1); // Wakeups only; never stores log payloads.
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
@@ -338,7 +338,7 @@ impl LogStore {
         mut conn: Connection,
         rx: Receiver<()>,
         stop: Arc<AtomicBool>,
-        spool: Arc<crate::log_spool::LogSpool>,
+        spool: Arc<crate::services::logs::log_spool::LogSpool>,
         gate: Option<Arc<Mutex<()>>>,
     ) {
         loop {

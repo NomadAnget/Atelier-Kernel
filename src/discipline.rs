@@ -221,7 +221,7 @@ fn check_sqlite_schema_drift(
     if table_exists(&conn, "kernel_outbox") {
         report.checked_tables += 1;
         if let Err(err) =
-            verify_sqlite_table_columns(&conn, "kernel_outbox", crate::outbox::OUTBOX_COLUMNS)
+            verify_sqlite_table_columns(&conn, "kernel_outbox", crate::services::outbox::OUTBOX_COLUMNS)
         {
             report.violations.push(ConstitutionViolation {
                 rule: "M7".into(),
@@ -235,7 +235,7 @@ fn check_sqlite_schema_drift(
         if let Err(err) = verify_sqlite_table_columns(
             &conn,
             "kernel_log_import",
-            crate::log_spool::CURSOR_COLUMNS,
+            crate::services::logs::log_spool::CURSOR_COLUMNS,
         ) {
             report.violations.push(ConstitutionViolation {
                 rule: "M7".into(),

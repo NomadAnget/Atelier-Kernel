@@ -1,4 +1,4 @@
-use crate::outbox::{self, PipeReceiver};
+use crate::services::outbox::{self, PipeReceiver};
 use crate::services::ports::{Forwarder, PortBinding};
 use crate::process_diagnostics::{ProcessDiagnostics, bounded, io_error};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::logging::LogRecord;
+use crate::services::logs::logging::LogRecord;
 use crate::protocol::{
     ContractStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
     KERNEL_STORAGE_TARGET, KernelToDomainFrame, MSG_REGISTER_HANDLERS, MSG_STORAGE_DELETE,
@@ -510,7 +510,7 @@ struct ManagedProcess {
     exit_status: Option<std::process::ExitStatus>,
     stop: Arc<AtomicBool>,
     drain: Arc<AtomicBool>,
-    output: crate::outbox::PipeSender,
+    output: crate::services::outbox::PipeSender,
     workers: Vec<thread::JoinHandle<()>>,
     app_ready: Arc<AtomicBool>,
     bindings: Vec<(Arc<Forwarder>, SocketAddr)>,

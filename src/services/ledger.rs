@@ -300,7 +300,7 @@ impl KernelLedger {
         db.execute_batch(SCHEMA)?;
         verify_sqlite_table_columns(&db, KERNEL_LEDGER_TABLE, KERNEL_LEDGER_COLUMNS)?;
         verify_sqlite_table_columns(&db, AUDIT_TABLE, AUDIT_COLUMNS)?;
-        crate::outbox::initialize(&db)?;
+        crate::services::outbox::initialize(&db)?;
 
         // 损坏的持久传输在启动清理前显式拒绝（沿用协议解码器，不维护第二套 JSON schema）。
         {
@@ -710,7 +710,7 @@ impl KernelLedger {
                 let mut db = self.db_conn.as_ref().unwrap().lock();
                 let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
                 write_messages_tx(&tx, &r)?;
-                crate::outbox::insert_frame(
+                crate::services::outbox::insert_frame(
                     &tx,
                     channel,
                     channel_seq,

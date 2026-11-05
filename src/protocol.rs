@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::logging::LogFramePayload;
+use crate::services::logs::logging::LogFramePayload;
 
 /// Built-in kernel target for domain handler registration.
 pub const KERNEL_REGISTRY_TARGET: &str = "kernel.registry";

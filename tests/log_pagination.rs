@@ -1,4 +1,4 @@
-use atelier_kernel::logging::{LOG_PAGE_MAX_BYTES, LOG_PAGE_MAX_ROWS};
+use atelier_kernel::services::logs::logging::{LOG_PAGE_MAX_BYTES, LOG_PAGE_MAX_ROWS};
 use atelier_kernel::{
     AtelierKernel, ContractStatus, KernelLogHub, KernelToDomainFrame, LogQuery, LogRecord, LogStore,
 };

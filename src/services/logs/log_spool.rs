@@ -1,5 +1,5 @@
 //! Durable append buffer independent from the application's SQLite writer lock.
-use crate::{logging::LogRecord, services::storage::StorageError};
+use crate::{services::logs::logging::LogRecord, services::storage::StorageError};
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::{

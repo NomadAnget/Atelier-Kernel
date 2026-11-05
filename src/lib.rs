@@ -2,11 +2,7 @@ pub mod discipline;
 pub mod endpoint;
 pub mod services;
 pub mod frontend;
-mod log_spool;
-pub mod logging;
 pub mod nucleus;
-pub mod observer;
-pub mod outbox;
 pub mod protocol;
 pub mod router;
 pub mod routing;
@@ -23,10 +19,10 @@ pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constituti
 pub use frontend::InteractiveFrontendDomain;
 pub use services::ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
 pub use services::objects::{DeleteOutcome, Object, ObjectHub, ObjectRef};
-pub use logging::{
+pub use services::logs::logging::{
     KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore, ProgressState,
 };
-pub use observer::KernelObserver;
+pub use services::observer::KernelObserver;
 pub use protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
     InboundReceipt, KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET,

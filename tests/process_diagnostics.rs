@@ -62,7 +62,7 @@ fn probe(code: &str, stage: &str) -> Value {
 }
 #[test]
 fn natural_child_exit_has_original_code() {
-    let row = probe("import sys;sys.exit(23)", "child_exit");
+    let row = probe("import sys,os,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); time.sleep(0.3); sys.exit(23)", "child_exit");
     assert_eq!(row["diagnostic"]["details"]["code"], 23);
     assert_eq!(row["diagnostic"]["details"]["after_cleanup_request"], false);
 }
@@ -70,7 +70,7 @@ fn natural_child_exit_has_original_code() {
 #[test]
 fn natural_child_signal_is_observed_before_cleanup() {
     let row = probe(
-        "import os,signal;os.kill(os.getpid(),signal.SIGTERM)",
+        "import os,signal,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); time.sleep(0.3); os.kill(os.getpid(),signal.SIGTERM)",
         "child_exit",
     );
     assert_eq!(row["diagnostic"]["details"]["signal"], 15);
@@ -80,7 +80,7 @@ fn natural_child_signal_is_observed_before_cleanup() {
 #[test]
 fn oversized_rx_records_original_error_before_cleanup() {
     let row = probe(
-        "import os,time;f=os.fdopen(int(os.environ['ATELIER_IPC_WRITE_FD']),'wb',buffering=0);f.write(b'x'*(16*1024*1024+1));time.sleep(30)",
+        "import os,time; w=open(os.environ['ATELIER_IPC_OUT'],'wb',buffering=0); w.write(b'x'*(16*1024*1024+1)); time.sleep(30)",
         "rx_read",
     );
     assert_eq!(row["diagnostic"]["details"]["kind"], "InvalidData");

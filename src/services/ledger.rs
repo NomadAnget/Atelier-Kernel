@@ -18,8 +18,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::nucleus::{AuditRecord, Message, Nucleus};
-use crate::protocol::{
+use crate::core::nucleus::{AuditRecord, Message, Nucleus};
+use crate::core::protocol::{
     ContractStatus, DeliveryPolicy, KernelMessage, MessageReceipt, now_millis, parse_target_address,
 };
 use crate::services::storage::{StorageError, verify_sqlite_table_columns};
@@ -315,13 +315,13 @@ impl KernelLedger {
                 let valid = if raw.len() > 16 * 1024 * 1024 {
                     false
                 } else {
-                    serde_json::from_str::<crate::protocol::KernelToDomainFrame>(&raw).is_ok_and(
+                    serde_json::from_str::<crate::core::protocol::KernelToDomainFrame>(&raw).is_ok_and(
                         |frame| match frame {
-                            crate::protocol::KernelToDomainFrame::Deliver(message) => {
+                            crate::core::protocol::KernelToDomainFrame::Deliver(message) => {
                                 priority == 1
                                     && delivery.as_deref() == Some(message.message_id.as_str())
                             }
-                            crate::protocol::KernelToDomainFrame::Receipt(_) => {
+                            crate::core::protocol::KernelToDomainFrame::Receipt(_) => {
                                 priority == 0 && delivery.is_none()
                             }
                         },
@@ -714,7 +714,7 @@ impl KernelLedger {
                     &tx,
                     channel,
                     channel_seq,
-                    &crate::protocol::KernelToDomainFrame::Deliver(msg.clone()),
+                    &crate::core::protocol::KernelToDomainFrame::Deliver(msg.clone()),
                 )?;
                 tx.commit()?;
                 Ok(())

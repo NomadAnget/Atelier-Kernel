@@ -1,5 +1,5 @@
 //! Per-generation transport queues. Durable payloads are spooled, never an unbounded RAM channel.
-use crate::protocol::{DeliveryPolicy, KernelToDomainFrame};
+use crate::core::protocol::{DeliveryPolicy, KernelToDomainFrame};
 use parking_lot::{Condvar, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::VecDeque;
@@ -246,7 +246,7 @@ impl PipeSender {
     pub(crate) fn accept(
         &self,
         ledger: &crate::services::ledger::KernelLedger,
-        msg: &crate::protocol::KernelMessage,
+        msg: &crate::core::protocol::KernelMessage,
         seq: u64,
     ) -> Result<(crate::services::ledger::DeliveryRecord, bool), QueueError> {
         let mut state = self.0.state.lock();
@@ -841,7 +841,7 @@ mod control_and_schema_tests {
                 seq: i,
                 target: "worker.run".into(),
                 message_type: "Durable".into(),
-                policy: crate::protocol::DeliveryPolicy::Durable,
+                policy: crate::core::protocol::DeliveryPolicy::Durable,
                 status: ContractStatus::Completed,
                 data: Some(serde_json::json!({"payload":"x".repeat(2048)})),
                 timestamp: 0,
@@ -895,7 +895,7 @@ mod domain_state_slot_tests {
         let db = k.ledger().db_conn.as_ref().unwrap().clone();
         let (tx, rx) = channel(db.clone());
         for i in 0..1000 {
-            let message = crate::protocol::KernelMessage {
+            let message = crate::core::protocol::KernelMessage {
                 logical_id: String::new(),
                 message_id: format!("event_{i}"),
                 source_domain: "kernel".into(),
@@ -914,7 +914,7 @@ mod domain_state_slot_tests {
             let mut value = serde_json::to_value(event).unwrap();
             value["details"]["revision"] = revision.into();
             tx.send(KernelToDomainFrame::Deliver(
-                crate::protocol::KernelMessage {
+                crate::core::protocol::KernelMessage {
                     logical_id: String::new(),
                     message_id: String::new(),
                     source_domain: "kernel".into(),
@@ -948,7 +948,7 @@ mod domain_state_reservation_tests {
     use super::*;
     use serde_json::json;
     fn event(data: serde_json::Value) -> KernelToDomainFrame {
-        KernelToDomainFrame::Deliver(crate::protocol::KernelMessage {
+        KernelToDomainFrame::Deliver(crate::core::protocol::KernelMessage {
             logical_id: String::new(),
             message_id: String::new(),
             source_domain: "kernel".into(),

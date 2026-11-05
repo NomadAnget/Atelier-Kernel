@@ -1,7 +1,129 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::services::logs::logging::LogFramePayload;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Standard Unix timestamp in seconds with fractional precision (matches Python `time.time()`).
+pub fn now_secs_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn default_info_level() -> String {
+    "INFO".to_string()
+}
+
+/// Outcome of an ephemeral progress update; independent of message receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+/// Unified Multi-State Structured Log Record.
+///
+/// Supports 3 core operational patterns:
+/// 1. **Hierarchical / Lifecycle Logs**: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` with `layer`, `component`, and `phase` execution pairing.
+/// 2. **Ephemeral Progress**: `ephemeral=true` with `key`, `frac`, `waiting`, and `done`. Dispatched only in-memory / SSE, never written to SQLite `hub_logs`.
+/// 3. **Console Only**: `console_only=true` (high-frequency heartbeats). Printed only to terminal, excluded from both `hub_logs` and SSE fanout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogRecord {
+    /// Kernel-bound origin; None for historical records predating this field.
+    #[serde(default)]
+    pub source_domain: Option<String>,
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default = "now_secs_f64")]
+    pub ts: f64,
+    #[serde(default = "default_info_level")]
+    pub level: String,
+    #[serde(default)]
+    pub layer: String,
+    #[serde(default)]
+    pub component: String,
+    #[serde(default)]
+    pub message: String,
+    /// Execution lifecycle pairing marker (`"start"` / `"finish"` / `""`).
+    #[serde(default)]
+    pub phase: String,
+    /// High-frequency telemetry visible only on console/terminal (no DB, no SSE).
+    #[serde(default)]
+    pub console_only: bool,
+    /// Live progress/telemetry dispatched only via SSE/pub-sub (never pollutes SQLite disk tables).
+    #[serde(default)]
+    pub ephemeral: bool,
+    /// Stable key for in-place frontend progress bar updating.
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Determinate progress fraction in range [0.0, 1.0]. None indicates indeterminate spinner.
+    #[serde(default)]
+    pub frac: Option<f64>,
+    /// True when the task is waiting/queuing before active execution.
+    #[serde(default)]
+    pub waiting: bool,
+    /// True when the ephemeral task is finished (signals termination, not necessarily success).
+    #[serde(default)]
+    pub done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<ProgressState>,
+}
+
+impl Default for LogRecord {
+    fn default() -> Self {
+        Self {
+            source_domain: None,
+            id: None,
+            ts: now_secs_f64(),
+            level: "INFO".to_string(),
+            layer: String::new(),
+            component: String::new(),
+            message: String::new(),
+            phase: String::new(),
+            console_only: false,
+            ephemeral: false,
+            key: None,
+            frac: None,
+            waiting: false,
+            done: false,
+            state: None,
+        }
+    }
+}
+
+/// Payload wrapper for log frames arriving from child domains over IPC.
+/// Tolerates either `{"frame_type": "log", "record": {...}}` or flattened `{"frame_type": "log", ...}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFramePayload {
+    #[serde(default)]
+    pub record: Option<LogRecord>,
+    #[serde(flatten)]
+    pub flat: Option<LogRecord>,
+}
+
+impl LogFramePayload {
+    pub fn from_record(record: LogRecord) -> Self {
+        Self {
+            record: Some(record),
+            flat: None,
+        }
+    }
+
+    pub fn into_record(self) -> LogRecord {
+        if let Some(r) = self.record {
+            r
+        } else if let Some(f) = self.flat {
+            f
+        } else {
+            LogRecord::default()
+        }
+    }
+}
+
 
 /// Built-in kernel target for domain handler registration.
 pub const KERNEL_REGISTRY_TARGET: &str = "kernel.registry";

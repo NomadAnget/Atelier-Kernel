@@ -40,7 +40,7 @@ impl ProcessDiagnostics {
         }
         let event = json!({"event":"kernel_process_diagnostic", "domain_id":self.domain,
             "pid":self.pid,"generation":self.generation,"stage":stage,
-            "ts":crate::services::logs::logging::now_secs_f64(),"details":details});
+            "ts":crate::core::protocol::now_secs_f64(),"details":details});
         evidence.stages.insert(stage, event.clone());
         if fault && evidence.first_fault.is_none() {
             evidence.first_fault = Some(event.clone());

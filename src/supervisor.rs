@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::services::logs::logging::LogRecord;
-use crate::protocol::{
+use crate::core::protocol::LogRecord;
+use crate::core::protocol::{
     ContractStatus, DomainToKernelFrame, InboundReceipt, KERNEL_REGISTRY_TARGET,
     KERNEL_STORAGE_TARGET, KernelToDomainFrame, MSG_REGISTER_HANDLERS, MSG_STORAGE_DELETE,
     MSG_STORAGE_INSERT, MSG_STORAGE_QUERY, MSG_STORAGE_UPDATE, OutboundMessage,
@@ -1266,7 +1266,7 @@ impl DomainSupervisorInner {
             let failed = {
                 let mut state = control.state.lock();
                 let faulted =
-                    self.router.domain_status(&id) == Some(crate::protocol::DomainStatus::Faulted);
+                    self.router.domain_status(&id) == Some(crate::core::protocol::DomainStatus::Faulted);
                 if state
                     .process
                     .as_mut()
@@ -2135,7 +2135,7 @@ time.sleep(30)
             let runtime_ok = observer.drain_frames().iter().any(|frame| {
                 matches!(frame,
                 KernelToDomainFrame::Receipt(receipt) if receipt.message_id == ids[0]
-                    && receipt.status == crate::protocol::ContractStatus::Completed)
+                    && receipt.status == crate::core::protocol::ContractStatus::Completed)
             });
             let _ = answer_tx.send((pid, runtime_ok));
         });

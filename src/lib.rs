@@ -1,13 +1,10 @@
+pub mod core;
 pub mod discipline;
 pub mod endpoint;
 pub mod services;
 pub mod frontend;
-pub mod nucleus;
-pub mod protocol;
 pub mod router;
-pub mod routing;
 pub mod supervisor;
-pub mod transport;
 pub mod web_frontend;
 
 use std::path::Path;
@@ -19,11 +16,10 @@ pub use discipline::{ConstitutionReport, ConstitutionViolation, check_constituti
 pub use frontend::InteractiveFrontendDomain;
 pub use services::ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
 pub use services::objects::{DeleteOutcome, Object, ObjectHub, ObjectRef};
-pub use services::logs::logging::{
-    KernelLogHub, LogFramePayload, LogPage, LogQuery, LogRecord, LogStore, ProgressState,
-};
+pub use core::protocol::{LogFramePayload, LogRecord, ProgressState};
+pub use services::logs::logging::{KernelLogHub, LogPage, LogQuery, LogStore};
 pub use services::observer::KernelObserver;
-pub use protocol::{
+pub use core::protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
     InboundReceipt, KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET,
     KERNEL_REGISTRY_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET, KERNEL_SUPERVISOR_TARGET,

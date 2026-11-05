@@ -6,7 +6,7 @@
 //! result has been published.
 
 use atelier_kernel::services::ledger::KernelLedger;
-use atelier_kernel::protocol::ContractStatus;
+use atelier_kernel::core::protocol::ContractStatus;
 use serde_json::{Value, json};
 
 fn deliver(ledger: &KernelLedger, seq: u64, kind: &str, data: Option<Value>) {

@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::protocol::{ContractStatus, DeliveryPolicy, now_millis};
+use crate::core::protocol::{ContractStatus, DeliveryPolicy, now_millis};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {

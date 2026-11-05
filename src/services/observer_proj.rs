@@ -4,7 +4,7 @@
 //! "结果被回收后从观察器还原真实终态"用。约束（C2/C3）：历史按条数与字节有界；
 //! 慢消费者/超预算事件可丢，但不阻塞业务、不反写状态。
 
-use crate::protocol::ContractStatus;
+use crate::core::protocol::ContractStatus;
 use serde_json::Value;
 use std::collections::VecDeque;
 

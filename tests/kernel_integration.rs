@@ -644,7 +644,7 @@ fn test_unified_multi_state_logging_and_hub_logs_persistence() {
     kernel.logger().reinject(atelier_kernel::LogRecord {
         source_domain: None,
         id: None,
-        ts: atelier_kernel::services::logs::logging::now_secs_f64(),
+        ts: atelier_kernel::core::protocol::now_secs_f64(),
         level: "DEBUG".to_string(),
         layer: "ENGINES".to_string(),
         component: "heartbeat".to_string(),

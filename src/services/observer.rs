@@ -1,4 +1,4 @@
-use crate::protocol::{ContractStatus, ObservationEvent, now_millis};
+use crate::core::protocol::{ContractStatus, ObservationEvent, now_millis};
 use parking_lot::Mutex;
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -51,7 +51,7 @@ impl KernelObserver {
         &self,
         domain: &str,
         generation: u64,
-        status: crate::protocol::DomainStatus,
+        status: crate::core::protocol::DomainStatus,
         reason: Option<&str>,
     ) {
         let change = {
@@ -191,7 +191,7 @@ impl KernelObserver {
 #[cfg(test)]
 mod domain_state_tests {
     use super::*;
-    use crate::protocol::DomainStatus;
+    use crate::core::protocol::DomainStatus;
     #[test]
     fn state_notifications_coalesce_to_current_snapshot_and_deduplicate_repeated_state() {
         let observer = KernelObserver::new(64);

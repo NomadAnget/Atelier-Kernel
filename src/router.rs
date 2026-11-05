@@ -9,10 +9,11 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{Value, json};
 
 use crate::services::ledger::{KernelLedger, ReceiptTransition};
-use crate::services::logs::logging::{KernelLogHub, LogQuery, LogRecord};
+use crate::services::logs::logging::{KernelLogHub, LogQuery};
+use crate::core::protocol::LogRecord;
 use crate::services::objects::{DeleteOutcome, ObjectHub};
 use crate::services::observer::KernelObserver;
-use crate::protocol::{
+use crate::core::protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
     InboundReceipt, KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET,
     KERNEL_REGISTRY_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET, KERNEL_SUPERVISOR_TARGET,
@@ -943,8 +944,8 @@ impl KernelRouter {
         let durable = targets.iter().all(|t| {
             outbound
                 .delivery
-                .unwrap_or_else(|| crate::protocol::DeliveryPolicy::resolve(t, &outbound.message_type))
-                == crate::protocol::DeliveryPolicy::Durable
+                .unwrap_or_else(|| crate::core::protocol::DeliveryPolicy::resolve(t, &outbound.message_type))
+                == crate::core::protocol::DeliveryPolicy::Durable
         });
         let (logical_id, ids, duplicate) = match self.ledger.try_allocate_submission(
             &format!("{authenticated_domain}#{instance_id}"),
@@ -961,7 +962,7 @@ impl KernelRouter {
                     .collect();
                 for (target, id) in targets.iter().zip(&ids) {
                     let delivery = outbound.delivery.unwrap_or_else(|| {
-                        crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
+                        crate::core::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
                     });
                     self.send_to_instance_inner(authenticated_domain,Some(instance_id),KernelToDomainFrame::Receipt(MessageReceipt {
                         logical_id:logical.clone(),message_id:id.clone(),seq:outbound.seq,target:target.clone(),message_type:outbound.message_type.clone(),
@@ -982,7 +983,7 @@ impl KernelRouter {
                 if receipts.is_empty() {
                     // 结果已随终态回收：从观察器还原真实终态，而不是一律报告失败。
                     let delivery = outbound.delivery.unwrap_or_else(|| {
-                        crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
+                        crate::core::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
                     });
                     let observed = self
                         .observer
@@ -1031,7 +1032,7 @@ impl KernelRouter {
         let ingress_ts = now_millis();
         for (target, message_id) in targets.iter().zip(&ids) {
             let delivery = outbound.delivery.unwrap_or_else(|| {
-                crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
+                crate::core::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
             });
             let kernel_msg = KernelMessage {
                 logical_id: logical_id.clone(),
@@ -2458,7 +2459,7 @@ impl KernelRouter {
             data.clone(),
         ) {
             // Query payloads belong to the requester, not a second full result cache.
-            let observed_data = if crate::protocol::DeliveryPolicy::is_infrastructure_query(
+            let observed_data = if crate::core::protocol::DeliveryPolicy::is_infrastructure_query(
                 &msg.target,
                 &msg.message_type,
             ) && final_status == ContractStatus::Completed

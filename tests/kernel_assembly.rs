@@ -3,9 +3,9 @@
 
 use atelier_kernel::services::objects::ObjectHub;
 use atelier_kernel::services::observer_proj::Observer;
-use atelier_kernel::protocol::{ContractStatus, DeliveryPolicy};
-use atelier_kernel::routing::Routing;
-use atelier_kernel::transport::{Frame, Transport};
+use atelier_kernel::core::protocol::{ContractStatus, DeliveryPolicy};
+use atelier_kernel::core::routing::Routing;
+use atelier_kernel::core::transport::{Frame, Transport};
 use serde_json::json;
 
 #[test]

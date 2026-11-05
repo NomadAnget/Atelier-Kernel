@@ -7,8 +7,8 @@
 //! 帧顺序由**每通道单调 seq**决定，与消息策略（Durable/Volatile/Ephemeral）无关。
 //! 这从结构上消灭了旧实现"内存 spool 先于 SQLite 行出队"导致的跨策略乱序（审计 A2）。
 
-use crate::nucleus::{Advance, Nucleus, Submission};
-use crate::protocol::{ContractStatus, DeliveryPolicy};
+use crate::core::nucleus::{Advance, Nucleus, Submission};
+use crate::core::protocol::{ContractStatus, DeliveryPolicy};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -50,7 +50,7 @@ impl Transport {
         }
     }
 
-    pub fn with_store<S: crate::nucleus::Store + 'static>(self, store: S) -> Self {
+    pub fn with_store<S: crate::core::nucleus::Store + 'static>(self, store: S) -> Self {
         Transport { nucleus: self.nucleus.with_store(store), ..self }
     }
 

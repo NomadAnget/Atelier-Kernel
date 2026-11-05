@@ -160,7 +160,7 @@ impl ObjectHub {
                     "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         obj.object_id, obj.owner, obj.virtual_path, obj.physical_path,
-                        obj.size as i64, obj.ref_count as i64, crate::protocol::now_millis()
+                        obj.size as i64, obj.ref_count as i64, crate::core::protocol::now_millis()
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -224,7 +224,7 @@ impl ObjectHub {
                     "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                     params![
                         obj.object_id, obj.owner, obj.virtual_path, obj.physical_path,
-                        obj.size as i64, obj.ref_count as i64, crate::protocol::now_millis()
+                        obj.size as i64, obj.ref_count as i64, crate::core::protocol::now_millis()
                     ],
                 )
                 .map_err(|e| e.to_string())?;

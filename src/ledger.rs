@@ -21,6 +21,7 @@ pub const KERNEL_LEDGER_COLUMNS: &[&str] = &[
     "source_domain",
     "target",
     "message_type",
+    "policy",
     "status",
     "data",
     "created_at",
@@ -36,6 +37,8 @@ pub struct DeliveryRecord {
     pub source_domain: String,
     pub target: String,
     pub message_type: String,
+    #[serde(default)]
+    pub policy: DeliveryPolicy,
     pub status: ContractStatus,
     pub data: Option<Value>,
     pub created_at: i64,
@@ -51,6 +54,7 @@ impl DeliveryRecord {
             seq: self.seq,
             target: self.target.clone(),
             message_type: self.message_type.clone(),
+            policy: self.policy,
             status: self.status,
             data: self.data.clone(),
             timestamp: self.updated_at,
@@ -90,10 +94,10 @@ const MAX_LIVE: i64 = 65_536;
 const MAX_TRANSIENT_BYTES: i64 = 64 * 1024 * 1024;
 /// How many recent submission sequences keep their session index for idempotent replay.
 const SESSION_REPLAY_WINDOW: i64 = 2_048;
-const SELECT_RECORD: &str = "SELECT message_id,logical_id,seq,source_domain,target,message_type,status,data,created_at,updated_at FROM kernel_ledger";
+const SELECT_RECORD: &str = "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at FROM kernel_ledger";
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS kernel_ledger(
  message_id TEXT PRIMARY KEY,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,source_domain TEXT NOT NULL,
- target TEXT NOT NULL,message_type TEXT NOT NULL,status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+ target TEXT NOT NULL,message_type TEXT NOT NULL,policy TEXT NOT NULL DEFAULT 'durable',status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS idx_kernel_ledger_logical ON kernel_ledger(logical_id);
  CREATE INDEX IF NOT EXISTS idx_kernel_ledger_status ON kernel_ledger(status);
  CREATE TABLE IF NOT EXISTS kernel_sessions(source TEXT NOT NULL,seq INTEGER NOT NULL,logical_id TEXT NOT NULL,children TEXT NOT NULL,PRIMARY KEY(source,seq));";
@@ -273,24 +277,28 @@ impl KernelLedger {
         gate
     }
     fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {
-        let status: String = row.get(6)?;
-        let raw: Option<String> = row.get(7)?;
+        let status: String = row.get(7)?;
+        let raw: Option<String> = row.get(8)?;
+        let policy: String = row.get(6)?;
         let error = |e: serde_json::Error| {
-            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
         };
+        let target: String = row.get(4)?;
+        let message_type: String = row.get(5)?;
         Ok(DeliveryRecord {
             message_id: row.get(0)?,
             logical_id: row.get(1)?,
             seq: row.get::<_, i64>(2)? as u64,
             source_domain: row.get(3)?,
-            target: row.get(4)?,
-            message_type: row.get(5)?,
+            target,
+            message_type,
+            policy: serde_json::from_value(Value::String(policy)).map_err(error)?,
             status: serde_json::from_value(Value::String(status)).map_err(error)?,
             data: raw
                 .map(|s| serde_json::from_str(&s).map_err(error))
                 .transpose()?,
-            created_at: row.get(8)?,
-            updated_at: row.get(9)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
         })
     }
     fn read(db: &Connection, id: &str) -> rusqlite::Result<Option<DeliveryRecord>> {
@@ -302,9 +310,9 @@ impl KernelLedger {
         .optional()
     }
     fn write(db: &Connection, r: &DeliveryRecord) -> Result<(), StorageError> {
-        db.execute("INSERT INTO kernel_ledger(message_id,logical_id,seq,source_domain,target,message_type,status,data,created_at,updated_at)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,data=excluded.data,updated_at=excluded.updated_at",
-            params![r.message_id,r.logical_id,r.seq as i64,r.source_domain,r.target,r.message_type,serde_json::to_value(r.status)?.as_str(),r.data.as_ref().map(serde_json::to_string).transpose()?,r.created_at,r.updated_at])?;
+        db.execute("INSERT INTO kernel_ledger(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,data=excluded.data,updated_at=excluded.updated_at",
+            params![r.message_id,r.logical_id,r.seq as i64,r.source_domain,r.target,r.message_type,serde_json::to_value(r.policy)?.as_str(),serde_json::to_value(r.status)?.as_str(),r.data.as_ref().map(serde_json::to_string).transpose()?,r.created_at,r.updated_at])?;
         Ok(())
     }
     fn failure(r: &DeliveryRecord, error: impl ToString) -> DeliveryRecord {
@@ -520,7 +528,7 @@ impl KernelLedger {
         if !r.status.is_terminal() {
             return;
         }
-        let policy = DeliveryPolicy::resolve(&r.target, &r.message_type);
+        let policy = r.policy;
         let mem = self.memory.lock();
         let abandoned:bool=mem.query_row("SELECT NOT EXISTS(SELECT 1 FROM identities i JOIN highwater h ON h.source=i.source WHERE i.message_id=?1)",[&r.message_id],|row|row.get(0)).expect("source lifetime query");
         let unpersisted: bool = mem.query_row("SELECT coalesce((SELECT persistence_failed FROM identities WHERE message_id=?1),0)",[&r.message_id], |row|row.get(0)).expect("publication provenance");
@@ -628,7 +636,8 @@ impl KernelLedger {
     ) -> (DeliveryRecord, bool) {
         let gate = self.message_gate(id);
         let _mutation = gate.lock();
-        self.record_initial_target_state_locked(id, seq, source, target, kind, status, data)
+        let policy = DeliveryPolicy::resolve(target, kind);
+        self.record_initial_target_state_locked(id, seq, source, target, kind, policy, status, data)
     }
     pub(crate) fn record_initial_target_state_locked(
         &self,
@@ -637,6 +646,7 @@ impl KernelLedger {
         source: &str,
         target: &str,
         kind: &str,
+        policy: DeliveryPolicy,
         status: ContractStatus,
         data: Option<Value>,
     ) -> (DeliveryRecord, bool) {
@@ -648,6 +658,7 @@ impl KernelLedger {
             source_domain: source.into(),
             target: target.into(),
             message_type: kind.into(),
+            policy,
             status,
             data,
             created_at: now,
@@ -669,6 +680,7 @@ impl KernelLedger {
             source_domain: msg.source_domain.clone(),
             target: msg.target.clone(),
             message_type: msg.message_type.clone(),
+            policy: msg.delivery,
             status: ContractStatus::Sent,
             data: None,
             created_at: now,
@@ -688,7 +700,7 @@ impl KernelLedger {
         r: DeliveryRecord,
         out: Option<(&str, &crate::protocol::KernelMessage)>,
     ) -> (DeliveryRecord, bool) {
-        let policy = DeliveryPolicy::resolve(&r.target, &r.message_type);
+        let policy = r.policy;
         if self.source_instance(&r.message_id).is_none() && !r.status.is_terminal() {
             let mem = self.memory.lock();
             let used: i64 = mem
@@ -881,7 +893,7 @@ impl KernelLedger {
         }
     }
     fn commit_transition(&self, r: &mut DeliveryRecord, old: &DeliveryRecord) {
-        let policy = DeliveryPolicy::resolve(&r.target, &r.message_type);
+        let policy = r.policy;
         if policy == DeliveryPolicy::Durable {
             let result = (|| -> Result<(), StorageError> {
                 let mut db = self.db_conn.as_ref().unwrap().lock();

@@ -1688,6 +1688,7 @@ impl DomainPipeClient {
             seq,
             targets,
             message_type: message_type.into(),
+            delivery: None,
             params,
             data,
         };

@@ -12,9 +12,9 @@ use crate::ledger::{KernelLedger, ReceiptTransition};
 use crate::logging::{KernelLogHub, LogQuery, LogRecord};
 use crate::observer::KernelObserver;
 use crate::protocol::{
-    ContractStatus, DomainStatus, DomainToKernelFrame, HandlerDescriptor, InboundReceipt,
-    KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET, KERNEL_REGISTRY_TARGET,
-    KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET, KERNEL_SUPERVISOR_TARGET,
+    ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
+    InboundReceipt, KERNEL_LOGGER_TARGET, KERNEL_NOTIFY_TARGET, KERNEL_OBSERVER_TARGET,
+    KERNEL_REGISTRY_TARGET, KERNEL_RUNTIME_TARGET, KERNEL_STORAGE_TARGET, KERNEL_SUPERVISOR_TARGET,
     KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_DOMAIN_ASSEMBLY,
     MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
@@ -244,6 +244,7 @@ impl KernelRouter {
                                         target: KERNEL_LOGGER_TARGET.to_string(),
                                         targets: vec![KERNEL_LOGGER_TARGET.to_string()],
                                         message_type: MSG_SYSTEM_LOG_EVENT.to_string(),
+                                        delivery: DeliveryPolicy::Ephemeral,
                                         params: json!({}),
                                         timestamp: now,
                                         data: data.clone(),
@@ -283,6 +284,7 @@ impl KernelRouter {
                                     target: KERNEL_OBSERVER_TARGET.into(),
                                     targets: vec![KERNEL_OBSERVER_TARGET.into()],
                                     message_type: MSG_SYSTEM_OBSERVER_EVENT.into(),
+                                    delivery: DeliveryPolicy::Ephemeral,
                                     params: json!({}),
                                     timestamp: event.timestamp,
                                     data: data.clone(),
@@ -309,6 +311,7 @@ impl KernelRouter {
                                         target: KERNEL_OBSERVER_TARGET.to_string(),
                                         targets: vec![KERNEL_OBSERVER_TARGET.to_string()],
                                         message_type: MSG_SYSTEM_OBSERVER_EVENT.to_string(),
+                                        delivery: DeliveryPolicy::Ephemeral,
                                         params: json!({}),
                                         timestamp: event.timestamp,
                                         data: data.clone(),
@@ -812,6 +815,7 @@ impl KernelRouter {
                     seq: 0,
                     target: "kernel.contract".to_string(),
                     message_type: "MalformedFrame".to_string(),
+                    policy: DeliveryPolicy::Durable,
                     status: ContractStatus::ContractInvalid,
                     data: err_data.clone(),
                     timestamp: now_millis(),
@@ -931,7 +935,9 @@ impl KernelRouter {
                 .collect()
         };
         let durable = targets.iter().all(|t| {
-            crate::protocol::DeliveryPolicy::resolve(t, &outbound.message_type)
+            outbound
+                .delivery
+                .unwrap_or_else(|| crate::protocol::DeliveryPolicy::resolve(t, &outbound.message_type))
                 == crate::protocol::DeliveryPolicy::Durable
         });
         let (logical_id, ids, duplicate) = match self.ledger.try_allocate_submission(
@@ -948,8 +954,12 @@ impl KernelRouter {
                     .map(|_| self.ledger.generate_message_id())
                     .collect();
                 for (target, id) in targets.iter().zip(&ids) {
+                    let delivery = outbound.delivery.unwrap_or_else(|| {
+                        crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
+                    });
                     self.send_to_instance_inner(authenticated_domain,Some(instance_id),KernelToDomainFrame::Receipt(MessageReceipt {
                         logical_id:logical.clone(),message_id:id.clone(),seq:outbound.seq,target:target.clone(),message_type:outbound.message_type.clone(),
+                        policy: delivery,
                         status:ContractStatus::ExecutionFailed,data:Some(json!({"error":"kernel_admission_failed","reason":error.to_string(),"persisted":false})),timestamp:now_millis(),
                     }), true);
                 }
@@ -965,6 +975,9 @@ impl KernelRouter {
                 let receipts = self.ledger.receipts_for_message(id);
                 if receipts.is_empty() {
                     // 重放的提交已终结且结果被回收：必须给出明确结论，不能让发送端干等超时。
+                    let delivery = outbound.delivery.unwrap_or_else(|| {
+                        crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
+                    });
                     self.send_to_instance(
                         authenticated_domain,
                         Some(instance_id),
@@ -974,6 +987,7 @@ impl KernelRouter {
                             seq: outbound.seq,
                             target: target.clone(),
                             message_type: outbound.message_type.clone(),
+                            policy: delivery,
                             status: ContractStatus::ExecutionFailed,
                             data: Some(json!({
                                 "error": "kernel_result_expired",
@@ -998,6 +1012,9 @@ impl KernelRouter {
         self.ledger.bind_origin(&ids, instance_id);
         let ingress_ts = now_millis();
         for (target, message_id) in targets.iter().zip(&ids) {
+            let delivery = outbound.delivery.unwrap_or_else(|| {
+                crate::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
+            });
             let kernel_msg = KernelMessage {
                 logical_id: logical_id.clone(),
                 message_id: message_id.clone(),
@@ -1005,6 +1022,7 @@ impl KernelRouter {
                 target: target.clone(),
                 targets: targets.clone(),
                 message_type: outbound.message_type.clone(),
+                delivery,
                 params: outbound.params.clone(),
                 timestamp: ingress_ts,
                 data: outbound.data.clone(),
@@ -1019,6 +1037,7 @@ impl KernelRouter {
                     authenticated_domain,
                     target,
                     &outbound.message_type,
+                    kernel_msg.delivery,
                     ContractStatus::ContractInvalid,
                     data.clone(),
                 );
@@ -1603,6 +1622,7 @@ impl KernelRouter {
                             target: KERNEL_TELEMETRY_TARGET.to_string(),
                             targets: vec![KERNEL_TELEMETRY_TARGET.to_string()],
                             message_type: MSG_SYSTEM_TELEMETRY_EVENT.to_string(),
+                            delivery: DeliveryPolicy::Ephemeral,
                             params: msg.params.clone(),
                             timestamp: now,
                             data: telem_data.clone(),
@@ -1707,6 +1727,7 @@ impl KernelRouter {
                             target: KERNEL_NOTIFY_TARGET.to_string(),
                             targets: vec![KERNEL_NOTIFY_TARGET.to_string()],
                             message_type: MSG_SYSTEM_NOTIFY_EVENT.to_string(),
+                            delivery: DeliveryPolicy::Ephemeral,
                             params: msg.params.clone(),
                             timestamp: now,
                             data: alert_data.clone(),
@@ -1851,6 +1872,7 @@ impl KernelRouter {
                         target: KERNEL_OBSERVER_TARGET.into(),
                         targets: vec![KERNEL_OBSERVER_TARGET.into()],
                         message_type: MSG_SYSTEM_OBSERVER_EVENT.into(),
+                        delivery: DeliveryPolicy::Ephemeral,
                         params: json!({}),
                         timestamp: event.timestamp,
                         data: serde_json::to_value(event).unwrap(),
@@ -2185,6 +2207,7 @@ impl KernelRouter {
             source_domain,
             &msg.target,
             &msg.message_type,
+            msg.delivery,
             ContractStatus::Sent,
             None,
         );
@@ -2329,6 +2352,7 @@ impl KernelRouter {
                 source_domain,
                 &target,
                 &msg.message_type,
+                msg.delivery,
                 ContractStatus::TargetInvalid,
                 err_data.clone(),
             );
@@ -2361,6 +2385,7 @@ impl KernelRouter {
                     source_domain,
                     &target,
                     &msg.message_type,
+                    msg.delivery,
                     ContractStatus::ExecutionFailed,
                     Some(json!({"error":"target_output_unavailable","reason":error.0})),
                 );
@@ -2802,6 +2827,7 @@ mod control_generation_tests {
             seq: 2,
             target: KERNEL_SUPERVISOR_TARGET.into(),
             message_type: MSG_RESTART_DOMAIN.into(),
+            policy: DeliveryPolicy::Durable,
             status: ContractStatus::Completed,
             data: Some(json!({"status":"restarted"})),
             timestamp: now_millis(),

@@ -124,10 +124,7 @@ pub fn channel(db: Arc<Mutex<Connection>>) -> (PipeSender, PipeReceiver) {
 }
 fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
     match frame {
-        KernelToDomainFrame::Receipt(r) => (
-            DeliveryPolicy::resolve(&r.target, &r.message_type) == DeliveryPolicy::Durable,
-            0,
-        ),
+        KernelToDomainFrame::Receipt(r) => (r.policy == DeliveryPolicy::Durable, 0),
         KernelToDomainFrame::Deliver(m) => {
             if m.target.starts_with("kernel.")
                 && matches!(
@@ -137,10 +134,7 @@ fn classify(frame: &KernelToDomainFrame) -> (bool, usize) {
             {
                 (false, 2)
             } else {
-                (
-                    DeliveryPolicy::resolve(&m.target, &m.message_type) == DeliveryPolicy::Durable,
-                    1,
-                )
+                (m.delivery == DeliveryPolicy::Durable, 1)
             }
         }
     }
@@ -232,7 +226,7 @@ impl PipeSender {
         }
         let (record, created) = ledger.record_delivery(msg, seq, &self.0.channel);
         if created {
-            if DeliveryPolicy::resolve(&msg.target, &msg.message_type) == DeliveryPolicy::Durable {
+            if msg.delivery == DeliveryPolicy::Durable {
                 state.pending += 1;
                 self.0.wake.notify_one();
             } else {
@@ -547,6 +541,7 @@ mod tests {
             .into(),
             targets: vec!["worker.run".into()],
             message_type: kind.into(),
+            delivery: DeliveryPolicy::from_message_type(kind),
             params: json!({"index":i}),
             timestamp: 0,
             data: json!({"text":"x".repeat(8192)}),
@@ -717,6 +712,7 @@ mod control_and_schema_tests {
                 seq: i,
                 target: "worker.run".into(),
                 message_type: "Durable".into(),
+                policy: crate::protocol::DeliveryPolicy::Durable,
                 status: ContractStatus::Completed,
                 data: Some(serde_json::json!({"payload":"x".repeat(2048)})),
                 timestamp: 0,
@@ -777,6 +773,7 @@ mod domain_state_slot_tests {
                 target: "kernel.observer".into(),
                 targets: vec!["kernel.observer".into()],
                 message_type: "ObservationEvent".into(),
+                delivery: DeliveryPolicy::Ephemeral,
                 params: serde_json::json!({}),
                 timestamp: 0,
                 data: serde_json::json!({"padding":"x".repeat(8192)}),
@@ -795,6 +792,7 @@ mod domain_state_slot_tests {
                     target: "kernel.observer".into(),
                     targets: vec!["kernel.observer".into()],
                     message_type: "ObservationEvent".into(),
+                    delivery: DeliveryPolicy::Ephemeral,
                     params: serde_json::json!({}),
                     timestamp: 0,
                     data: value,
@@ -828,6 +826,7 @@ mod domain_state_reservation_tests {
             target: "kernel.observer".into(),
             targets: vec!["kernel.observer".into()],
             message_type: "ObservationEvent".into(),
+            delivery: DeliveryPolicy::Ephemeral,
             params: json!({}),
             timestamp: 0,
             data,

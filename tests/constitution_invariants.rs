@@ -7,7 +7,8 @@
 //!   I3 有界性：非持久终态不留常驻状态，提交去重索引有界。
 
 use atelier_kernel::{
-    AtelierKernel, ContractStatus as S, KernelToDomainFrame as F, MSG_DELIVERY_VOLATILE,
+    AtelierKernel, ContractStatus as S, DeliveryPolicy, DomainToKernelFrame, KernelToDomainFrame as F,
+    MSG_DELIVERY_VOLATILE, OutboundMessage,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -79,6 +80,51 @@ fn i1_durable_result_unique_and_queryable() {
     // 内存身份已回收（有界），且不因业务结果变大
     assert_eq!(after["child_links"], before["child_links"], "{before} -> {after}");
     assert_eq!(after["durable_records"], 0);
+}
+
+#[test]
+fn sdk_declared_policy_overrides_string_inference() {
+    let k = AtelierKernel::new_in_memory().unwrap();
+    let sender = k.attach_domain("decl_sender");
+    let worker = k.attach_domain("decl_worker");
+    worker.register_handlers(&["run"]);
+    worker.drain_frames();
+
+    // message_type "Run" 会被字符串推断为 Durable；SDK 声明 Volatile 必须覆盖它。
+    let outbound = OutboundMessage {
+        seq: 1,
+        targets: vec!["decl_worker.run".into()],
+        message_type: "Run".into(),
+        delivery: Some(DeliveryPolicy::Volatile),
+        params: json!({}),
+        data: json!({}),
+    };
+    let ids = k
+        .router()
+        .handle_frame_for_instance(
+            "decl_sender",
+            sender.instance_id(),
+            DomainToKernelFrame::Send(outbound),
+        )
+        .expect("valid instance");
+    let id = &ids[0];
+    assert!(
+        k.ledger().get_persisted_record(id).is_none(),
+        "declared Volatile must not be persisted"
+    );
+
+    let F::Deliver(m) = worker.recv_frame_timeout(Duration::from_secs(5)).unwrap() else {
+        panic!("expected delivery")
+    };
+    worker.report_receipt(&m.message_id, &m.target, S::Completed, Some(json!({"ok": true})));
+    while let Ok(frame) = sender.recv_frame_timeout(Duration::from_millis(300)) {
+        let _ = frame;
+    }
+
+    let counts = k.ledger().retention_counts();
+    assert_eq!(counts["durable_records"], 0, "{counts}");
+    assert_eq!(counts["volatile_records"], 0, "{counts}");
+    assert!(k.ledger().get_persisted_record(id).is_none());
 }
 
 #[test]

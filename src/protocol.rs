@@ -87,10 +87,11 @@ pub struct HandlerDescriptor {
 }
 
 /// Delivery persistence policy resolved from `message_type` for domain messages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryPolicy {
     /// Persisted in SQLite; only bounded live metadata and explicit failures reside in memory.
+    #[default]
     Durable,
     /// Tracked in the in-memory ledger and observer only; never written to SQLite `kernel_ledger`.
     Volatile,
@@ -256,6 +257,9 @@ pub struct OutboundMessage {
     pub targets: Vec<String>,
     /// Message type (business message type or kernel storage CRUD type).
     pub message_type: String,
+    /// Delivery policy declared by the SDK (business domains do not set this).
+    #[serde(default)]
+    pub delivery: Option<DeliveryPolicy>,
     /// Upper-layer contract parameter list (JSON Object).
     #[serde(default = "default_empty_object")]
     pub params: Value,
@@ -280,6 +284,8 @@ pub struct KernelMessage {
     pub targets: Vec<String>,
     /// Message type identifier.
     pub message_type: String,
+    /// Delivery policy resolved at ingress (SDK-declared or inferred fallback).
+    pub delivery: DeliveryPolicy,
     /// Parameter list (JSON Object).
     pub params: Value,
     /// Kernel ingress timestamp (Unix milliseconds).
@@ -317,6 +323,9 @@ pub struct MessageReceipt {
     pub target: String,
     /// Message type of the original message.
     pub message_type: String,
+    /// Delivery policy of the original message (so terminal cleanup does not re-infer it).
+    #[serde(default)]
+    pub policy: DeliveryPolicy,
     /// Current contract or lifecycle status.
     pub status: ContractStatus,
     /// Optional response payload or error diagnostic JSON.

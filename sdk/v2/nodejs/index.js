@@ -120,8 +120,7 @@ class AtelierDomain {
     this._closed = false;
     this._input = null;
     this._output = null;
-    const fds = claimIpcFds();
-    if (fds) this._streams = fds;
+    this._fds = claimIpcFds();
   }
 
   // 能力 2：注册处理器
@@ -335,9 +334,11 @@ class AtelierDomain {
 
   // 能力 1：生命周期
   async runAsync({ onStart, onClose } = {}) {
-    if (!this._streams) throw new Error("IPC pipes are not configured");
+    if (!this._fds) throw new Error("IPC pipes are not configured");
+    this._streams = openStreams(this._fds);
     this._input = this._streams.input;
     this._output = this._streams.output;
+    process.stderr.write("v2 transport ready input=" + !!this._input + " output=" + !!this._output + " bridge=" + !!this._streams.bridge + "\n");
     this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: {} }, data: {} });
     this._readLoop();
     if (onStart) await onStart();
@@ -451,22 +452,25 @@ function claimIpcFds() {
   delete process.env.ATELIER_IPC_WRITE_FD;
   delete process.env.ATELIER_IPC_HANDLE_MODE;
   if (readRaw === undefined || writeRaw === undefined) return null;
-  const readFd = Number.parseInt(readRaw, 10);
-  const writeFd = Number.parseInt(writeRaw, 10);
-  if (process.platform === "win32" && (handleMode === "win32" || handleMode === "win32_handle")) {
+  return { readFd: Number.parseInt(readRaw, 10), writeFd: Number.parseInt(writeRaw, 10), handleMode };
+}
+
+function openStreams(fds) {
+  if (process.platform === "win32" && (fds.handleMode === "win32" || fds.handleMode === "win32_handle")) {
     const python = process.env.PYTHON || process.env.PYTHON_BIN || "python";
-    const bridge = spawn(python, ["-u", "-c", BRIDGE_PY, String(readFd), String(writeFd), String(process.pid)], {
+    const bridge = spawn(python, ["-u", "-c", BRIDGE_PY, String(fds.readFd), String(fds.writeFd), String(process.pid)], {
       stdio: ["pipe", "pipe", "inherit"],
       windowsHide: true,
     });
     bridge.stdout.pause();
+    bridge.on("spawn", () => process.stderr.write("v2 bridge spawned pid=" + bridge.pid + "\n"));
     bridge.on("exit", (code) => process.stderr.write("v2 bridge exit " + code + "\n"));
     bridge.on("error", (error) => process.stderr.write("v2 bridge error " + String(error && error.message) + "\n"));
     return { input: bridge.stdout, output: bridge.stdin, bridge };
   }
-  const input = new net.Socket({ fd: readFd, readable: true, writable: false });
+  const input = new net.Socket({ fd: fds.readFd, readable: true, writable: false });
   input.pause();
-  const output = new net.Socket({ fd: writeFd, readable: false, writable: true });
+  const output = new net.Socket({ fd: fds.writeFd, readable: false, writable: true });
   return { input, output, bridge: null };
 }
 

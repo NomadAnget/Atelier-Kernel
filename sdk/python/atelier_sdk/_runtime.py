@@ -85,7 +85,7 @@ class AsyncRuntime(MessageClient):
         try:self.logger.error(message,*args)
         except Exception:sys.stderr.write((message % args if args else message)+'\n')
     def _configure(self,**options):
-        defaults=dict(max_pending=1024,max_outbox=256,max_frame_bytes=16777216,shutdown_grace=5)
+        defaults=dict(max_pending=1024,max_outbox=256,max_frame_bytes=16777216,shutdown_grace=5,result_ttl_ms=30000)
         for key,value in options.items():
             if key not in defaults:raise ValueError('unknown SDK option: '+key)
             defaults[key]=value

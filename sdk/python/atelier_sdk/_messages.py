@@ -5,6 +5,8 @@ import time
 from ._errors import DomainRequestError
 
 TERMINAL=('completed','execution_failed','target_invalid','contract_invalid')
+# 基础设施目标（控制面 + 观察面）走保留通道，不被业务数据面饱和堵死；kernel.storage 属业务，不在此列。
+INFRA=frozenset({'kernel.supervisor','kernel.logger','kernel.observer','kernel.telemetry','kernel.registry','kernel.runtime','kernel.notify','kernel.contract'})
 
 class MessageClient:
     async def _await_receipt(self, future, timeout):
@@ -26,7 +28,7 @@ class MessageClient:
         if self._closed or self._async_loop is not loop:raise DomainRequestError('connection_closed')
         if not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or timeout<=0:raise ValueError('invalid timeout')
         reserved=sum(len(e['targets'])-len(e['ids']) for e in self._pending.values())
-        if len(self._results)+reserved+len(names)>self._limits['max_pending']:raise DomainRequestError('busy')
+        if not all(t in INFRA for t in names) and len(self._results)+reserved+len(names)>self._limits['max_pending']:raise DomainRequestError('busy')
         with self._write_lock:seq=self._seq_counter;self._seq_counter+=1
         future=loop.create_future();entry={'targets':names,'ids':{},'future':future};self._pending[seq]=entry
         accepted=False
@@ -54,15 +56,22 @@ class MessageClient:
         if entry and target not in entry['ids']:
             if mid in self._results:raise ValueError('kernel reused a child message ID')
             entry['ids'][target]=mid
-            self._results[mid]={'target':target,'future':asyncio.get_running_loop().create_future(),'waiters':0}
+            self._results[mid]={'target':target,'future':asyncio.get_running_loop().create_future(),'waiters':0,'evict':None}
             if len(entry['ids'])==len(entry['targets']) and not entry['future'].done():entry['future'].set_result([entry['ids'][t] for t in entry['targets']])
         result=self._results.get(mid)
-        if result and result['target']==target and not result['future'].done() and status in TERMINAL:result['future'].set_result(frame)
+        if result and result['target']==target and not result['future'].done() and status in TERMINAL:
+            result['future'].set_result(frame)
+            if not result['waiters']:
+                ttl=self._limits.get('result_ttl_ms',30000)
+                if ttl and ttl>0:
+                    result['evict']=asyncio.get_running_loop().call_later(ttl/1000.0,self._evict_result,mid)
 
     async def wait_result(self,message_id,timeout=30):
         if timeout is not None and (not isinstance(timeout,(int,float)) or not math.isfinite(timeout) or timeout<=0):raise ValueError('invalid timeout')
         entry=self._results.get(message_id)
         if entry is None:raise DomainRequestError('unknown_message',message_id=message_id)
+        handle=entry.pop('evict',None)
+        if handle:handle.cancel()
         entry['waiters']+=1
         observed=False
         try:
@@ -87,7 +96,14 @@ class MessageClient:
     def forget_result(self,message_id):
         entry=self._results.get(message_id)
         if entry and entry['waiters']:raise DomainRequestError('busy',message_id=message_id)
+        if entry:
+            handle=entry.pop('evict',None)
+            if handle:handle.cancel()
         return self._results.pop(message_id,None) is not None
+
+    def _evict_result(self,message_id):
+        entry=self._results.get(message_id)
+        if entry and not entry['waiters']:self._results.pop(message_id,None)
 
     async def request(self,target,message_type,params=None,data=None,timeout=30):
         if not isinstance(target,str):raise ValueError('request requires one target')

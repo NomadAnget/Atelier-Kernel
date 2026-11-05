@@ -50,14 +50,23 @@ class AtelierDomain:
         self._reader = None
         self._writer = None
         self._loop = None
+        self._done = None
         self._closed = False
         self._read_thread = None
 
-        read_fd = os.environ.get("ATELIER_IPC_READ_FD")
-        write_fd = os.environ.get("ATELIER_IPC_WRITE_FD")
-        if read_fd and write_fd:
-            self._reader = os.fdopen(int(read_fd), "r", encoding="utf-8", newline="\n")
-            self._writer = os.fdopen(int(write_fd), "w", encoding="utf-8", newline="\n")
+        read_raw = os.environ.pop("ATELIER_IPC_READ_FD", None)
+        write_raw = os.environ.pop("ATELIER_IPC_WRITE_FD", None)
+        handle_mode = os.environ.pop("ATELIER_IPC_HANDLE_MODE", None)
+        if read_raw and write_raw:
+            read_fd, write_fd = int(read_raw), int(write_raw)
+            if os.name == "nt" and handle_mode in ("win32", "win32_handle"):
+                import msvcrt
+
+                binary = getattr(os, "O_BINARY", 0)
+                read_fd = msvcrt.open_osfhandle(read_fd, os.O_RDONLY | binary)
+                write_fd = msvcrt.open_osfhandle(write_fd, os.O_WRONLY | binary)
+            self._reader = os.fdopen(read_fd, "r", encoding="utf-8", newline="\n")
+            self._writer = os.fdopen(write_fd, "w", encoding="utf-8", newline="\n")
 
     # ── 能力 2：注册处理器 ──────────────────────────────────────────────
     def handler(self, name):
@@ -371,6 +380,7 @@ class AtelierDomain:
         if self._reader is None or self._writer is None:
             raise RuntimeError("IPC pipes are not configured (ATELIER_IPC_READ_FD / WRITE_FD)")
         self._loop = asyncio.get_running_loop()
+        self._done = self._loop.create_future()
         self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._read_thread.start()
         self._write(
@@ -379,7 +389,7 @@ class AtelierDomain:
                 "seq": self._next_seq(),
                 "targets": ["kernel.registry"],
                 "message_type": "RegisterHandlers",
-                "params": {"domain": self.domain, "handlers": list(self._handlers)},
+                "params": {"handlers": list(self._handlers), "descriptions": {}},
                 "data": {},
             }
         )
@@ -387,12 +397,21 @@ class AtelierDomain:
             result = on_start()
             if asyncio.iscoroutine(result):
                 await result
+        try:
+            await self._done
+        finally:
+            if on_close is not None:
+                result = on_close()
+                if asyncio.iscoroutine(result):
+                    await result
 
     def run(self, **kwargs):
         asyncio.run(self.run_async(**kwargs))
 
     def shutdown(self):
         self._closed = True
+        if self._done is not None and not self._done.done() and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._done.set_result, True)
 
     def _next_seq(self):
         with self._lock:
@@ -420,7 +439,8 @@ class AtelierDomain:
             except Exception:
                 continue
             if self._loop is not None:
-                asyncio.run_coroutine_threadsafe(self._handle(frame), self._loop).result()
+                # 不阻塞读线程：处理器里可能再发 request，需要读线程继续处理回执。
+                asyncio.run_coroutine_threadsafe(self._handle(frame), self._loop)
 
     async def _handle(self, frame):
         if frame.get("frame_type") == "receipt":
@@ -469,7 +489,7 @@ class AtelierDomain:
             return
         self.report_receipt(frame.get("message_id"), target, "started")
         try:
-            result = fn(frame)
+            result = fn(_Message(frame))
             if asyncio.iscoroutine(result):
                 result = await result
             self.report_receipt(frame.get("message_id"), target, "completed", result)
@@ -490,6 +510,37 @@ SYSTEM_EVENTS = {
     "ObserverEvent": "observation",
     "TelemetryEvent": "telemetry",
 }
+
+
+class _Message:
+    """处理器收到的消息视图（只读）。"""
+
+    def __init__(self, frame):
+        self._frame = frame
+
+    @property
+    def message_id(self):
+        return self._frame.get("message_id")
+
+    @property
+    def target(self):
+        return self._frame.get("target", "")
+
+    @property
+    def message_type(self):
+        return self._frame.get("message_type", "")
+
+    @property
+    def source_domain(self):
+        return self._frame.get("source_domain", "")
+
+    @property
+    def params(self):
+        return self._frame.get("params") or {}
+
+    @property
+    def data(self):
+        return self._frame.get("data") or {}
 
 
 class _Logger:

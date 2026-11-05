@@ -527,12 +527,6 @@ impl KernelLedger {
             )
             .expect("exited source result cleanup");
         }
-        // 终态记录不再保留在内存账本里：留在这里只会堆积到配额上限。
-        mem.execute(
-            "DELETE FROM kernel_ledger WHERE message_id=?1",
-            [&r.message_id],
-        )
-        .expect("terminal ledger cleanup");
         mem.execute(
             "DELETE FROM identities WHERE message_id=?1",
             [&r.message_id],

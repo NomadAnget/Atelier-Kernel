@@ -127,15 +127,16 @@ class AsyncRuntime(MessageClient):
         return res.get('description')
 
     async def storage_insert_async(self,record_id,category,data,upsert=True,timeout=30):
-        return (await self.request('kernel.storage','StorageInsert',dict(record_id=record_id,category=category,upsert=upsert),data,timeout))['data']
+        return await self._decode_files((await self.request('kernel.storage','StorageInsert',dict(record_id=record_id,category=category,upsert=upsert),data,timeout))['data'])
     async def storage_update_async(self,record_id,data,patch=True,timeout=30):
-        return (await self.request('kernel.storage','StorageUpdate',dict(record_id=record_id,patch=patch),data,timeout))['data']
+        return await self._decode_files((await self.request('kernel.storage','StorageUpdate',dict(record_id=record_id,patch=patch),data,timeout))['data'])
     async def storage_delete_async(self,record_id=None,category=None,timeout=30):
         params={k:v for k,v in dict(record_id=record_id,category=category).items() if v is not None}
         return (await self.request('kernel.storage','StorageDelete',params,{},timeout))['data']
     async def storage_query_async(self,domain=None,record_id=None,category=None,filter=None,filter_map=None,limit=500,timeout=30):
         params={k:v for k,v in dict(domain=domain,record_id=record_id,category=category,filter=filter if filter is not None else filter_map,limit=limit).items() if v is not None}
-        return (await self.request('kernel.storage','StorageQuery',params,{},timeout))['data']
+        # 存储记录里的文件引用在读出时还原成原生文件对象。
+        return await self._decode_files((await self.request('kernel.storage','StorageQuery',params,{},timeout))['data'])
 
     async def query_logs_async(self,domain=None,domain_id=None,source_domain=None,level=None,layer=None,component=None,phase=None,since_ts=None,limit=200,timeout=30,before_id=None):
         params={'limit':limit}

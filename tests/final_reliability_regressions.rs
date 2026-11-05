@@ -220,13 +220,13 @@ fn dropped_host_cancels_long_update_and_closes_retained_supervisor() {
     let base = dir();
     let marker = base.join("candidate");
     let k = AtelierKernel::new_in_memory().unwrap();
-    k.spawn_process_domain(spec("worker", "import time; time.sleep(30)"))
+    k.spawn_process_domain(spec("worker", "import os,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); time.sleep(30)"))
         .unwrap();
     let source = k.attach_domain("controller");
     let candidate = spec(
         "worker",
         &format!(
-            "import pathlib,time; pathlib.Path({:?}).write_text('started'); time.sleep(30)",
+            "import os,pathlib,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); pathlib.Path({:?}).write_text('started'); time.sleep(30)",
             marker.to_string_lossy()
         ),
     );
@@ -266,7 +266,7 @@ fn dropped_host_cancels_long_update_and_closes_retained_supervisor() {
 fn invalid_dynamic_candidate_is_rejected_before_touching_old_process() {
     let k = AtelierKernel::new_in_memory().unwrap();
     let pid = k
-        .spawn_process_domain(spec("worker", "import time; time.sleep(30)"))
+        .spawn_process_domain(spec("worker", "import os,time; r=open(os.environ['ATELIER_IPC_IN'],'rb'); w=open(os.environ['ATELIER_IPC_OUT'],'wb'); time.sleep(30)"))
         .unwrap();
     for bad in ["bad.domain", "", " padded "] {
         assert!(k.spawn_process_domain(spec(bad, "pass")).is_err());

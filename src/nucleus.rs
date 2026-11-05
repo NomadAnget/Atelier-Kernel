@@ -98,14 +98,95 @@ pub enum Advance {
 /// 有界去重窗口：每个 source（去重键）只保留最近 `window` 个 seq 的提交身份。
 const REPLAY_WINDOW: usize = 2_048;
 
-pub struct Nucleus {
-    active: BTreeMap<String, Message>,
-    /// 去重窗口 `(dedup_key, seq) -> (logical_id, children)`，按 seq 有界。
+/// SubmissionCache —— 提交身份/去重/高水位：核外的一个推导。
+/// 旧 `allocate_submission` 映射到这里；它不持有消息状态，只记录"哪次提交对应哪些 id"。
+pub struct SubmissionCache {
+    /// 去重窗口 `(dedup_key, seq) -> Submission`，按 seq 有界。
     submissions: BTreeMap<(String, u64), Submission>,
     /// 单调高水位：会话行被回收后仍记住"到过的最高 seq"，防止老 seq 被误判成新提交。
     high_water: BTreeMap<String, u64>,
-    audit: Vec<AuditRecord>,
     next_id: u64,
+}
+
+impl Default for SubmissionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SubmissionCache {
+    pub fn new() -> Self {
+        SubmissionCache { submissions: BTreeMap::new(), high_water: BTreeMap::new(), next_id: 1 }
+    }
+
+    fn generate_id(&mut self) -> String {
+        let id = format!("msg_{}", self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// 分配提交身份：去重命中窗口则复用原身份，否则分配新 id。
+    /// 返回 `(logical_id, ids, replayed)`。
+    pub fn allocate(&mut self, dedup_key: &str, seq: u64, count: usize) -> (String, Vec<String>, bool) {
+        if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
+            return (existing.logical_id.clone(), existing.ids.clone(), true);
+        }
+        let logical_id = self.generate_id().replacen("msg_", "logical_", 1);
+        let ids: Vec<String> = (0..count).map(|_| self.generate_id()).collect();
+        let sub = Submission { logical_id: logical_id.clone(), ids: ids.clone(), replayed: false };
+        self.submissions.insert((dedup_key.to_string(), seq), sub);
+        self.high_water
+            .entry(dedup_key.to_string())
+            .and_modify(|h| *h = (*h).max(seq))
+            .or_insert(seq);
+        self.trim_window(dedup_key);
+        (logical_id, ids, false)
+    }
+
+    /// 某 logical 的全部子消息终态后，回收其提交身份。
+    pub fn reclaim_logical(&mut self, logical_id: &str) {
+        self.submissions.retain(|_, s| s.logical_id != logical_id);
+    }
+
+    /// 退役一个去重键：清掉其提交身份与高水位。
+    pub fn retire(&mut self, dedup_key: &str) {
+        self.submissions.retain(|(k, _), _| k != dedup_key);
+        self.high_water.remove(dedup_key);
+    }
+
+    /// 有界化：每个去重键只保留最近 `REPLAY_WINDOW` 个 seq 的提交身份。
+    fn trim_window(&mut self, dedup_key: &str) {
+        let keys: Vec<u64> = self
+            .submissions
+            .keys()
+            .filter(|(k, _)| k == dedup_key)
+            .map(|(_, s)| *s)
+            .collect();
+        if keys.len() > REPLAY_WINDOW {
+            let mut sorted = keys;
+            sorted.sort_unstable();
+            let keep_from = sorted[sorted.len() - REPLAY_WINDOW];
+            let stale: Vec<(String, u64)> = self
+                .submissions
+                .keys()
+                .filter(|(k, s)| k == dedup_key && *s < keep_from)
+                .cloned()
+                .collect();
+            for k in stale {
+                self.submissions.remove(&k);
+            }
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.submissions.len()
+    }
+}
+
+pub struct Nucleus {
+    active: BTreeMap<String, Message>,
+    audit: Vec<AuditRecord>,
+    cache: SubmissionCache,
     store: Option<Box<dyn Store>>,
 }
 
@@ -119,10 +200,8 @@ impl Nucleus {
     pub fn new() -> Self {
         Nucleus {
             active: BTreeMap::new(),
-            submissions: BTreeMap::new(),
-            high_water: BTreeMap::new(),
             audit: Vec::new(),
-            next_id: 1,
+            cache: SubmissionCache::new(),
             store: None,
         }
     }
@@ -159,12 +238,6 @@ impl Nucleus {
             );
         }
         n
-    }
-
-    fn generate_id(&mut self) -> String {
-        let id = format!("msg_{}", self.next_id);
-        self.next_id += 1;
-        id
     }
 
     /// 消息级基础操作：收进一条消息的活跃行。
@@ -210,21 +283,10 @@ impl Nucleus {
         policy: DeliveryPolicy,
         data: Option<serde_json::Value>,
     ) -> Submission {
-        // 去重命中：窗口内复用原身份，不产生新活跃行。
-        if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
-            let mut replay = existing.clone();
-            replay.replayed = true;
-            return replay;
+        let (logical_id, ids, replayed) = self.cache.allocate(dedup_key, seq, targets.len());
+        if replayed {
+            return Submission { logical_id, ids, replayed: true };
         }
-        // 老 seq（在窗口外但仍 ≤ 高水位）：磁盘侧审计可回放；内存核无持久层时按新提交处理。
-        if let Some(high) = self.high_water.get(dedup_key).copied() {
-            if seq > 0 && seq <= high {
-                // 已过窗口的重放：无法复用身份，只能作为新提交（at-least-once 语义由调用方决定）。
-                // 见 docs/ledger-core-rewrite.md §2 submission_high 的说明。
-            }
-        }
-        let logical_id = self.generate_id().replacen("msg_", "logical_", 1);
-        let ids: Vec<String> = targets.iter().map(|_| self.generate_id()).collect();
         for (target, id) in targets.iter().zip(&ids) {
             self.put(
                 id.clone(),
@@ -238,7 +300,6 @@ impl Nucleus {
                 data.clone(),
             );
         }
-        let sub = Submission { logical_id: logical_id.clone(), ids: ids.clone(), replayed: false };
         if policy == DeliveryPolicy::Durable {
             if let Some(store) = self.store.as_mut() {
                 for id in &ids {
@@ -248,38 +309,7 @@ impl Nucleus {
                 }
             }
         }
-        self.submissions.insert((dedup_key.to_string(), seq), sub.clone());
-        // 有界窗口 + 单调高水位
-        self.high_water
-            .entry(dedup_key.to_string())
-            .and_modify(|h| *h = (*h).max(seq))
-            .or_insert(seq);
-        self.trim_window(dedup_key);
-        sub
-    }
-
-    /// 有界化：每个去重键只保留最近 `REPLAY_WINDOW` 个 seq 的提交身份。
-    fn trim_window(&mut self, dedup_key: &str) {
-        let keys: Vec<u64> = self
-            .submissions
-            .keys()
-            .filter(|(k, _)| k == dedup_key)
-            .map(|(_, s)| *s)
-            .collect();
-        if keys.len() > REPLAY_WINDOW {
-            let mut sorted = keys;
-            sorted.sort_unstable();
-            let keep_from = sorted[sorted.len() - REPLAY_WINDOW];
-            let stale: Vec<(String, u64)> = self
-                .submissions
-                .keys()
-                .filter(|(k, s)| k == dedup_key && *s < keep_from)
-                .cloned()
-                .collect();
-            for k in stale {
-                self.submissions.remove(&k);
-            }
-        }
+        Submission { logical_id, ids, replayed: false }
     }
 
     /// 单调推进一条消息；推进到终态即自动"转审计或清除 + 回收去重窗口"。
@@ -320,12 +350,9 @@ impl Nucleus {
             self.active.remove(message_id);
             // 回收该 logical 的去重窗口：所有子消息都终态后删除提交身份。
             let logical = next.logical_id.clone();
-            let all_children_done = !self
-                .active
-                .values()
-                .any(|m| m.logical_id == logical);
+            let all_children_done = !self.active.values().any(|m| m.logical_id == logical);
             if all_children_done {
-                self.submissions.retain(|_, s| s.logical_id != logical);
+                self.cache.reclaim_logical(&logical);
             }
         } else {
             self.active.insert(message_id.to_string(), next.clone());
@@ -353,8 +380,7 @@ impl Nucleus {
                 Some(serde_json::json!({"error":"source_retired","execution_outcome":"unknown"})),
             );
         }
-        self.submissions.retain(|(k, _), _| k != dedup_key);
-        self.high_water.remove(dedup_key);
+        self.cache.retire(dedup_key);
     }
 
     /// 读活跃或审计结果（活行优先）。
@@ -368,7 +394,7 @@ impl Nucleus {
 
     /// 有界性/唯一性诊断（I3）。
     pub fn retention(&self) -> (usize, usize, usize) {
-        (self.active.len(), self.submissions.len(), self.audit.len())
+        (self.active.len(), self.cache.len(), self.audit.len())
     }
 }
 

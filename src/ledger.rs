@@ -873,7 +873,8 @@ impl KernelLedger {
             }
         } else {
             let mem = self.memory.lock();
-            if policy == DeliveryPolicy::Ephemeral && r.status.is_terminal() {
+            if r.status.is_terminal() {
+                // 非持久记录（Ephemeral + Volatile）终态即清理：两者都不落盘，也不承担事后结果查询。
                 mem.execute(
                     "DELETE FROM kernel_ledger WHERE message_id=?1",
                     [&r.message_id],
@@ -1181,10 +1182,8 @@ mod restoration_tests {
             ledger.allocate_submission("sender", 2, 1),
             (logical.clone(), ids.clone(), true)
         );
-        assert_eq!(
-            ledger.receipts_for_logical(&logical)[0].status,
-            ContractStatus::Completed
-        );
+        // Volatile 终态同样从内存账本清理，不再提供事后结果查询。
+        assert!(ledger.receipts_for_logical(&logical).is_empty());
     }
 
 }

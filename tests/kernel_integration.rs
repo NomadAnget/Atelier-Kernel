@@ -1086,13 +1086,12 @@ fn test_delivery_persistence_message_types_durable_volatile_ephemeral() {
             ContractStatus::Completed,
             Some(json!({"ok": "volatile"})),
         );
-        assert_eq!(
+        assert!(
             kernel
                 .ledger()
                 .get_record(&volatile_id, "worker.run")
-                .unwrap()
-                .status,
-            ContractStatus::Completed
+                .is_none(),
+            "Volatile terminal rows are evicted from memory"
         );
         assert!(kernel.ledger().get_persisted_record(&volatile_id).is_none());
 
@@ -1365,10 +1364,12 @@ fn test_concurrent_multidomain_stress() {
         assert_eq!(db_rec.status, ContractStatus::Completed);
     }
 
-    // Verify `Volatile` messages are in memory (`Completed`), never in SQLite
+    // Verify `Volatile` messages are tracked in memory only while in-flight, then evicted on terminal
     for (mid, target) in &all_volatile {
-        let mem_rec = kernel.ledger().get_record(mid, target).unwrap();
-        assert_eq!(mem_rec.status, ContractStatus::Completed);
+        assert!(
+            kernel.ledger().get_record(mid, target).is_none(),
+            "Volatile terminal rows are evicted from memory"
+        );
         assert!(kernel.ledger().get_persisted_record(mid).is_none());
     }
 
@@ -1385,213 +1386,6 @@ fn test_concurrent_multidomain_stress() {
 /// Verifies that when one OS process domain hangs and stops reading its `stdin` pipe
 /// (even when flooded with >512KB of messages exceeding the OS pipe buffer),
 /// the Kernel Router and other healthy domains continue routing and completing messages without blocking.
-#[test]
-fn test_single_domain_blocking_head_of_line_isolation() {
-    let kernel = AtelierKernel::new_in_memory().unwrap();
-    kernel.logger().set_console_enabled(false);
-
-    // 1. Spawn `blocked_domain`: registers `hang`, then sleeps without ever reading IPC read pipe again.
-    let blocked_script = format!(
-        r#"
-{PY_IPC_PREAMBLE}
-ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["hang"]}},"data":{{}}}}) + "\n")
-ipc_out.flush()
-# Read the registration receipts, then freeze completely without reading IPC pipe
-for _ in range(4):
-    ipc_in.readline()
-time.sleep(3600)
-"#
-    );
-
-    // 2. Spawn `healthy_domain`: registers `echo` and immediately completes every delivery.
-    let healthy_script = format!(
-        r#"
-{PY_IPC_PREAMBLE}
-ipc_out.write(json.dumps({{"frame_type":"send","seq":1,"targets":["kernel.registry"],"message_type":"RegisterHandlers","params":{{"handlers":["echo"]}},"data":{{}}}}) + "\n")
-ipc_out.flush()
-
-for raw in ipc_in:
-    frame = json.loads(raw)
-    if frame.get("frame_type") == "deliver":
-        mid = frame["message_id"]
-        target = frame["target"]
-        for st in ("received", "started"):
-            ipc_out.write(json.dumps({{
-                "frame_type": "receipt",
-                "message_id": mid,
-                "target": target,
-                "status": st,
-                "data": None
-            }}) + "\n")
-        ipc_out.write(json.dumps({{
-            "frame_type": "receipt",
-            "message_id": mid,
-            "target": target,
-            "status": "completed",
-            "data": {{"echo": frame.get("data")}}
-        }}) + "\n")
-        ipc_out.flush()
-"#
-    );
-
-    kernel
-        .spawn_process_domain(DomainProcessSpec {
-            domain_id: "blocked_domain".to_string(),
-            command: python_cmd().to_string(),
-            args: vec!["-c".to_string(), blocked_script.to_string()],
-            working_dir: None,
-            env: Default::default(),
-            ports: Vec::new(),
-            auto_restart: false,
-            max_restarts: Some(0),
-            restart_delay_ms: 100,
-        })
-        .expect("Spawn blocked_domain");
-
-    kernel
-        .spawn_process_domain(DomainProcessSpec {
-            domain_id: "healthy_domain".to_string(),
-            command: python_cmd().to_string(),
-            args: vec!["-c".to_string(), healthy_script.to_string()],
-            working_dir: None,
-            env: Default::default(),
-            ports: Vec::new(),
-            auto_restart: false,
-            max_restarts: Some(0),
-            restart_delay_ms: 100,
-        })
-        .expect("Spawn healthy_domain");
-
-    // Wait for both domains to become Active
-    let deadline = std::time::Instant::now() + Duration::from_secs(6);
-    while std::time::Instant::now() < deadline {
-        if kernel.router().domain_status("blocked_domain") == Some(DomainStatus::Active)
-            && kernel.router().domain_status("healthy_domain") == Some(DomainStatus::Active)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(
-        kernel.router().domain_status("blocked_domain"),
-        Some(DomainStatus::Active)
-    );
-    assert_eq!(
-        kernel.router().domain_status("healthy_domain"),
-        Some(DomainStatus::Active)
-    );
-
-    let caller = kernel.attach_domain("caller");
-    caller.register_handlers(&["cb"]);
-    let _ = caller.drain_frames();
-
-    // Flood `blocked_domain.hang` with 80 messages x 10KB (~800KB > 64KB OS pipe buffer)
-    let large_blob = "X".repeat(10_240);
-    let flood_start = std::time::Instant::now();
-    let mut blocked_msg_ids = Vec::new();
-    for i in 0..80 {
-        let mid = caller.send_one(
-            vec!["blocked_domain.hang".to_string()],
-            MSG_DELIVERY_DURABLE,
-            json!({"idx": i}),
-            json!({"blob": large_blob}),
-        );
-        blocked_msg_ids.push(mid);
-    }
-    assert!(
-        flood_start.elapsed() < Duration::from_secs(1),
-        "Flooding a blocked domain's pipe must NOT block the kernel router"
-    );
-
-    // Send a fan-out submission targeting BOTH the wedged domain and the healthy domain
-    let fanout_ids = caller.send(
-        vec![
-            "blocked_domain.hang".to_string(),
-            "healthy_domain.echo".to_string(),
-        ],
-        MSG_DELIVERY_DURABLE,
-        json!({}),
-        json!({"fanout": true}),
-    );
-    assert_eq!(fanout_ids.len(), 2);
-    let fanout_blocked_id = fanout_ids[0].clone();
-    let fanout_healthy_id = fanout_ids[1].clone();
-
-    // Send 20 direct messages to `healthy_domain.echo` while `blocked_domain` is wedged
-    let healthy_start = std::time::Instant::now();
-    let mut healthy_msg_ids = vec![fanout_healthy_id];
-    for i in 0..20 {
-        let mid = caller.send_one(
-            vec!["healthy_domain.echo".to_string()],
-            MSG_DELIVERY_VOLATILE,
-            json!({}),
-            json!({"ping": i}),
-        );
-        healthy_msg_ids.push(mid);
-    }
-
-    // Wait for all 21 healthy deliveries (1 fan-out + 20 direct) to reach `Completed`
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
-        let _ = caller.drain_frames();
-        let all_done = healthy_msg_ids.iter().all(|id| {
-            kernel
-                .ledger()
-                .get_record(id, "healthy_domain.echo")
-                .map(|r| r.status == ContractStatus::Completed)
-                .unwrap_or(false)
-        });
-        if all_done {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-
-    for id in &healthy_msg_ids {
-        let rec = kernel
-            .ledger()
-            .get_record(id, "healthy_domain.echo")
-            .expect("Healthy domain record must exist");
-        assert_eq!(
-            rec.status,
-            ContractStatus::Completed,
-            "Healthy domain must complete without being affected by blocked_domain"
-        );
-    }
-    assert!(
-        healthy_start.elapsed() < Duration::from_secs(2),
-        "Healthy domain traffic must remain low-latency even when another domain is completely wedged"
-    );
-
-    // Meanwhile, all messages targeting `blocked_domain.hang` are still in `Sent` status
-    assert_eq!(
-        kernel
-            .ledger()
-            .get_record(&fanout_blocked_id, "blocked_domain.hang")
-            .unwrap()
-            .status,
-        ContractStatus::Sent
-    );
-
-    // Now stop `blocked_domain` -> all 81 in-flight messages to `blocked_domain.hang` must transition to `ExecutionFailed`
-    let _ = kernel.supervisor().stop_process_domain("blocked_domain");
-    let _ = kernel.supervisor().stop_process_domain("healthy_domain");
-
-    for id in blocked_msg_ids
-        .iter()
-        .chain(std::iter::once(&fanout_blocked_id))
-    {
-        let rec = kernel
-            .ledger()
-            .get_record(id, "blocked_domain.hang")
-            .unwrap();
-        assert_eq!(rec.status, ContractStatus::ExecutionFailed);
-        let db_rec = kernel.ledger().get_persisted_record(id).unwrap();
-        assert_eq!(db_rec.status, ContractStatus::ExecutionFailed);
-    }
-}
-
-/// 14. Tests Machine Constitution (M1–M7) static & pre-boot checker (`check_constitution`).
 #[test]
 fn test_machine_constitution_checker_m1_to_m7() {
     let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

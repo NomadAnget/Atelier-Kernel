@@ -273,15 +273,17 @@ impl ObjectHub {
     }
 
     /// 按唯一 id 解析（跨域只读）。
-    /// 使用前自愈：物理文件已不存在时清掉失效索引行并返回 `None`。
+    /// 使用前自愈 + 由内核按 `metadata` 取 size（内核拥有物理文件）。
     pub fn resolve(&mut self, object_id: &str) -> Option<Object> {
-        let stale = self
-            .objects
-            .get(object_id)
-            .is_some_and(|o| !Path::new(&o.physical_path).exists());
-        if stale {
+        let path = Path::new(&self.objects.get(object_id)?.physical_path).to_path_buf();
+        if !path.exists() {
             self.remove(object_id);
             return None;
+        }
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Some(obj) = self.objects.get_mut(object_id) {
+                obj.size = meta.len();
+            }
         }
         self.objects.get(object_id).cloned()
     }

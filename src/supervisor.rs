@@ -665,6 +665,8 @@ struct DomainSupervisorInner {
     forwarders: Mutex<HashMap<(String, String), (PortBinding, Arc<Forwarder>)>>,
     retiring: Mutex<Vec<RetiringProcess>>,
     boot_config_path: RwLock<Option<std::path::PathBuf>>,
+    /// C4 项目根；spawn 时给域注入 `ATELIER_FILES_ROOT=<root>/<domain>`。
+    files_root: RwLock<Option<std::path::PathBuf>>,
     router: Arc<KernelRouter>,
     domains: RwLock<HashMap<String, Arc<DomainControl>>>,
     shutdown: Arc<AtomicBool>,
@@ -773,6 +775,11 @@ impl DomainSupervisorInner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            if let Some(root) = self.files_root.read().as_ref() {
+                let domain_root = root.join(&spec.domain_id);
+                let _ = std::fs::create_dir_all(&domain_root);
+                cmd.env("ATELIER_FILES_ROOT", domain_root.to_string_lossy().to_string());
+            }
             if let Some(dir) = &spec.working_dir {
                 cmd.current_dir(dir);
             }
@@ -1281,6 +1288,7 @@ impl DomainSupervisor {
     pub fn new(router: Arc<KernelRouter>) -> Self {
         let inner = Arc::new(DomainSupervisorInner {
             boot_config_path: RwLock::new(None),
+            files_root: RwLock::new(None),
             forwarders: Mutex::new(HashMap::new()),
             retiring: Mutex::new(Vec::new()),
             router,
@@ -1355,6 +1363,7 @@ impl DomainSupervisor {
         config: &KernelBootConfig,
     ) -> Vec<(String, Result<u32, SupervisorError>)> {
         *self.inner.boot_config_path.write() = config.source_path.clone();
+        *self.inner.files_root.write() = Some(std::path::PathBuf::from(&config.project_root));
         config
             .domains
             .iter()

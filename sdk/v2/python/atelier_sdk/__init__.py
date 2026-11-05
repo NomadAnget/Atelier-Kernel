@@ -84,6 +84,8 @@ class AtelierDomain:
         names = list(dict.fromkeys(names))
         if not names:
             raise ValueError("targets required")
+        params = self._encode_files(params or {})
+        data = self._encode_files(data or {})
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + timeout
 
@@ -375,6 +377,33 @@ class AtelierDomain:
         data = (await self.request("kernel.storage", "StorageObjectList", {}))["data"]
         return data
 
+    # ── 能力 13 配套：消息里的文件对象编解码（实例级，无全局状态）──────────
+    def _encode_files(self, value):
+        namespace = self._namespace
+        if (
+            namespace is not None
+            and hasattr(value, "read")
+            and isinstance(getattr(value, "name", None), str)
+        ):
+            object_id = namespace.object_id_for_physical(value.name)
+            if object_id:
+                return {"__atelier_file__": object_id}
+        if isinstance(value, dict):
+            return {key: self._encode_files(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._encode_files(item) for item in value]
+        return value
+
+    async def _decode_files(self, value):
+        if isinstance(value, dict):
+            if len(value) == 1 and isinstance(value.get("__atelier_file__"), str):
+                ref = await self.get_object(value["__atelier_file__"])
+                return open(ref["physical_path"], "rb+")
+            return {key: await self._decode_files(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [await self._decode_files(item) for item in value]
+        return value
+
     # ── 能力 1：生命周期 ──────────────────────────────────────────────
     async def run_async(self, *, on_start=None, on_close=None):
         if self._reader is None or self._writer is None:
@@ -489,6 +518,7 @@ class AtelierDomain:
             return
         self.report_receipt(frame.get("message_id"), target, "started")
         try:
+            frame["data"] = await self._decode_files(frame.get("data"))
             result = fn(_Message(frame))
             if asyncio.iscoroutine(result):
                 result = await result
@@ -609,3 +639,9 @@ class _FileNamespace:
     def object_id(self, path):
         physical = self._cache.get(self.normalize(path))
         return self._by_physical.get(os.path.abspath(physical)) if physical else None
+
+    def object_id_for_physical(self, physical):
+        try:
+            return self._by_physical.get(os.path.abspath(physical))
+        except Exception:  # noqa: BLE001
+            return None

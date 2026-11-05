@@ -103,6 +103,13 @@ class FileNamespace {
     const physical = this.cache.get(this.normalize(p));
     return physical ? this.byPhysical.get(path.resolve(physical)) || null : null;
   }
+  objectIdForPath(physical) {
+    try {
+      return this.byPhysical.get(path.resolve(physical)) || null;
+    } catch (_) {
+      return null;
+    }
+  }
 }
 
 class AtelierDomain {
@@ -116,6 +123,7 @@ class AtelierDomain {
     this._events = { receipt: [], log: [], notify: [], observation: [], telemetry: [] };
     this._seq = 1;
     this._namespace = null;
+    this._handles = new WeakMap();
     this._logger = new Logger(this);
     this._closed = false;
     this._input = null;
@@ -133,6 +141,8 @@ class AtelierDomain {
   async send(targets, messageType, params = {}, data = {}, options = {}) {
     const names = typeof targets === "string" ? [targets] : [...new Set(targets)];
     const timeout = options.timeout ?? 30;
+    params = this._encodeFiles(params);
+    data = this._encodeFiles(data);
     const deadline = Date.now() + timeout * 1000;
     while (this._pending.size + names.length > this._maxPending) {
       if (Date.now() >= deadline) throw new DomainRequestError("busy");
@@ -284,7 +294,67 @@ class AtelierDomain {
     this._namespace = new FileNamespace(root || process.env.ATELIER_FILES_ROOT || ".", (virtual, objectId) =>
       this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.storage"], message_type: "StorageObjectPut", params: { virtual_path: virtual, object_id: objectId }, data: {} })
     );
+    this._patchFs(this._namespace);
     return this._namespace;
+  }
+
+  _patchFs(ns) {
+    const handles = this._handles;
+    const originalPromiseOpen = fs.promises.open;
+    const wrap = (holder, name, forWrite, index = 0) => {
+      const original = holder[name];
+      if (typeof original !== "function") return;
+      holder[name] = function (...args) {
+        if (ns.matches(args[index])) args[index] = ns.resolve(args[index], forWrite);
+        return original.apply(holder, args);
+      };
+    };
+    const table = [
+      ["readFile", false],
+      ["stat", false],
+      ["access", false],
+      ["writeFile", true],
+      ["appendFile", true],
+      ["unlink", true],
+      ["rm", true],
+    ];
+    for (const [name, forWrite] of table) {
+      wrap(fs, name, forWrite);
+      wrap(fs, name + "Sync", forWrite);
+      wrap(fs.promises, name, forWrite);
+    }
+    // fs.open 的句柄不暴露路径，用 WeakMap 记住「句柄 → object_id」供编解码反查。
+    const openHandler = (holder, original, sync) => {
+      if (typeof original !== "function") return;
+      holder.open = function (p, ...rest) {
+        if (ns.matches(p)) {
+          const physical = ns.resolve(p, true);
+          const objectId = ns.objectIdForPath(physical);
+          const result = original.call(holder, physical, ...rest);
+          if (!sync && result && typeof result.then === "function") {
+            return result.then((handle) => {
+              handles.set(handle, objectId);
+              return handle;
+            });
+          }
+          return result;
+        }
+        return original.call(holder, p, ...rest);
+      };
+    };
+    openHandler(fs, fs.open, false);
+    openHandler(fs, fs.openSync, true);
+    fs.promises.open = function (p, ...rest) {
+      if (ns.matches(p)) {
+        const physical = ns.resolve(p, true);
+        const objectId = ns.objectIdForPath(physical);
+        return originalPromiseOpen.call(fs.promises, physical, ...rest).then((handle) => {
+          handles.set(handle, objectId);
+          return handle;
+        });
+      }
+      return originalPromiseOpen.call(fs.promises, p, ...rest);
+    };
   }
   async putObject(virtualPath) {
     return (await this.request("kernel.storage", "StorageObjectPut", { virtual_path: virtualPath })).data;
@@ -300,6 +370,40 @@ class AtelierDomain {
   }
   async refreshFileIndex() {
     return (await this.request("kernel.storage", "StorageObjectList", {})).data;
+  }
+
+  // 能力 13 配套：消息里的文件句柄编解码（实例级，无全局状态）
+  _encodeFiles(value) {
+    if (this._handles.has(value)) return { __atelier_file__: this._handles.get(value) };
+    if (this._namespace && value && typeof value.read === "function" && typeof value.path === "string" && value.path) {
+      const objectId = this._namespace.objectIdForPath(value.path);
+      if (objectId) return { __atelier_file__: objectId };
+    }
+    if (Array.isArray(value)) return value.map((item) => this._encodeFiles(item));
+    if (value && typeof value === "object" && value.constructor === Object) {
+      const out = {};
+      for (const [key, item] of Object.entries(value)) out[key] = this._encodeFiles(item);
+      return out;
+    }
+    return value;
+  }
+  async _decodeFiles(value) {
+    if (Array.isArray(value)) {
+      const out = [];
+      for (const item of value) out.push(await this._decodeFiles(item));
+      return out;
+    }
+    if (value && typeof value === "object" && value.constructor === Object) {
+      const keys = Object.keys(value);
+      if (keys.length === 1 && keys[0] === "__atelier_file__" && typeof value.__atelier_file__ === "string") {
+        const ref = await this.getObject(value.__atelier_file__);
+        return fs.promises.open(ref.physical_path, "r+");
+      }
+      const out = {};
+      for (const [key, item] of Object.entries(value)) out[key] = await this._decodeFiles(item);
+      return out;
+    }
+    return value;
   }
 
   // 能力 14：日志
@@ -421,6 +525,7 @@ class AtelierDomain {
     }
     this.reportReceipt(frame.message_id, frame.target, "started");
     try {
+      frame.data = await this._decodeFiles(frame.data || {});
       const result = await fn(frame);
       this.reportReceipt(frame.message_id, frame.target, "completed", result ?? {});
     } catch (error) {

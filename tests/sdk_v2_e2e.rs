@@ -36,6 +36,17 @@ async def echo(msg):
 async def add(msg):
     return {"sum": int(msg.data["a"]) + int(msg.data["b"])}
 
+@domain.handler("file")
+async def file_handler(msg):
+    domain.enable_file_interception()
+    await domain.refresh_file_index()
+    with open("vfs://out/payload.bin", "wb") as f:
+        f.write(b"v2-file-object")
+    with open("vfs://out/payload.bin", "rb") as f:
+        encoded = domain._encode_files({"f": f})
+        decoded = await domain._decode_files(encoded)
+    return {"content": decoded["f"].read().decode(), "encoded": "__atelier_file__" in encoded["f"]}
+
 domain.run()
 "#;
 
@@ -87,6 +98,18 @@ fn sdk_v2_round_trip() {
     let added = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(added.status, atelier_kernel::ContractStatus::Completed, "{:?}", added.data);
     assert_eq!(added.data.unwrap()["sum"], 42);
+
+    verifier.send(vec!["v2test.file".into()], "File", json!({}), json!({}));
+    let file_result = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(
+        file_result.status,
+        atelier_kernel::ContractStatus::Completed,
+        "{:?}",
+        file_result.data
+    );
+    let file_data = file_result.data.unwrap();
+    assert_eq!(file_data["content"], "v2-file-object");
+    assert_eq!(file_data["encoded"], true);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

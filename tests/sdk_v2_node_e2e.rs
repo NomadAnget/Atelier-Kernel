@@ -28,6 +28,18 @@ const {{ AtelierDomain }} = require({:?});
 const domain = new AtelierDomain("v2node");
 domain.handler("echo", async (msg) => ({{ echo: msg.data.value }}));
 domain.handler("add", async (msg) => ({{ sum: Number(msg.data.a) + Number(msg.data.b) }}));
+domain.handler("file", async () => {{
+  domain.enableFileInterception();
+  await domain.refreshFileIndex();
+  const fsp = require("fs/promises");
+  await fsp.writeFile("vfs://out/payload.bin", "v2-file-object");
+  const handle = await fsp.open("vfs://out/payload.bin", "r+");
+  const encoded = domain._encodeFiles({{ f: handle }});
+  const decoded = await domain._decodeFiles(encoded);
+  const buffer = Buffer.alloc(64);
+  const {{ bytesRead }} = await decoded.f.read(buffer, 0, 64, 0);
+  return {{ content: buffer.subarray(0, bytesRead).toString(), encoded: !!encoded.f.__atelier_file__, handle_path: String(handle.path || ""), ns_count: domain._namespace.byPhysical.size }};
+}});
 domain.run();
 "#,
         sdk.to_string_lossy().replace('\\', "/")
@@ -75,6 +87,18 @@ domain.run();
     let added = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(added.status, atelier_kernel::ContractStatus::Completed, "{:?}", added.data);
     assert_eq!(added.data.unwrap()["sum"], 42);
+
+    verifier.send(vec!["v2node.file".into()], "File", json!({}), json!({}));
+    let file_result = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(
+        file_result.status,
+        atelier_kernel::ContractStatus::Completed,
+        "{:?}",
+        file_result.data
+    );
+    let file_data = file_result.data.unwrap();
+    assert_eq!(file_data["content"], "v2-file-object", "{file_data}");
+    assert_eq!(file_data["encoded"], true, "{file_data}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

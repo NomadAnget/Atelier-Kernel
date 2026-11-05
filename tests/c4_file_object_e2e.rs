@@ -25,7 +25,7 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 
 const PRODUCER: &str = r#"
 from atelier_sdk import AtelierDomain
-domain = AtelierDomain()
+domain = AtelierDomain("c4")
 
 @domain.handler("write")
 async def write(msg):
@@ -37,12 +37,13 @@ async def write(msg):
         res = await domain.request("consumer.take", "Take", {}, {"report": f})
     return {"content": res["data"]["content"], "is_file": res["data"]["is_file"]}
 
-domain.run()
+import asyncio
+asyncio.run(domain.run_async())
 "#;
 
 const CONSUMER: &str = r#"
 from atelier_sdk import AtelierDomain
-domain = AtelierDomain()
+domain = AtelierDomain("c4")
 
 @domain.handler("take")
 async def take(msg):
@@ -54,12 +55,13 @@ async def take(msg):
     f.flush()
     return {"content": content, "is_file": hasattr(f, "write")}
 
-domain.run()
+import asyncio
+asyncio.run(domain.run_async())
 "#;
 
 #[test]
 fn c4_file_object_round_trip() {
-    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/python");
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/v2/python");
     let tmp = std::env::temp_dir().join(format!("c4-file-obj-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp).unwrap();
     let db = tmp.join("kernel.db");

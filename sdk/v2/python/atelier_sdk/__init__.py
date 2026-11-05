@@ -165,7 +165,8 @@ class AtelierDomain:
 
     # ── 能力 8：本域存储（唯一实现 `_storage`，其余只转发）──────────────
     async def _storage(self, message_type, params, data=None):
-        return (await self.request("kernel.storage", message_type, params, data or {}))["data"]
+        result = (await self.request("kernel.storage", message_type, params, data or {}))["data"]
+        return await self._decode_files(result)
 
     async def storage_insert(self, record_id, category, data, upsert=True):
         return await self._storage(

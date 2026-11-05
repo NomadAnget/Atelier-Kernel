@@ -25,7 +25,7 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 
 const DOMAIN: &str = r#"
 from atelier_sdk import AtelierDomain
-domain = AtelierDomain()
+domain = AtelierDomain("c4")
 
 def find_file(value):
     if isinstance(value, dict):
@@ -55,12 +55,13 @@ async def check(msg):
     content = handle.read().decode() if handle is not None else None
     return {"content": content, "has_file_object": handle is not None}
 
-domain.run()
+import asyncio
+asyncio.run(domain.run_async())
 "#;
 
 #[test]
 fn c4_storage_file_object_round_trip() {
-    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/python");
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/v2/python");
     let tmp = std::env::temp_dir().join(format!("c4-store-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp).unwrap();
     let db = tmp.join("kernel.db");

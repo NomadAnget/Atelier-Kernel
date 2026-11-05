@@ -129,20 +129,33 @@ Naming rules:
 
 | Capability | Python | Node |
 |---|---|---|
-| lifecycle | `run` / `run_async` / `shutdown` / `close` | `run` / `runAsync` / `shutdown` / `close` |
-| handler | `handler(name)` | `handler(name)` |
+| lifecycle | `run_async(on_start=, on_close=)` / `shutdown` | `runAsync({onStart, onClose})` / `run` / `shutdown` |
+| handler | `handler(name)`（docstring 注册描述） | `handler(name, fn, description?)` |
 | send / request | `send` / `request` | `send` / `request` |
-| wait / forget | `wait_result` / `wait_results` / `forget_result` | `waitResult` / `waitResults` / `forgetResult` |
+| wait / forget | `wait_result` / `wait_results` / `forget_result` | `waitResult` / `forgetResult` |
 | report receipt | `report_receipt` | `reportReceipt` |
-| storage CRUD (returns data) | `storage_insert/update/delete/query` | `storageInsert/Update/Delete/Query` |
-| logs | `query_logs` | `queryLogs` |
-| registry | `query_handlers` / `discover_handlers` / `get_handler_description` | `queryHandlers` / `discoverHandlers` / `getHandlerDescription` |
-| runtime | `query_runtime` | `queryRuntime` |
-| observer | `query_observer` / `on_observation` | `queryObserver` / `onObservation` |
-| supervisor | `supervisor_start/stop/restart/update` | `supervisor.start/stop/restart/update` |
-| subscribe | `subscribe_logs/telemetry/notify/observer` (+ `unsubscribe_*`) | same names, camelCase |
+| events | `on_receipt/log/notify/observation/telemetry` | `onReceipt/Log/Notify/Observation/Telemetry` |
+| storage CRUD | `storage_insert/update/delete/query` | `storageInsert/Update/Delete/Query` |
+| queries | `query_logs/handlers/runtime/observer/progress` | `queryLogs/Handlers/Runtime/Observer/Progress` |
+| supervisor | `supervisor_start/stop/restart/update` | `supervisorStart/Stop/Restart/Update` |
+| subscribe | `subscribe_*` / `unsubscribe_*` | `subscribe*` / `unsubscribe*` |
 | notify | `notify` | `notify` |
-| progress | `query_progress` | `queryProgress` |
-| C4 objects | `put_object` / `get_object` / `delete_object` / `file_object_id` / `enable_file_interception` / `refresh_file_index` | `putObject` / `getObject` / `deleteObject` / `fileObjectId` / `enableFileInterception` / `refreshFileIndex` |
+| C4 objects | `enable_file_interception` / `put_object` / `get_object` / `delete_object` / `file_object_id` / `refresh_file_index` | `enableFileInterception` / `putObject` / `getObject` / `deleteObject` / `fileObjectId` / `refreshFileIndex` |
 | ports | `bindings` | `bindings` |
-| logger | `logger` / `attach_stdlib_logging` | `logger` / `attachStdlibLogging` |
+| logger | `logger` | `logger` |
+
+## v0.2.0：传输层与 SDK 重写
+
+**传输**：内核不再向域传递 fd/HANDLE，改为创建两条**单向命名端点**并由域主动连接：
+
+| 环境变量 | 方向 | 域侧打开方式 |
+|---|---|---|
+| `ATELIER_IPC_IN` | 内核 → 域 | Python `open(IN, "rb", buffering=0)`；Node `net.createConnection(IN)` |
+| `ATELIER_IPC_OUT` | 域 → 内核 | Python `open(OUT, "wb", buffering=0)`；Node `net.createConnection(OUT)` |
+
+- Windows 用命名管道（`\\.\pipe\atelier-<domain>-<nonce>-{in,out}`），Unix 用 domain socket；
+- 两条管道各自单向——**不要**合成一条双向管道：Windows 上同一句柄的阻塞读会串行化写；
+- 域在 `on_start` 完成后，若带 `ATELIER_MANAGED_READY=1`，必须发 `{"frame_type":"ready"}` 帧，内核据此激活端口转发。
+
+**SDK**：单层 `AtelierDomain`、全异步、无门面客户端类、无同步 API、无 `_async` 别名。旧版 `domain.registry` / `domain.supervisor` / `attach_stdlib_logging` / `discover_handlers` / `get_handler_description` / `close` 均已移除，对应能力改为上表中的主类方法。
+

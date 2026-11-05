@@ -1,350 +1,130 @@
-export interface DeliveryMessage<TData = Record<string, any>, TParams = Record<string, any>> {
-  logical_id: string;
-  signal?: AbortSignal;
+// Atelier SDK v2 type definitions — single-layer AtelierDomain.
+// 15 capabilities: lifecycle / handlers / send / request / wait / receipts / events /
+// storage / queries / supervisor / subscribe / notify / C4 objects / logger / ports.
+
+export type Json = Record<string, any>;
+
+export interface MessageReceipt {
   message_id: string;
-  source_domain: string;
   target: string;
-  targets: string[];
+  status: "sent" | "received" | "started" | "completed" | "execution_failed" | "target_invalid" | "contract_invalid";
+  data?: Json;
+  seq?: number;
+  [key: string]: any;
+}
+
+export interface Message {
+  message_id: string;
+  target: string;
   message_type: string;
-  params: TParams;
-  data: TData;
+  source_domain: string;
+  params: Json;
+  data: Json;
 }
 
-export interface StorageQueryOptions {
-  domain?: string;
-  recordId?: string;
-  record_id?: string;
-  category?: string;
-  filter?: Record<string, any>;
-  filter_map?: Record<string, any>;
-  limit?: number;
-}
+export type Handler = (msg: Message) => unknown | Promise<unknown>;
 
-export interface StorageDeleteOptions {
-  recordId?: string;
-  record_id?: string;
-  category?: string;
-}
-
-export interface AtelierDomainOptions {
-  domain?: string;
-  stageDelayMs?: number;
+export interface DomainOptions {
   maxPending?: number;
-  maxOutbox?: number;
-  maxFrameBytes?: number;
-  shutdownGrace?: number;
+  resultTtlMs?: number;
 }
 
-export interface DomainContext {
-  logical_id?:string;
-  message_id?:string; source_domain?:string; target?:string; message_type?:string;
-}
-/** null waits for a terminal receipt until cancellation/disconnect; send admission remains bounded. */
-export interface RequestOptions { timeout?:number|null; signal?:AbortSignal; delivery?: 'durable'|'volatile'|'ephemeral'; }
-export interface TargetResult {
-  message_id:string;
-  target:string|null;status:string;receipt:Record<string,any>|null;
-  error:{status:string;data:any;message_id:string|null}|null;
-}
-
-export interface LogOptions {
-  layer?: string;
-  component?: string;
-  phase?: string;
-  consoleOnly?: boolean;
-  console_only?: boolean;
-}
-
-export interface ProgressOptions {
-  key?: string | null;
-  frac?: number | null;
-  waiting?: boolean;
-  done?: boolean;
-  state?: "running" | "completed" | "failed" | "cancelled" | null;
-  layer?: string;
-  component?: string;
-}
-
-export class DomainLogger {
-  defaultLayer: string;
-  defaultComponent: string;
-  constructor(domain: AtelierDomain, defaultLayer?: string, defaultComponent?: string);
-  debug(msg: any, opts?: LogOptions): void;
-  info(msg: any, opts?: LogOptions): void;
-  warn(msg: any, opts?: LogOptions): void;
-  warning(msg: any, opts?: LogOptions): void;
-  error(msg: any, opts?: LogOptions): void;
-  critical(msg: any, opts?: LogOptions): void;
-  phase(level: string, phaseName: string, msg: any, opts?: LogOptions): void;
-  progress(msg: any, options?: ProgressOptions): void;
-  queryLogs(options?: QueryLogsOptions, requestOptions?: RequestOptions): Promise<QueryLogsResponse>;
-  queryLogsAsync(options?: QueryLogsOptions, requestOptions?: RequestOptions): Promise<QueryLogsResponse>;
-  queryProgress(requestOptions?: RequestOptions): Promise<QueryProgressResponse>;
-  queryProgressAsync(requestOptions?: RequestOptions): Promise<QueryProgressResponse>;
-}
-
-export class DomainExecutionFailed extends Error {
-  readonly payload: Record<string, any>;
-  constructor(payload: Record<string, any>);
-}
-
-export interface QueryHandlersOptions {
-  domain?: string;
-  target?: string;
-  handler?: string;
-  includeInactive?: boolean;
-  include_inactive?: boolean;
-}
-
-export interface HandlerDescriptor {
-  target: string;
-  domain: string;
-  handler: string;
-  description: string;
+export declare class DomainRequestError extends Error {
   status: string;
+  data: Json | null;
+  message_id: string | null;
 }
 
-export interface QueryHandlersResponse {
-  count: number;
-  routes: string[];
-  handlers: HandlerDescriptor[];
-  description?: string | null;
+export declare class DomainExecutionFailed extends Error {
+  payload: Json;
 }
 
-export interface QueryLogsOptions {
-  domain?: string;
-  domainId?: string;
-  domain_id?: string;
-  source_domain?: string;
-  level?: string;
-  layer?: string;
-  component?: string;
-  phase?: string;
-  sinceTs?: number;
-  since_ts?: number;
-  limit?: number;
-  beforeId?: number;
-  before_id?: number;
+export declare class FileNamespace {
+  root: string;
+  prefix: string;
+  matches(path: string): boolean;
+  normalize(path: string): string;
+  resolve(path: string, forWrite: boolean): string;
+  objectId(path: string): string | null;
+  objectIdForPath(physical: string): string | null;
 }
 
-export interface QueryLogsResponse {
-  logs: Array<Record<string, any>>;
-  /** Number of logs in this page, not the database total. */
-  total: number;
-  has_more: boolean;
-  next_before_id: number | null;
+export interface Logger {
+  debug(message: string, fields?: Json): void;
+  info(message: string, fields?: Json): void;
+  warn(message: string, fields?: Json): void;
+  error(message: string, fields?: Json): void;
 }
 
-export interface QueryProgressResponse {
-  progress: Array<Record<string, any>>;
-  count: number;
-}
-
-export class DomainTelemetry {
-  constructor(domain: AtelierDomain);
-  emit(metricName: string, value: any, tags?: Record<string, any>): number;
-  emitAsync(metricName: string, value: any, tags?: Record<string, any>, options?: RequestOptions): Promise<Record<string, any>>;
-}
-
-export class DomainStorageClient {
-  constructor(domain: AtelierDomain);
-  insert(recordId: string, category: string, data: any, upsert?: boolean): Promise<string>;
-  update(recordId: string, data: any, patch?: boolean): Promise<string>;
-  delete(options?: StorageDeleteOptions): Promise<string>;
-  delete(recordId?: string, category?: string): Promise<string>;
-  query(options?: StorageQueryOptions): Promise<string>;
-  query(domain?: string, recordId?: string, category?: string, filter?: Record<string, any>, limit?: number): Promise<string>;
-}
-
-export class DomainRegistryClient {
-  constructor(domain: AtelierDomain);
-  queryHandlers(options?: QueryHandlersOptions, requestOptions?: RequestOptions): Promise<QueryHandlersResponse>;
-  getDescription(target: string, requestOptions?: RequestOptions): Promise<string | null>;
-}
-
-export interface QueryRuntimeOptions {
-  domain?: string;
-  domainId?: string;
-  domain_id?: string;
-}
-
-export interface DomainAssembly {
-  domain_id: string;
-  status: string;
-  instance_id: number;
-  routes: string[];
-  handlers: Record<string, string>;
-  process?: Record<string, any>;
-}
-
-export class DomainRuntimeClient {
-  constructor(domain: AtelierDomain);
-  query(options?: QueryRuntimeOptions | string, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  listDomains(requestOptions?: RequestOptions): Promise<DomainAssembly[]>;
-  getDomain(domainId: string, requestOptions?: RequestOptions): Promise<DomainAssembly | null>;
-}
-
-export interface QueryObserverOptions {
-  limit?: number;
-  messageId?: string;
-  message_id?: string;
-  target?: string;
-  sourceDomain?: string;
-  source_domain?: string;
-}
-
-export class DomainObserverClient {
-  readonly domainStates: {stream_id:string; revision:number; domains:Array<{domain_id:string;instance_id:number;generation:number;status:string;revision:number;timestamp:number;reason:string|null}>}|null;
-  constructor(domain: AtelierDomain);
-  query(options?: QueryObserverOptions, requestOptions?: RequestOptions): Promise<Array<Record<string, any>>>;
-  subscribe(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  unsubscribe(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-}
-
-export interface SupervisorUpdateOptions {
+export declare class AtelierDomain {
+  constructor(domain: string, options?: DomainOptions);
   domain: string;
-  spec?: Record<string, any>;
-  probeHandler?: string;
-  probe_handler?: string;
-  timeoutMs?: number;
-  timeout_ms?: number;
+
+  // 2. handlers
+  handler(name: string, fn: Handler, description?: string): this;
+
+  // 3/4/5. messages
+  send(targets: string | string[], messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<string | string[]>;
+  request(target: string, messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<MessageReceipt>;
+  waitResult(messageId: string, options?: { timeout?: number }): Promise<MessageReceipt>;
+  forgetResult(messageId: string): boolean;
+
+  // 6. receipts
+  reportReceipt(messageId: string, target: string, status: string, data?: Json): void;
+
+  // 7. events
+  onReceipt(fn: (frame: MessageReceipt) => void): this;
+  onLog(fn: (payload: Json) => void): this;
+  onNotify(fn: (payload: Json) => void): this;
+  onObservation(fn: (payload: Json) => void): this;
+  onTelemetry(fn: (payload: Json) => void): this;
+
+  // 8. storage
+  storageInsert(recordId: string, category: string, data: Json, upsert?: boolean): Promise<Json>;
+  storageUpdate(recordId: string, data: Json, patch?: boolean): Promise<Json>;
+  storageDelete(recordId?: string, category?: string): Promise<Json>;
+  storageQuery(options?: { domain?: string; record_id?: string; category?: string; filter?: Json; limit?: number }): Promise<Json>;
+
+  // 9. queries
+  queryLogs(params?: Json): Promise<Json>;
+  queryHandlers(params?: Json): Promise<Json>;
+  queryRuntime(params?: Json): Promise<Json>;
+  queryObserver(params?: Json): Promise<Json>;
+  queryProgress(): Promise<Json>;
+
+  // 10. supervisor
+  supervisorStart(domain: string, spec?: Json): Promise<Json>;
+  supervisorStop(domain: string): Promise<Json>;
+  supervisorRestart(domain: string): Promise<Json>;
+  supervisorUpdate(domain: string, spec?: Json, probeHandler?: string): Promise<Json>;
+
+  // 11. subscribe
+  subscribeLogs(): Promise<Json>;
+  unsubscribeLogs(): Promise<Json>;
+  subscribeTelemetry(): Promise<Json>;
+  unsubscribeTelemetry(): Promise<Json>;
+  subscribeNotify(): Promise<Json>;
+  unsubscribeNotify(): Promise<Json>;
+  subscribeObserver(): Promise<Json>;
+  unsubscribeObserver(): Promise<Json>;
+
+  // 12. notify
+  notify(level: string, message: string, title?: string, details?: Json): Promise<Json>;
+
+  // 13. C4 objects
+  enableFileInterception(root?: string): FileNamespace;
+  putObject(virtualPath: string): Promise<Json>;
+  getObject(objectId: string): Promise<Json>;
+  deleteObject(objectId: string): Promise<Json>;
+  fileObjectId(virtualPath: string): string | null;
+  refreshFileIndex(): Promise<Json>;
+
+  // 14/15. logger and ports
+  readonly logger: Logger;
+  readonly bindings: Record<string, { host: string; port: number }>;
+
+  // 1. lifecycle
+  runAsync(options?: { onStart?: () => unknown | Promise<unknown>; onClose?: () => unknown | Promise<unknown> }): Promise<void>;
+  run(options?: { onStart?: () => unknown | Promise<unknown>; onClose?: () => unknown | Promise<unknown> }): Promise<void>;
+  shutdown(): void;
 }
-
-export class DomainSupervisorClient {
-  constructor(domain: AtelierDomain);
-  start(domain: string, spec?: Record<string, any>, options?: RequestOptions): Promise<Record<string, any>>;
-  stop(domain: string, options?: RequestOptions): Promise<Record<string, any>>;
-  restart(domain: string, options?: RequestOptions): Promise<Record<string, any>>;
-  update(domain: string, spec?: Record<string, any>, options?: Partial<SupervisorUpdateOptions> & RequestOptions): Promise<Record<string, any>>;
-}
-
-export class AtelierDomain {
-  readonly bindings: Record<string, {host: string; port: number}>;
-  readonly context:DomainContext;
-  readonly logger: DomainLogger;
-  readonly telemetry: DomainTelemetry;
-  readonly storage: DomainStorageClient;
-  readonly registry: DomainRegistryClient;
-  readonly runtime: DomainRuntimeClient;
-  readonly observer: DomainObserverClient;
-  readonly supervisor: DomainSupervisorClient;
-  shutdown(options?:{grace?:number}):Promise<void>;
-  requestMany(messageIds:string[],options?:RequestOptions):Promise<TargetResult[]>;
-  waitResult(messageId:string,options?:RequestOptions):Promise<Record<string,any>>;
-  waitResults(messageIds:string[],options?:RequestOptions):Promise<TargetResult[]>;
-  forgetResult(messageId:string):boolean;
-  queryHandlersAsync(options?:QueryHandlersOptions,requestOptions?:RequestOptions):Promise<QueryHandlersResponse>;
-  getHandlerDescriptionAsync(target:string,requestOptions?:RequestOptions):Promise<string|null>;
-  queryLogsAsync(options?:QueryLogsOptions,requestOptions?:RequestOptions):Promise<QueryLogsResponse>;
-  queryProgressAsync(requestOptions?:RequestOptions):Promise<QueryProgressResponse>;
-  queryRuntimeAsync(options?: QueryRuntimeOptions, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  queryObserverAsync(options?: QueryObserverOptions, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  subscribeObserverAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  unsubscribeObserverAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  supervisorStartAsync(options: { domain: string; spec?: Record<string, any> }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  supervisorStopAsync(options: { domain: string }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  supervisorRestartAsync(options: { domain: string }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  supervisorUpdateAsync(options: SupervisorUpdateOptions, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  subscribeLogsAsync(options?: { level?: string; sourceDomain?: string; source_domain?: string }, requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  unsubscribeLogsAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  subscribeTelemetryAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  unsubscribeTelemetryAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  subscribeNotifyAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  unsubscribeNotifyAsync(requestOptions?: RequestOptions): Promise<Record<string, any>>;
-  storageInsertAsync(recordId:string,category:string,data:Record<string,any>,upsert?:boolean,options?:RequestOptions):Promise<any>;
-  storageUpdateAsync(recordId:string,data:Record<string,any>,patch?:boolean,options?:RequestOptions):Promise<any>;
-  storageDeleteAsync(options?:StorageDeleteOptions,requestOptions?:RequestOptions):Promise<any>;
-  storageQueryAsync(options?:StorageQueryOptions,requestOptions?:RequestOptions):Promise<any>;
-  runAsync(options?: { onStart?: () => any | Promise<any>; onClose?: () => any | Promise<any> }): Promise<void>;
-  close(): void;
-  request(target: string, messageType: string, params?: Record<string, any>, data?: Record<string, any>, options?: { timeout?: number; signal?: AbortSignal }): Promise<Record<string, any>>;
-  constructor(options?: AtelierDomainOptions);
-  handler<TData = Record<string, any>, TParams = Record<string, any>>(
-    name: string,
-    fn: (msg: DeliveryMessage<TData, TParams>, domain: AtelierDomain) => any | Promise<any>
-  ): this;
-  on<TData = Record<string, any>, TParams = Record<string, any>>(
-    name: string,
-    fn: (msg: DeliveryMessage<TData, TParams>, domain: AtelierDomain) => any | Promise<any>
-  ): this;
-  onReceipt(fn: (receiptFrame: Record<string, any>) => void): this;
-  onLog(callback: (record: Record<string, any>) => any | Promise<any>, options?: { level?: string; sourceDomain?: string; source_domain?: string }): this;
-  onTelemetry(callback: (metric: Record<string, any>) => any | Promise<any>): this;
-  onNotify(callback: (alert: Record<string, any>) => any | Promise<any>): this;
-  onObservation(callback: (event: Record<string, any>) => any | Promise<any>): this;
-  notify(level: string, message: string, title?: string, details?: Record<string, any>): number;
-  notifyAsync(level: string, message: string, title?: string, details?: Record<string, any>, options?: RequestOptions): Promise<Record<string, any>>;
-  discoverHandlers(options?: QueryHandlersOptions): Promise<QueryHandlersResponse>;
-  queryHandlers(options?:QueryHandlersOptions):Promise<string>;
-  queryHandlers(domain?:string,target?:string,handler?:string):Promise<string>;
-  queryLogs(options?:QueryLogsOptions):Promise<string>;
-  queryProgress():Promise<string>;
-  send(target:string,messageType:string,params?:Record<string,any>,data?:any,options?:RequestOptions):Promise<string>;
-  send(targets:string[],messageType:string,params?:Record<string,any>,data?:any,options?:RequestOptions):Promise<string[]>;
-  storageInsert(recordId:string,category:string,data:any,upsert?:boolean):Promise<string>;
-  storageUpdate(recordId:string,data:any,patch?:boolean):Promise<string>;
-  storageDelete(options?:StorageDeleteOptions):Promise<string>;
-  storageDelete(recordId?:string,category?:string):Promise<string>;
-  storageQuery(options?:StorageQueryOptions):Promise<string>;
-  storageQuery(domain?:string,recordId?:string,category?:string,filter?:Record<string,any>,limit?:number):Promise<string>;
-  putObject(virtualPath:string):Promise<string>;
-  getObject(objectId:string):Promise<string>;
-  deleteObject(objectId:string):Promise<string>;
-  enableFileInterception(root?:string|null,prefix?:string):any;
-  refreshFileIndex(options?:{timeout?:number}):Promise<any[]>;
-  reportReceipt(
-    messageId: string,
-    target: string,
-    status: "received" | "started" | "completed" | "execution_failed",
-    data?: Record<string, any> | null
-  ): void;
-  run(): void;
-}
-
-export class DomainRequestError extends Error {
-  readonly status: string;
-  readonly data: any;
-  readonly message_id: string | null;
-  constructor(status: string, data?: any, messageId?: string | null);
-}
-
-export const KERNEL_REGISTRY_TARGET: "kernel.registry";
-export const KERNEL_STORAGE_TARGET: "kernel.storage";
-export const KERNEL_LOGGER_TARGET: "kernel.logger";
-export const KERNEL_TELEMETRY_TARGET: "kernel.telemetry";
-export const KERNEL_NOTIFY_TARGET: "kernel.notify";
-export const KERNEL_RUNTIME_TARGET: "kernel.runtime";
-export const KERNEL_OBSERVER_TARGET: "kernel.observer";
-export const KERNEL_SUPERVISOR_TARGET: "kernel.supervisor";
-
-export const MSG_REGISTER_HANDLERS: "RegisterHandlers";
-export const MSG_UNREGISTER_HANDLERS: "UnregisterHandlers";
-export const MSG_QUERY_HANDLERS: "QueryHandlers";
-export const MSG_QUERY_LOGS: "QueryLogs";
-export const MSG_QUERY_PROGRESS: "QueryProgress";
-export const MSG_SUBSCRIBE_LOGS: "SubscribeLogs";
-export const MSG_UNSUBSCRIBE_LOGS: "UnsubscribeLogs";
-export const MSG_SUBSCRIBE_TELEMETRY: "SubscribeTelemetry";
-export const MSG_UNSUBSCRIBE_TELEMETRY: "UnsubscribeTelemetry";
-export const MSG_SUBSCRIBE_NOTIFY: "SubscribeNotify";
-export const MSG_UNSUBSCRIBE_NOTIFY: "UnsubscribeNotify";
-export const MSG_QUERY_RUNTIME: "QueryRuntime";
-export const MSG_QUERY_DOMAIN_ASSEMBLY: "QueryDomainAssembly";
-export const MSG_QUERY_OBSERVER: "QueryObserver";
-export const MSG_SUBSCRIBE_OBSERVER: "SubscribeObserver";
-export const MSG_UNSUBSCRIBE_OBSERVER: "UnsubscribeObserver";
-export const MSG_START_DOMAIN: "StartDomain";
-export const MSG_STOP_DOMAIN: "StopDomain";
-export const MSG_RESTART_DOMAIN: "RestartDomain";
-export const MSG_UPDATE_DOMAIN: "UpdateDomain";
-export const MSG_SYSTEM_LOG_EVENT: "LogEvent";
-export const MSG_SYSTEM_TELEMETRY_EVENT: "TelemetryEvent";
-export const MSG_SYSTEM_NOTIFY_EVENT: "NotifyEvent";
-export const MSG_SYSTEM_OBSERVER_EVENT: "ObservationEvent";
-export const MSG_STORAGE_INSERT: "StorageInsert";
-export const MSG_STORAGE_QUERY: "StorageQuery";
-export const MSG_STORAGE_UPDATE: "StorageUpdate";
-export const MSG_STORAGE_DELETE: "StorageDelete";
-export const MSG_DELIVERY_DURABLE: "Durable";
-export const MSG_DELIVERY_VOLATILE: "Volatile";
-export const MSG_DELIVERY_EPHEMERAL: "Ephemeral";

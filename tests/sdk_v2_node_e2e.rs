@@ -21,7 +21,7 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 #[test]
 fn sdk_v2_node_round_trip() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let sdk = root.join("sdk/v2/nodejs/index.js");
+    let sdk = root.join("sdk/nodejs/index.js");
     let script = format!(
         r#"
 const {{ AtelierDomain }} = require({:?});

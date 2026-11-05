@@ -57,7 +57,7 @@ asyncio.run(domain.run_async())
 
 #[test]
 fn c4_multi_process_object_round_trip() {
-    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/v2/python");
+    let sdk = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sdk/python");
     let tmp = std::env::temp_dir().join(format!("c4-e2e-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&tmp).unwrap();
     let db = tmp.join("kernel.db");

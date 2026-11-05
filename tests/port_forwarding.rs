@@ -81,14 +81,14 @@ d.run(on_start=start)
             vec![
                 "-e".into(),
                 js.into(),
-                root.join("sdk/v2/nodejs").to_string_lossy().into(),
+                root.join("sdk/nodejs").to_string_lossy().into(),
                 version.into(),
                 delay.into(),
             ]
         } else {
             vec!["-c".into(), py.clone(), version.into(), delay.into()]
         };
-        serde_json::from_value(json!({"domain_id":"service","command":if node{"node"}else if cfg!(windows){"python"}else{"python3"},"args":args,"env":{"PYTHONPATH":root.join("sdk/v2/python").to_string_lossy()},"auto_restart":false,"ports":[{"name":"http","listen":public},{"name":"other","listen":second}]})).unwrap()
+        serde_json::from_value(json!({"domain_id":"service","command":if node{"node"}else if cfg!(windows){"python"}else{"python3"},"args":args,"env":{"PYTHONPATH":root.join("sdk/python").to_string_lossy()},"auto_restart":false,"ports":[{"name":"http","listen":public},{"name":"other","listen":second}]})).unwrap()
     };
     let k = AtelierKernel::new_in_memory().unwrap();
     k.supervisor()

@@ -1,17 +1,13 @@
 {
   "name": "atelier-sdk",
-  "version": "0.1.19",
-  "description": "Official Node.js / TypeScript Domain SDK for Atelier Kernel (Stdio JSON-Lines IPC, 4-stage receipts, and Storage-as-Messaging)",
+  "version": "0.2.0",
+  "description": "Official Node.js Domain SDK for Atelier Kernel (named-pipe IPC, 4-stage receipts, C4 virtual files)",
   "main": "index.js",
   "types": "index.d.ts",
   "files": [
     "index.js",
     "index.d.ts",
     "README.md",
-    "runtime.js",
-    "messages.js",
-    "files.js",
-    "codec.js",
     "vfs-loader.mjs",
     "vfs-hooks.mjs",
     "vfs-shim.mjs"
@@ -25,6 +21,6 @@
   "author": "Atelier Kernel Team",
   "license": "MIT",
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   }
 }

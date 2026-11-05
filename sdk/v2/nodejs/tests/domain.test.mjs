@@ -130,3 +130,57 @@ test("_decodeFiles leaves non-references untouched", async () => {
   const domain = makeDomain();
   assert.deepEqual(await domain._decodeFiles({ n: 1, s: "x" }), { n: 1, s: "x" });
 });
+
+// ── C4 CRUD / 事件 / 日志 / 端口 ──────────────────────────────────────
+test("putObject routes to kernel.storage", async () => {
+  const domain = makeDomain();
+  const frame = await capture(domain, domain.putObject("evidence/x"));
+  assert.equal(frame.targets[0], "kernel.storage");
+  assert.equal(frame.message_type, "StorageObjectPut");
+  assert.deepEqual(frame.params, { virtual_path: "evidence/x" });
+});
+
+test("getObject routes to kernel.storage", async () => {
+  const domain = makeDomain();
+  const frame = await capture(domain, domain.getObject("abc"));
+  assert.equal(frame.message_type, "StorageObjectGet");
+  assert.deepEqual(frame.params, { object_id: "abc" });
+});
+
+test("deleteObject routes to kernel.storage", async () => {
+  const domain = makeDomain();
+  const frame = await capture(domain, domain.deleteObject("abc"));
+  assert.equal(frame.message_type, "StorageObjectDelete");
+  assert.deepEqual(frame.params, { object_id: "abc" });
+});
+
+test("events dispatch to callbacks", () => {
+  const domain = makeDomain();
+  const seen = [];
+  domain.onLog((payload) => seen.push(payload));
+  domain._emit("log", { level: "info" });
+  domain._emit("log", { level: "warn" });
+  assert.deepEqual(seen.map((item) => item.level), ["info", "warn"]);
+});
+
+test("event callback failure does not break emit", () => {
+  const domain = makeDomain();
+  domain.onTelemetry(() => {
+    throw new Error("boom");
+  });
+  domain._emit("telemetry", { ok: true });
+});
+
+test("bindings defaults to an empty object", () => {
+  assert.deepEqual(makeDomain().bindings, {});
+});
+
+test("logger writes to kernel.logger", () => {
+  const domain = makeDomain();
+  domain.logger.info("hello");
+  const frame = domain.frames[domain.frames.length - 1];
+  assert.equal(frame.targets[0], "kernel.logger");
+  assert.equal(frame.message_type, "Log");
+  assert.equal(frame.data.message, "hello");
+  assert.equal(frame.params.level, "info");
+});

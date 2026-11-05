@@ -40,6 +40,12 @@ domain.handler("file", async () => {{
   const {{ bytesRead }} = await decoded.f.read(buffer, 0, 64, 0);
   return {{ content: buffer.subarray(0, bytesRead).toString(), encoded: !!encoded.f.__atelier_file__, handle_path: String(handle.path || ""), ns_count: domain._namespace.byPhysical.size }};
 }});
+domain.handler("storage", async (msg) => {{
+  const recordId = "e2e-" + msg.message_id;
+  await domain.storageInsert(recordId, "e2e", {{ value: 7 }});
+  const query = await domain.storageQuery({{ record_id: recordId }});
+  return {{ rows: (query.items || []).length, count: query.count }};
+}});
 domain.run();
 "#,
         sdk.to_string_lossy().replace('\\', "/")
@@ -99,6 +105,12 @@ domain.run();
     let file_data = file_result.data.unwrap();
     assert_eq!(file_data["content"], "v2-file-object", "{file_data}");
     assert_eq!(file_data["encoded"], true, "{file_data}");
+
+    verifier.send(vec!["v2node.storage".into()], "Storage", json!({}), json!({}));
+    let stored = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(stored.status, atelier_kernel::ContractStatus::Completed, "{:?}", stored.data);
+    let stored_data = stored.data.unwrap();
+    assert!(stored_data["rows"].as_u64().unwrap_or(0) >= 1, "{stored_data}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

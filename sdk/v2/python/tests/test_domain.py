@@ -120,5 +120,66 @@ class CapabilityRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(frame["data"]["message"], "hello")
 
 
+class C4AndObservabilityTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.domain = FakeDomain()
+        self.domain._loop = asyncio.get_running_loop()
+
+    async def _capture(self, coro):
+        task = asyncio.create_task(coro)
+        await asyncio.sleep(0)
+        frame = self.domain.frames[-1]
+        self.domain.receipt("x", frame["targets"][0], "sent", seq=frame["seq"])
+        await asyncio.sleep(0)
+        self.domain.receipt("x", frame["targets"][0], "completed", {"done": True})
+        await task
+        return frame
+
+    async def test_put_object_routes(self):
+        frame = await self._capture(self.domain.put_object("evidence/x"))
+        self.assertEqual(frame["targets"], ["kernel.storage"])
+        self.assertEqual(frame["message_type"], "StorageObjectPut")
+        self.assertEqual(frame["params"], {"virtual_path": "evidence/x"})
+
+    async def test_get_object_routes(self):
+        frame = await self._capture(self.domain.get_object("abc"))
+        self.assertEqual(frame["message_type"], "StorageObjectGet")
+        self.assertEqual(frame["params"], {"object_id": "abc"})
+
+    async def test_delete_object_routes(self):
+        frame = await self._capture(self.domain.delete_object("abc"))
+        self.assertEqual(frame["message_type"], "StorageObjectDelete")
+        self.assertEqual(frame["params"], {"object_id": "abc"})
+
+    async def test_refresh_file_index_routes(self):
+        frame = await self._capture(self.domain.refresh_file_index())
+        self.assertEqual(frame["message_type"], "StorageObjectList")
+
+    def test_events_are_dispatched_to_callbacks(self):
+        seen = []
+        self.domain.on_log(seen.append)
+        self.domain._emit("log", {"level": "info"})
+        self.domain._emit("log", {"level": "warn"})
+        self.assertEqual([item["level"] for item in seen], ["info", "warn"])
+
+    def test_event_callback_failure_does_not_break_emit(self):
+        def boom(_payload):
+            raise RuntimeError("boom")
+
+        self.domain.on_telemetry(boom)
+        self.domain._emit("telemetry", {"ok": True})
+
+    def test_bindings_default_empty(self):
+        self.assertEqual(self.domain.bindings, {})
+
+    def test_logger_writes_to_kernel_logger(self):
+        self.domain.logger.info("hello")
+        frame = self.domain.frames[-1]
+        self.assertEqual(frame["targets"], ["kernel.logger"])
+        self.assertEqual(frame["message_type"], "Log")
+        self.assertEqual(frame["data"]["message"], "hello")
+        self.assertEqual(frame["params"]["level"], "info")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -83,6 +83,7 @@ pub struct KernelLedger {
     memory: Mutex<Connection>,
     pub(crate) db_conn: Option<Arc<Mutex<Connection>>>,
     gates: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    evicted: AtomicU64,
     _owner: Option<std::fs::File>,
 }
 const MAX_LIVE: i64 = 65_536;
@@ -240,6 +241,7 @@ impl KernelLedger {
             memory: Mutex::new(memory),
             db_conn: Some(Arc::new(Mutex::new(db))),
             gates: Mutex::new(HashMap::new()),
+            evicted: AtomicU64::new(0),
             _owner: prepared.map(|(_, owner)| owner),
         })
     }
@@ -593,7 +595,7 @@ impl KernelLedger {
                 }
             }
         }
-        json!({"resident_records":records,"record_capacity":records,"durable_records":durable,"volatile_records":volatile,"ephemeral_inflight":ephemeral,
+        json!({"resident_records":records,"record_capacity":records,"durable_records":durable,"volatile_records":volatile,"ephemeral_inflight":ephemeral,"nonpersistent_evicted":self.evicted.load(Ordering::Relaxed),
             "submissions":count("SELECT count(*) FROM kernel_sessions"),"submission_capacity":MAX_LIVE,"logical_groups":count("SELECT count(DISTINCT logical_id) FROM identities"),"logical_capacity":ids,"child_links":ids,"child_capacity":ids})
     }
     pub fn record_initial_target_state(
@@ -734,11 +736,38 @@ impl KernelLedger {
             if bytes + r.data.as_ref().map_or(0, |v| v.to_string().len() as i64)
                 > MAX_TRANSIENT_BYTES
             {
-                let failed = Self::failure(&r, "nonpersistent ledger capacity exhausted");
-                drop(mem);
-                self.remember_failure(&failed);
-                self.update_metadata(&failed);
-                return (failed, false);
+                // 非持久账本容量是软上限：先淘汰最旧的已终结记录，绝不因为容量拒绝新消息。
+                let size = r.data.as_ref().map_or(0, |v| v.to_string().len() as i64);
+                let mut need = bytes + size - MAX_TRANSIENT_BYTES;
+                let victims: Vec<(String, i64)> = {
+                    let mut stmt = mem
+                        .prepare(
+                            "SELECT message_id, coalesce(length(data),0) FROM kernel_ledger \
+                             WHERE status IN ('sent','received','completed','execution_failed','contract_invalid','target_invalid') \
+                             ORDER BY created_at ASC",
+                        )
+                        .expect("quota victim query");
+                    let rows = stmt
+                        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                        .expect("quota victim rows");
+                    rows.filter_map(Result::ok).collect()
+                };
+                for (id, len) in victims {
+                    if need <= 0 {
+                        break;
+                    }
+                    mem.execute("DELETE FROM kernel_ledger WHERE message_id=?1", [&id])
+                        .expect("quota eviction");
+                    self.evicted.fetch_add(1, Ordering::Relaxed);
+                    need -= len.max(1);
+                }
+                if need > 0 {
+                    let failed = Self::failure(&r, "nonpersistent ledger capacity exhausted");
+                    drop(mem);
+                    self.remember_failure(&failed);
+                    self.update_metadata(&failed);
+                    return (failed, false);
+                }
             }
             Self::write(&mem, &r).expect("cannot write in-memory ledger");
         }

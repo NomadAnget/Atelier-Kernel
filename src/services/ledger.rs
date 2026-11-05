@@ -1129,7 +1129,7 @@ fn insert_audit_tx(db: &Connection, r: &DeliveryRecord) -> Result<(), StorageErr
 
 #[cfg(test)]
 mod tests {
-    use crate::*;
+    use super::*;
 
     #[test]
     fn terminal_ingress_durable_lands_in_audit_only() {

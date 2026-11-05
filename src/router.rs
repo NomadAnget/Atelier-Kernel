@@ -1940,7 +1940,19 @@ impl KernelRouter {
         }
 
         match msg.message_type.as_str() {
-            MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY | _ => {}
+            MSG_QUERY_RUNTIME | MSG_QUERY_DOMAIN_ASSEMBLY => {}
+            _ => {
+                self.complete_kernel_internal_target(
+                    source_domain,
+                    msg,
+                    ContractStatus::ContractInvalid,
+                    Some(json!({
+                        "error": "unknown_message_type",
+                        "reason": format!("kernel.runtime does not support {}", msg.message_type),
+                    })),
+                );
+                return;
+            }
         }
 
         let target_domain = msg

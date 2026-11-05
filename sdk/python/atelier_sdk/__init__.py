@@ -662,7 +662,16 @@ class AtelierDomain(AsyncRuntime):
         upsert: bool = True,
     ):
         """Writes a record and returns the stored record (request semantics)."""
-        return await self.storage_insert_async(record_id, category, data, upsert)
+        return await self._decode_files(
+            (
+                await self.request(
+                    "kernel.storage",
+                    "StorageInsert",
+                    {"record_id": record_id, "category": category, "upsert": upsert},
+                    data,
+                )
+            )["data"]
+        )
 
     async def storage_update(
         self,
@@ -671,7 +680,16 @@ class AtelierDomain(AsyncRuntime):
         patch: bool = True,
     ):
         """Updates a record and returns it (request semantics)."""
-        return await self.storage_update_async(record_id, data, patch)
+        return await self._decode_files(
+            (
+                await self.request(
+                    "kernel.storage",
+                    "StorageUpdate",
+                    {"record_id": record_id, "patch": patch},
+                    data,
+                )
+            )["data"]
+        )
 
     async def storage_delete(
         self,
@@ -679,7 +697,12 @@ class AtelierDomain(AsyncRuntime):
         category: Optional[str] = None,
     ):
         """Deletes record(s) and returns the outcome (request semantics)."""
-        return await self.storage_delete_async(record_id, category)
+        params: Dict[str, Any] = {}
+        if record_id is not None:
+            params["record_id"] = record_id
+        if category is not None:
+            params["category"] = category
+        return (await self.request("kernel.storage", "StorageDelete", params, {}))["data"]
 
     async def storage_query(
         self,
@@ -691,13 +714,18 @@ class AtelierDomain(AsyncRuntime):
         limit: int = 500,
     ):
         """Queries this domain's storage table and returns the data (request semantics)."""
-        return await self.storage_query_async(
-            domain=domain,
-            record_id=record_id,
-            category=category,
-            filter=filter,
-            filter_map=filter_map,
-            limit=limit,
+        params: Dict[str, Any] = {"limit": limit}
+        if domain is not None:
+            params["domain"] = domain
+        if record_id is not None:
+            params["record_id"] = record_id
+        if category is not None:
+            params["category"] = category
+        active_filter = filter if filter is not None else filter_map
+        if active_filter is not None:
+            params["filter"] = active_filter
+        return await self._decode_files(
+            (await self.request("kernel.storage", "StorageQuery", params, {}))["data"]
         )
 
     async def put_object(self, virtual_path: str):

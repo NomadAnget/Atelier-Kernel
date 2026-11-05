@@ -129,18 +129,6 @@ class AsyncRuntime(MessageClient):
         """标准名（无 `_async` 后缀）的处理器描述查询。"""
         return await self.get_handler_description_async(target,timeout)
 
-    async def storage_insert_async(self,record_id,category,data,upsert=True,timeout=30):
-        return await self._decode_files((await self.request('kernel.storage','StorageInsert',dict(record_id=record_id,category=category,upsert=upsert),data,timeout))['data'])
-    async def storage_update_async(self,record_id,data,patch=True,timeout=30):
-        return await self._decode_files((await self.request('kernel.storage','StorageUpdate',dict(record_id=record_id,patch=patch),data,timeout))['data'])
-    async def storage_delete_async(self,record_id=None,category=None,timeout=30):
-        params={k:v for k,v in dict(record_id=record_id,category=category).items() if v is not None}
-        return (await self.request('kernel.storage','StorageDelete',params,{},timeout))['data']
-    async def storage_query_async(self,domain=None,record_id=None,category=None,filter=None,filter_map=None,limit=500,timeout=30):
-        params={k:v for k,v in dict(domain=domain,record_id=record_id,category=category,filter=filter if filter is not None else filter_map,limit=limit).items() if v is not None}
-        # 存储记录里的文件引用在读出时还原成原生文件对象。
-        return await self._decode_files((await self.request('kernel.storage','StorageQuery',params,{},timeout))['data'])
-
     async def query_logs_async(self,domain=None,domain_id=None,source_domain=None,level=None,layer=None,component=None,phase=None,since_ts=None,limit=200,timeout=30,before_id=None):
         params={'limit':limit}
         d=domain if domain is not None else (domain_id if domain_id is not None else source_domain)
@@ -156,25 +144,25 @@ class AsyncRuntime(MessageClient):
     async def query_progress_async(self,timeout=30):
         return (await self.request('kernel.logger','QueryProgress',{},{},timeout))['data']
 
-    async def subscribe_logs_async(self, level=None, source_domain=None, timeout=30):
+    async def subscribe_logs(self, level=None, source_domain=None, timeout=30):
         params = {}
         if level is not None: params['level'] = level
         if source_domain is not None: params['source_domain'] = source_domain
         return (await self.request('kernel.logger', 'SubscribeLogs', params, {}, timeout))['data']
 
-    async def unsubscribe_logs_async(self, timeout=30):
+    async def unsubscribe_logs(self, timeout=30):
         return (await self.request('kernel.logger', 'UnsubscribeLogs', {}, {}, timeout))['data']
 
-    async def subscribe_telemetry_async(self, timeout=30):
+    async def subscribe_telemetry(self, timeout=30):
         return (await self.request('kernel.telemetry', 'SubscribeTelemetry', {}, {}, timeout))['data']
 
-    async def unsubscribe_telemetry_async(self, timeout=30):
+    async def unsubscribe_telemetry(self, timeout=30):
         return (await self.request('kernel.telemetry', 'UnsubscribeTelemetry', {}, {}, timeout))['data']
 
-    async def subscribe_notify_async(self, timeout=30):
+    async def subscribe_notify(self, timeout=30):
         return (await self.request('kernel.notify', 'SubscribeNotify', {}, {}, timeout))['data']
 
-    async def unsubscribe_notify_async(self, timeout=30):
+    async def unsubscribe_notify(self, timeout=30):
         return (await self.request('kernel.notify', 'UnsubscribeNotify', {}, {}, timeout))['data']
 
     async def query_runtime_async(self, domain=None, timeout=30):
@@ -190,26 +178,26 @@ class AsyncRuntime(MessageClient):
         if source_domain is not None: params['source_domain'] = source_domain
         return (await self.request('kernel.observer', 'QueryObserver', params, {}, timeout))['data']
 
-    async def subscribe_observer_async(self, timeout=30):
+    async def subscribe_observer(self, timeout=30):
         return (await self.request('kernel.observer', 'SubscribeObserver', {}, {}, timeout))['data']
 
-    async def unsubscribe_observer_async(self, timeout=30):
+    async def unsubscribe_observer(self, timeout=30):
         return (await self.request('kernel.observer', 'UnsubscribeObserver', {}, {}, timeout))['data']
 
-    async def supervisor_start_async(self, domain, spec=None, timeout=30):
+    async def supervisor_start(self, domain, spec=None, timeout=30):
         params = {'domain': domain}
         if spec is not None: params['spec'] = spec
         return (await self.request('kernel.supervisor', 'StartDomain', params, {}, timeout))['data']
 
-    async def supervisor_stop_async(self, domain, timeout=30):
+    async def supervisor_stop(self, domain, timeout=30):
         params = {'domain': domain}
         return (await self.request('kernel.supervisor', 'StopDomain', params, {}, timeout))['data']
 
-    async def supervisor_restart_async(self, domain, timeout=30):
+    async def supervisor_restart(self, domain, timeout=30):
         params = {'domain': domain}
         return (await self.request('kernel.supervisor', 'RestartDomain', params, {}, timeout))['data']
 
-    async def supervisor_update_async(self, domain, spec=None, probe_handler=None, timeout_ms=5000, timeout=30):
+    async def supervisor_update(self, domain, spec=None, probe_handler=None, timeout_ms=5000, timeout=30):
         params = {'domain': domain, 'timeout_ms': timeout_ms}
         if spec is not None: params['spec'] = spec
         if probe_handler is not None: params['probe_handler'] = probe_handler

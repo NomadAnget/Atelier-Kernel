@@ -49,8 +49,8 @@ async def check(msg):
     with open("vfs://out/payload.bin", "wb") as f:
         f.write(b"stored-file-object")
     with open("vfs://out/payload.bin", "rb") as f:
-        await domain.storage_insert_async("rec-1", "evidence", {"file": f})
-    rows = await domain.storage_query_async(record_id="rec-1")
+        await domain.storage_insert("rec-1", "evidence", {"file": f})
+    rows = await domain.storage_query(record_id="rec-1")
     handle = find_file(rows)
     content = handle.read().decode() if handle is not None else None
     return {"content": content, "has_file_object": handle is not None}

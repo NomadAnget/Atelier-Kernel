@@ -448,7 +448,17 @@ class AtelierDomain {
     this._output = this._streams.output;
     this._readLoop();
     this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.registry"], message_type: "RegisterHandlers", params: { handlers: [...this._handlers.keys()], descriptions: Object.fromEntries(this._descriptions) }, data: {} });
-    if (onStart) await onStart();
+    if (onStart) {
+      try {
+        await onStart();
+      } catch (error) {
+        this._write({ frame_type: "ready", error: String(error && error.message || error) });
+        throw error;
+      }
+    }
+    if (process.env.ATELIER_MANAGED_READY === "1") {
+      this._write({ frame_type: "ready" });
+    }
     this._done = new Promise((resolve) => { this._finish = resolve; });
     await this._done;
     if (onClose) await onClose();

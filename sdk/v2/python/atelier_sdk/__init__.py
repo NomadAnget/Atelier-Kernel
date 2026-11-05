@@ -423,9 +423,15 @@ class AtelierDomain:
             }
         )
         if on_start is not None:
-            result = on_start()
-            if asyncio.iscoroutine(result):
-                await result
+            try:
+                result = on_start()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as error:  # noqa: BLE001
+                self._write({"frame_type": "ready", "error": str(error)})
+                raise
+        if os.environ.get("ATELIER_MANAGED_READY") == "1":
+            self._write({"frame_type": "ready"})
         try:
             await self._done
         finally:

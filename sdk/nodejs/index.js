@@ -622,6 +622,23 @@ class AtelierDomain {
     return this.getHandlerDescriptionAsync(target, options);
   }
 
+  /** Routes console.* to the domain logger (standard-library logging bridge). */
+  attachStdlibLogging() {
+    if (globalThis.__atelierStdlibLogging) return;
+    globalThis.__atelierStdlibLogging = true;
+    const logger = this.logger;
+    for (const level of ["debug", "info", "warn", "error"]) {
+      const original = typeof console[level] === "function" ? console[level].bind(console) : null;
+      console[level] = (...args) => {
+        try {
+          logger[level](args.map((value) => (typeof value === "string" ? value : JSON.stringify(value))).join(" "));
+        } catch (_) {
+          if (original) original(...args);
+        }
+      };
+    }
+  }
+
   /**
    * Resolves an `object_id` to its object ref (C4).
    */

@@ -56,7 +56,7 @@ fn exercise(node: bool) {
     let (public, second) = free_ports();
     let py = r#"import asyncio,socketserver,threading,sys
 from atelier_sdk import AtelierDomain
-d=AtelierDomain(domain='service')
+d=AtelierDomain('service')
 @d.handler('ping')
 def ping(m):return {'ok':True}
 class H(socketserver.StreamRequestHandler):
@@ -75,20 +75,20 @@ d.run(on_start=start)
         "d.run(on_start=start)",
         "asyncio.run(d.run_async(on_start=start))",
     );
-    let js = r#"const {AtelierDomain}=require(process.argv[1]);const net=require('node:net');const d=new AtelierDomain({domain:'service'});d.handler('ping',()=>({ok:true}));d.runAsync({onStart:async()=>{if(process.argv[2]==='bad')throw Error('intentional startup failure');await new Promise(r=>setTimeout(r,Number(process.argv[3])*1000));for(const ep of Object.values(d.bindings)){await new Promise((resolve,reject)=>{const server=net.createServer(c=>{c.on('data',()=>c.write(process.argv[2]+'\n'));});server.once('error',reject);server.listen(ep.port,ep.host,resolve);});}}}).catch(()=>{process.exitCode=1;});"#;
+    let js = r#"const {AtelierDomain}=require(process.argv[1]);const net=require('node:net');const d=new AtelierDomain('service');d.handler('ping',()=>({ok:true}));d.runAsync({onStart:async()=>{if(process.argv[2]==='bad')throw Error('intentional startup failure');await new Promise(r=>setTimeout(r,Number(process.argv[3])*1000));for(const ep of Object.values(d.bindings)){await new Promise((resolve,reject)=>{const server=net.createServer(c=>{c.on('data',()=>c.write(process.argv[2]+'\n'));});server.once('error',reject);server.listen(ep.port,ep.host,resolve);});}}}).catch(()=>{process.exitCode=1;});"#;
     let make = |version: &str, delay: &str| -> DomainProcessSpec {
         let args = if node {
             vec![
                 "-e".into(),
                 js.into(),
-                root.join("sdk/nodejs").to_string_lossy().into(),
+                root.join("sdk/v2/nodejs").to_string_lossy().into(),
                 version.into(),
                 delay.into(),
             ]
         } else {
             vec!["-c".into(), py.clone(), version.into(), delay.into()]
         };
-        serde_json::from_value(json!({"domain_id":"service","command":if node{"node"}else if cfg!(windows){"python"}else{"python3"},"args":args,"env":{"PYTHONPATH":root.join("sdk/python").to_string_lossy()},"auto_restart":false,"ports":[{"name":"http","listen":public},{"name":"other","listen":second}]})).unwrap()
+        serde_json::from_value(json!({"domain_id":"service","command":if node{"node"}else if cfg!(windows){"python"}else{"python3"},"args":args,"env":{"PYTHONPATH":root.join("sdk/v2/python").to_string_lossy()},"auto_restart":false,"ports":[{"name":"http","listen":public},{"name":"other","listen":second}]})).unwrap()
     };
     let k = AtelierKernel::new_in_memory().unwrap();
     k.supervisor()

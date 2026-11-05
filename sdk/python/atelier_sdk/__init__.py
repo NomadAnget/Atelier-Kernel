@@ -762,17 +762,19 @@ class AtelierDomain(AsyncRuntime):
             data={},
         )
 
-    def enable_file_interception(self, root: Optional[str] = None):
+    def enable_file_interception(self, root: Optional[str] = None, prefix: str = "vfs://"):
         """Installs the C4 virtual file namespace (C4).
 
-        After this, plain `open("users/a.png", "w")` writes a flat unique-id file under the
-        domain root and registers the virtual path with the kernel; reads resolve via the
-        local index cache. Developers keep using native file handles.
+        Only paths starting with `prefix` (default `vfs://`) are resolved to kernel-managed
+        flat unique-id files; every other file operation — including dependency libraries'
+        config/temp/cache files — passes through to the native `open` untouched.
+
+        Business code keeps native handles: `open("vfs://users/a.png", "wb")`.
         """
         from ._files import install
 
         base = root or os.environ.get("ATELIER_FILES_ROOT") or "."
-        self._file_namespace = install(base, self._submit)
+        self._file_namespace = install(base, self._submit, prefix)
         return self._file_namespace
 
     async def refresh_file_index(self, timeout: float = 30):

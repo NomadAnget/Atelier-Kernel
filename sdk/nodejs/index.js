@@ -605,13 +605,11 @@ class AtelierDomain {
   }
 
   /**
-   * Registers a domain file as a kernel-indexed object via `kernel.storage` (C4).
-   * The kernel only indexes the absolute path (no copy, no move, no read) and returns
-   * `{ object_id, size }`. The domain keeps using its path as a normal file.
+   * Allocates a virtual path to a flat unique-id file (C4).
+   * Returns `{ object_id, virtual_path, physical_path, size }`.
    */
-  putObject(filePath) {
-    const absolute = require("path").resolve(filePath);
-    return this.send("kernel.storage", "StorageObjectPut", { path: absolute }, {});
+  putObject(virtualPath) {
+    return this.send("kernel.storage", "StorageObjectPut", { virtual_path: virtualPath }, {});
   }
 
   /**
@@ -626,6 +624,54 @@ class AtelierDomain {
    */
   deleteObject(objectId) {
     return this.send("kernel.storage", "StorageObjectDelete", { object_id: objectId }, {});
+  }
+
+  /**
+   * Installs the C4 virtual file namespace (C4).
+   *
+   * Only paths starting with `prefix` (default `vfs://`) are resolved to kernel-managed flat
+   * unique-id files; every other file operation — including dependencies' config/temp/cache
+   * files — passes through to the native `fs.*` untouched. Business code keeps native
+   * handles: `fs.writeFileSync("vfs://users/a.png", bytes)`.
+   */
+  enableFileInterception(root = null, prefix = "vfs://") {
+    const { FileNamespace, install } = require("./files");
+    const base = root || process.env.ATELIER_FILES_ROOT || ".";
+    this._fileNamespace = new FileNamespace(base, this._submit.bind(this), prefix);
+    install(this._fileNamespace);
+    return this._fileNamespace;
+  }
+
+  /**
+   * Pulls this domain's object index from the kernel into the local read cache (C4).
+   */
+  refreshFileIndex({ timeout = 30000 } = {}) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let seq = null;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this._receiptCallbacks = this._receiptCallbacks.filter((f) => f !== handler);
+        fn(value);
+      };
+      const handler = (receipt) => {
+        if (!receipt || receipt.seq !== seq) return;
+        if (receipt.status === "completed") {
+          const objects = (receipt.data && receipt.data.objects) || [];
+          if (this._fileNamespace) this._fileNamespace.loadIndex(objects);
+          finish(resolve, objects);
+        } else if (
+          ["execution_failed", "target_invalid", "contract_invalid"].includes(receipt.status)
+        ) {
+          finish(reject, new Error(receipt.status));
+        }
+      };
+      const timer = setTimeout(() => finish(reject, new Error("timeout")), timeout);
+      this._receiptCallbacks.push(handler);
+      seq = this._submit(["kernel.storage"], "StorageObjectList", {}, {});
+    });
   }
 
   /**

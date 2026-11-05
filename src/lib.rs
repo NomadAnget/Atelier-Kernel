@@ -11,6 +11,7 @@ pub mod outbox;
 pub mod port_forwarder;
 pub mod protocol;
 pub mod router;
+pub mod routing;
 pub mod storage;
 pub mod supervisor;
 pub mod transport;

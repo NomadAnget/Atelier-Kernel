@@ -28,6 +28,8 @@ def _open_endpoint(path, mode):
     return sock.makefile("wb" if "w" in mode else "rb", buffering=0)
 
 TERMINAL = {"completed", "execution_failed", "target_invalid", "contract_invalid"}
+# 已停止等待、但帧已写入内核的提交，其回执归属最多保留这么多条；超出按先进先出丢弃并计数。
+_ORPHAN_LIMIT = 4096
 
 
 class DomainRequestError(Exception):
@@ -51,11 +53,16 @@ class AtelierDomain:
         self.domain = domain
         self._max_pending = max_pending
         self._result_ttl = result_ttl
+        # 提交窗口超时后帧已经写进管道：内核仍可能回执，归属必须保留，不能丢弃内核发出的回执。
+        self._orphan_limit = _ORPHAN_LIMIT
 
         self._handlers = {}
         self._descriptions = {}
         self._pending = {}  # seq -> {"targets", "ids", "future"}
         self._results = {}  # message_id -> {"target", "future", "waiters", "evict"}
+        self._orphans = {}  # seq -> 与 _pending 同构，供已停止等待的提交继续认领回执
+        self._evicted_ids = set()
+        self._stats = {"evicted_results": 0, "dropped_orphan_receipts": 0, "local_backpressure": 0}
         self._events = {kind: [] for kind in ("receipt", "log", "notify", "observation", "telemetry")}
         self._logger = _Logger(self)
         self._namespace = None
@@ -103,7 +110,12 @@ class AtelierDomain:
 
         while len(self._pending) + len(names) > self._max_pending:
             if deadline is not None and loop.time() >= deadline:
-                raise DomainRequestError("busy")
+                # 本地提交窗口已满：这条消息从未交给内核，所以它不是一个内核终态。
+                self._stats["local_backpressure"] += 1
+                raise DomainRequestError(
+                    "local_backpressure",
+                    {"submitted": False, "reason": "local submission window is full", "max_pending": self._max_pending},
+                )
             await asyncio.sleep(0.01)
 
         with self._lock:
@@ -124,8 +136,24 @@ class AtelierDomain:
             )
             ids = await asyncio.wait_for(asyncio.shield(future), None if timeout is None else timeout)
             return ids[0] if isinstance(targets, str) else ids
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # 帧已在管道里：本地停止等待，但内核的回执仍会到来，保留它的归属。
+            entry = self._pending.get(seq)
+            if entry is not None:
+                self._remember_orphan(seq, entry)
+            raise
         finally:
             self._pending.pop(seq, None)
+
+    def _remember_orphan(self, seq, entry):
+        if self._orphan_limit <= 0:
+            self._stats["dropped_orphan_receipts"] += 1
+            return
+        self._orphans[seq] = entry
+        while len(self._orphans) > self._orphan_limit:
+            oldest = next(iter(self._orphans))
+            self._orphans.pop(oldest, None)
+            self._stats["dropped_orphan_receipts"] += 1
 
     async def request(self, target, message_type, params=None, data=None, *, timeout=30):
         message_id = await self.send(target, message_type, params, data, timeout=timeout)
@@ -138,7 +166,12 @@ class AtelierDomain:
     async def wait_result(self, message_id, *, timeout=30):
         entry = self._results.get(message_id)
         if entry is None:
-            raise DomainRequestError("unknown_message", message_id=message_id)
+            # 区分"从没收到过"和"收到过但本地条目已过期"，调用方才能判断是否自己错过了回执。
+            raise DomainRequestError(
+                "unknown_message",
+                {"message_id": message_id, "evicted": message_id in self._evicted_ids},
+                message_id,
+            )
         handle = entry.pop("evict", None)
         if handle:
             handle.cancel()
@@ -169,6 +202,17 @@ class AtelierDomain:
             if handle:
                 handle.cancel()
         return self._results.pop(message_id, None) is not None
+
+    def stats(self):
+        """本地队列与丢回执的计数；只描述 SDK 自己的内存，不代表内核状态。"""
+        return {
+            "pending": len(self._pending),
+            "results": len(self._results),
+            "orphans": len(self._orphans),
+            "evicted_results": self._stats["evicted_results"],
+            "dropped_orphan_receipts": self._stats["dropped_orphan_receipts"],
+            "local_backpressure": self._stats["local_backpressure"],
+        }
 
     # ── 能力 6：上报回执 ──────────────────────────────────────────────
     def report_receipt(self, message_id, target, status, data=None):
@@ -514,7 +558,9 @@ class AtelierDomain:
         status = frame.get("status")
         if not isinstance(message_id, str) or status not in {"sent", "received", "started", *TERMINAL}:
             return
-        entry = self._pending.get(frame.get("seq"))
+        seq = frame.get("seq")
+        # 本地已停止等待的提交同样要认出归属：内核已经发出的回执不能被丢弃。
+        entry = self._pending.get(seq) or self._orphans.get(seq)
         if entry and target not in entry["ids"] and target in entry["targets"]:
             entry["ids"][target] = message_id
             self._results[message_id] = {
@@ -523,15 +569,24 @@ class AtelierDomain:
                 "waiters": 0,
                 "evict": None,
             }
-            if len(entry["ids"]) == len(entry["targets"]) and not entry["future"].done():
-                entry["future"].set_result([entry["ids"][t] for t in entry["targets"]])
+            if len(entry["ids"]) == len(entry["targets"]):
+                if not entry["future"].done():
+                    entry["future"].set_result([entry["ids"][t] for t in entry["targets"]])
+                self._orphans.pop(seq, None)
         result = self._results.get(message_id)
         if result and result["target"] == target and not result["future"].done() and status in TERMINAL:
             result["future"].set_result(frame)
             if not result["waiters"] and self._result_ttl > 0:
-                result["evict"] = self._loop.call_later(
-                    self._result_ttl, self._results.pop, message_id, None
-                )
+                def _evict(mid=message_id, res=result):
+                    if res["waiters"]:
+                        return
+                    if self._results.pop(mid, None) is not None:
+                        self._stats["evicted_results"] += 1
+                        self._evicted_ids.add(mid)
+                        if len(self._evicted_ids) > 1024:
+                            self._evicted_ids.discard(next(iter(self._evicted_ids)))
+
+                result["evict"] = self._loop.call_later(self._result_ttl, _evict)
 
     async def _dispatch(self, frame):
         target = frame.get("target", "")

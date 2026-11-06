@@ -8,6 +8,8 @@ const os = require("os");
 const path = require("path");
 
 const TERMINAL = new Set(["completed", "execution_failed", "target_invalid", "contract_invalid"]);
+// 已停止等待、但帧已写入内核的提交，其回执归属最多保留这么多条；超出按先进先出丢弃并计数。
+const ORPHAN_LIMIT = 4096;
 const SYSTEM_EVENTS = { LogEvent: "log", NotifyEvent: "notify", ObservationEvent: "observation", TelemetryEvent: "telemetry" };
 
 class DomainRequestError extends Error {
@@ -77,6 +79,11 @@ class AtelierDomain {
     this._descriptions = new Map();
     this._pending = new Map();
     this._results = new Map();
+    // 提交窗口超时后，帧已经写进管道：内核仍可能回执，归属必须保留，不能丢掉内核发出的回执。
+    this._orphans = new Map();
+    this._orphanLimit = ORPHAN_LIMIT;
+    this._evictedIds = new Set();
+    this._stats = { evicted_results: 0, dropped_orphan_receipts: 0, local_backpressure: 0 };
     this._events = { receipt: [], log: [], notify: [], observation: [], telemetry: [] };
     this._seq = 1;
     this._namespace = null;
@@ -105,19 +112,45 @@ class AtelierDomain {
     data = this._encodeFiles(data);
     const deadline = Date.now() + timeout * 1000;
     while (this._pending.size + names.length > this._maxPending) {
-      if (Date.now() >= deadline) throw new DomainRequestError("busy");
+      if (Date.now() >= deadline) {
+        // 本地提交窗口已满：这条消息从未交给内核，所以它不是一个内核终态。
+        // 用独立状态暴露，避免把"SDK 没写出去"混同成"内核拒绝了"。
+        this._stats.local_backpressure += 1;
+        throw new DomainRequestError(
+          "local_backpressure",
+          { submitted: false, reason: "local submission window is full", max_pending: this._maxPending },
+          null
+        );
+      }
       await new Promise((r) => setTimeout(r, 10));
     }
     const seq = this._seq++;
     const promise = new Promise((resolve, reject) => {
-      this._pending.set(seq, { targets: names, ids: new Map(), resolve, reject });
+      this._pending.set(seq, { targets: names, ids: new Map(), resolve, reject, seq });
     });
     this._write({ frame_type: "send", seq, targets: names, message_type: messageType, params, data });
     try {
       const ids = await withTimeout(promise, timeout);
       return typeof targets === "string" ? ids[0] : ids;
+    } catch (error) {
+      // 帧已在管道里：本地停止等待，但内核的回执仍会到来，保留它的归属。
+      const entry = this._pending.get(seq);
+      if (entry) this._rememberOrphan(seq, entry);
+      throw error;
     } finally {
       this._pending.delete(seq);
+    }
+  }
+
+  _rememberOrphan(seq, entry) {
+    if (this._orphanLimit <= 0) {
+      this._stats.dropped_orphan_receipts += 1;
+      return;
+    }
+    this._orphans.set(seq, entry);
+    while (this._orphans.size > this._orphanLimit) {
+      this._orphans.delete(this._orphans.keys().next().value);
+      this._stats.dropped_orphan_receipts += 1;
     }
   }
 
@@ -135,7 +168,14 @@ class AtelierDomain {
   // 能力 5：等待 / 遗忘
   async waitResult(messageId, options = {}) {
     const entry = this._results.get(messageId);
-    if (!entry) throw new DomainRequestError("unknown_message", null, messageId);
+    if (!entry) {
+      // 区分"从没收到过"和"收到过但本地条目已过期"，否则调用方无法判断是不是自己错过了回执。
+      throw new DomainRequestError(
+        "unknown_message",
+        { message_id: messageId, evicted: this._evictedIds.has(messageId) },
+        messageId
+      );
+    }
     if (entry.evict) {
       clearTimeout(entry.evict);
       entry.evict = null;
@@ -163,6 +203,18 @@ class AtelierDomain {
     if (entry?.waiters) throw new DomainRequestError("busy", null, messageId);
     if (entry?.evict) clearTimeout(entry.evict);
     return this._results.delete(messageId);
+  }
+
+  // 本地队列与丢回执的可观测性：这些计数只描述 SDK 自己的内存，不代表内核状态。
+  stats() {
+    return {
+      pending: this._pending.size,
+      results: this._results.size,
+      orphans: this._orphans.size,
+      evicted_results: this._stats.evicted_results,
+      dropped_orphan_receipts: this._stats.dropped_orphan_receipts,
+      local_backpressure: this._stats.local_backpressure,
+    };
   }
 
   // 能力 6：上报回执
@@ -477,20 +529,30 @@ class AtelierDomain {
     const target = frame.target;
     const status = frame.status;
     if (typeof messageId !== "string" || !(status === "sent" || status === "received" || status === "started" || TERMINAL.has(status))) return;
-    const entry = this._pending.get(frame.seq);
+    // 本地已停止等待的提交同样要认出归属：内核已经发出的回执不能被丢弃。
+    const entry = this._pending.get(frame.seq) ?? this._orphans.get(frame.seq);
     if (entry && !entry.ids.has(target) && entry.targets.includes(target)) {
       entry.ids.set(target, messageId);
       let resolve;
       const promise = new Promise((yes) => { resolve = yes; });
       const result = { target, promise, resolve, waiters: 0, observed: false, evict: null };
       this._results.set(messageId, result);
-      if (entry.ids.size === entry.targets.length) entry.resolve(entry.targets.map((t) => entry.ids.get(t)));
+      if (entry.ids.size === entry.targets.length) {
+        entry.resolve(entry.targets.map((t) => entry.ids.get(t)));
+        this._orphans.delete(frame.seq);
+      }
     }
     const result = this._results.get(messageId);
     if (result && result.target === target && !result.observed && TERMINAL.has(status)) {
       result.resolve(frame);
       if (!result.waiters && this._resultTtlMs > 0) {
-        result.evict = setTimeout(() => { if (!result.waiters) this._results.delete(messageId); }, this._resultTtlMs);
+        result.evict = setTimeout(() => {
+          if (result.waiters) return;
+          this._results.delete(messageId);
+          this._stats.evicted_results += 1;
+          this._evictedIds.add(messageId);
+          if (this._evictedIds.size > 1024) this._evictedIds.delete(this._evictedIds.values().next().value);
+        }, this._resultTtlMs);
       }
     }
   }

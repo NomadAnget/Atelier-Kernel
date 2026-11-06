@@ -44,11 +44,19 @@ SDK 侧只有少量本地资源上限，用来约束自己的等待槽，与业�
 
 | 项 | Python | Node.js | 说明 |
 | :--- | :--- | :--- | :--- |
-| 待处理提交 | `max_pending=1024` | `maxPending: 1024` | **只约束还在等初始消息 id 的提交**：id 一到就从 `_pending` 移除，之后等待终态回执**不占**这个额度。到上限时新的 send 会阻塞等释放，不会静默丢弃 |
-| 未读结果的存活期 | `result_ttl=30.0` 秒 | `resultTtlMs: 30000` | 没人等待的终态回执在多久后被驱逐。这是未读结果的**唯一**实际上限 |
-| 单次请求超时 | `timeout=30` | `options.timeout`，默认 30 秒 | 与上面无关：超时只放弃本地等待，不取消内核侧执行 |
+| 待处理提交 | `max_pending=1024` | `maxPending: 1024` | **只约束还在等初始消息 id 的提交**：id 一到就从 `_pending` 移除，之后等待终态回执**不占**这个额度。窗口满时新的 send 先等待；等满 `timeout` 仍未腾出，则抛 **`local_backpressure`**（`data.submitted=false`）——这条消息**从未交给内核**，所以它不是内核终态 |
+| 未读结果的存活期 | `result_ttl=30.0` 秒 | `resultTtlMs: 30000` | 没人等待的终态回执在多久后被驱逐；驱逐会计入 `stats().evicted_results`，此后 `wait_result` 报 `unknown_message` 并带 `data.evicted=true` |
+| 单次请求超时 | `timeout=30` | `options.timeout`，默认 30 秒 | 与上面无关：超时只放弃本地等待，不取消内核侧执行，**也不丢弃已经写入内核那条消息的回执归属** |
 
-> SDK 侧的构造参数只有这三个（Python `max_pending` / `result_ttl`，Node `maxPending` / `resultTtlMs`）。历史上 Python 还有一个 `max_results=4096`，它只被赋值、不参与任何容量判断，已删除——**不要再按它调优**。
+### 本地限制与内核终态的边界（硬约束）
+
+内核是全系统唯一具备准入判定权的一方：每条真正提交给内核的消息都由内核给出明确终态。SDK 的本地上限**只允许推迟写入**，不允许替内核判决，具体三条：
+
+1. **未写入 ≠ 终态**。`local_backpressure` 表示帧还在 SDK 里，内核从未见过这条消息；它必须与 `completed` / `execution_failed` / `target_invalid` / `contract_invalid` 这些内核状态严格区分，调用方可以据此安全重试。
+2. **已经写入就不许忘**。帧写进管道后，即使本地等待超时，SDK 仍保留该提交的回执归属（有界，`ORPHAN_LIMIT=4096`，先进先出），迟到的回执照样能关联到 `message_id` 并进入 `wait_result`。丢弃计入 `stats().dropped_orphan_receipts`，正常为 0。
+3. **驱逐可观测**。`stats()` 暴露 `pending` / `results` / `orphans` / `evicted_results` / `dropped_orphan_receipts` / `local_backpressure` 六个计数；它们只描述 SDK 自己的内存，不代表内核状态。
+
+> SDK 侧的构造参数只有这三个（Python `max_pending` / `result_ttl`，Node `maxPending` / `resultTtlMs`）。历史上 Python 还有一个 `max_results=4096`，它只被赋值、不参与任何容量判断，已删除——**不要再按它调优**。孤儿保留上限是模块常量，不是构造参数。
 
 `shutdown()` 是协作式的：把实例标记为已关闭、结束 `run` / `runAsync` 主循环、销毁端点流并让出事件循环。**它不会中断语言运行时里正在执行的业务函数**；进程停止与重启是内核 supervisor 的职责。SDK 没有独立的入站并发配额，也没有可配置的排空宽限期。
 

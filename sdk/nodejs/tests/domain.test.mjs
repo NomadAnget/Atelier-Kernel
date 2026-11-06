@@ -217,3 +217,54 @@ test("logger writes a dedicated log frame", () => {
   assert.equal(frame.record.phase, "start");
   assert.equal(frame.record.tag, "x");
 });
+
+// ── 本地限制与内核终态的边界 ──────────────────────────────────────────
+test("a full submission window raises local_backpressure, not a kernel terminal", async () => {
+  const domain = new AtelierDomain("test", { maxPending: 1 });
+  domain.frames = [];
+  domain._write = (frame) => domain.frames.push(frame);
+
+  const first = domain.send("t.h", "T", {}, {}, { timeout: 5 });
+  await tick();
+  await assert.rejects(domain.send("t.h", "T", {}, {}, { timeout: 0.02 }), (error) => {
+    assert.equal(error.status, "local_backpressure");
+    assert.equal(error.data.submitted, false);
+    assert.equal(error.message_id, null);
+    return true;
+  });
+
+  receipt(domain, "m-local", "t.h", "sent", null, domain.frames[0].seq);
+  assert.equal(await first, "m-local");
+  assert.equal(domain.stats().local_backpressure, 1);
+});
+
+test("a submission that timed out locally still accepts the kernel receipt", async () => {
+  const domain = makeDomain();
+  await assert.rejects(domain.send("t.h", "T", {}, {}, { timeout: 0.01 }));
+  assert.equal(domain.stats().orphans, 1);
+
+  // 帧已经写进管道；内核的回执迟到时，SDK 必须仍然认出它属于谁。
+  const seq = domain.frames[0].seq;
+  receipt(domain, "m-late", "t.h", "sent", null, seq);
+  assert.equal(domain._results.has("m-late"), true);
+  assert.equal(domain.stats().orphans, 0);
+
+  receipt(domain, "m-late", "t.h", "completed", { ok: 1 });
+  const value = await domain.waitResult("m-late", { timeout: 1 });
+  assert.deepEqual(value.data, { ok: 1 });
+});
+
+test("unknown_message reports whether the local result was evicted", async () => {
+  const domain = makeDomain();
+  await assert.rejects(domain.waitResult("never-seen"), (error) => {
+    assert.equal(error.status, "unknown_message");
+    assert.equal(error.data.evicted, false);
+    return true;
+  });
+  domain._evictedIds.add("gone");
+  await assert.rejects(domain.waitResult("gone"), (error) => {
+    assert.equal(error.status, "unknown_message");
+    assert.equal(error.data.evicted, true);
+    return true;
+  });
+});

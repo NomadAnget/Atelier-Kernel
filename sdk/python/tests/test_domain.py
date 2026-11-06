@@ -203,3 +203,58 @@ class C4AndObservabilityTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── 本地限制与内核终态的边界 ──────────────────────────────────────────
+
+from atelier_sdk import DomainRequestError  # noqa: E402  (与上面的用例同文件)
+
+
+def make_fake(**kwargs):
+    domain = FakeDomain.__new__(FakeDomain)
+    AtelierDomain.__init__(domain, "test", **kwargs)
+    domain.frames = []
+    domain._loop = asyncio.get_running_loop()
+    return domain
+
+
+class LocalLimitTest(unittest.IsolatedAsyncioTestCase):
+    async def test_full_window_raises_local_backpressure(self):
+        domain = make_fake(max_pending=1)
+        first = asyncio.create_task(domain.send("t.h", "T"))
+        await asyncio.sleep(0.01)
+        with self.assertRaises(DomainRequestError) as ctx:
+            await domain.send("t.h", "T", timeout=0.02)
+        self.assertEqual(ctx.exception.status, "local_backpressure")
+        self.assertFalse(ctx.exception.data["submitted"])
+        domain.receipt("m1", "t.h", "sent", seq=domain.frames[0]["seq"])
+        self.assertEqual(await first, "m1")
+        self.assertEqual(domain.stats()["local_backpressure"], 1)
+
+    async def test_timed_out_send_still_accepts_the_kernel_receipt(self):
+        domain = make_fake()
+        with self.assertRaises(asyncio.TimeoutError):
+            await domain.send("t.h", "T", timeout=0.01)
+        self.assertEqual(domain.stats()["orphans"], 1)
+
+        # 帧已经写进管道；回执迟到时仍必须认出归属。
+        seq = domain.frames[0]["seq"]
+        domain.receipt("m-late", "t.h", "sent", seq=seq)
+        self.assertIn("m-late", domain._results)
+        self.assertEqual(domain.stats()["orphans"], 0)
+
+        domain.receipt("m-late", "t.h", "completed", {"ok": 1})
+        receipt = await domain.wait_result("m-late", timeout=1)
+        self.assertEqual(receipt["data"], {"ok": 1})
+
+    async def test_unknown_message_reports_eviction(self):
+        domain = make_fake()
+        with self.assertRaises(DomainRequestError) as ctx:
+            await domain.wait_result("never-seen")
+        self.assertEqual(ctx.exception.status, "unknown_message")
+        self.assertFalse(ctx.exception.data["evicted"])
+
+        domain._evicted_ids.add("gone")
+        with self.assertRaises(DomainRequestError) as ctx2:
+            await domain.wait_result("gone")
+        self.assertTrue(ctx2.exception.data["evicted"])

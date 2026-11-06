@@ -13,11 +13,10 @@ atelier-kernel-runtime-<os>-<arch>/
 ├── atelier-kernel                        # 1. 预编译 Rust 微内核可执行程序（Windows 下为 atelier-kernel.exe）
 ├── kernel_boot.template.json             # 2. 默认多域启动配置模板
 ├── README.md                             # 3. 内核介绍与最高准则
-├── kernel.svg                            # 4. 内核图标
-├── docs/                                 # 5. 宪法、架构、能力与 SDK 文档（入口 docs/INDEX.md）
+├── docs/                                 # 4. 宪法、架构、能力与 SDK 文档（入口 docs/INDEX.md），含 kernel.svg 图标
 └── sdk/
-    ├── atelier_sdk-<version>-py3-none-any.whl # 6. Python 域官方 SDK 安装包 (Wheel)
-    └── atelier-sdk-<version>.tgz              # 7. Node.js / TypeScript 域官方 SDK 安装包 (NPM Tarball)
+    ├── atelier_sdk-<version>-py3-none-any.whl # 5. Python 域官方 SDK 安装包 (Wheel)
+    └── atelier-sdk-<version>.tgz              # 6. Node.js / TypeScript 域官方 SDK 安装包 (NPM Tarball)
 ```
 
 ---

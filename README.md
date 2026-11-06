@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="kernel.svg" width="112" height="112" alt="Atelier Kernel"/>
+  <img src="docs/kernel.svg" width="112" height="112" alt="Atelier Kernel"/>
 </p>
 
 <h1 align="center">Atelier Kernel</h1>

@@ -171,8 +171,8 @@ jobs:
           mkdir -p dist/kernel-runtime-${{ matrix.target_label }}
           cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
           cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
-          # 根目录只有 README 与图标；契约、能力与 SDK 文档全部随 docs/ 一起打包。
-          cp README.md kernel.svg dist/kernel-runtime-${{ matrix.target_label }}/
+          # 根目录只有 README；契约、能力、SDK 文档与图标全部随 docs/ 一起打包。
+          cp README.md dist/kernel-runtime-${{ matrix.target_label }}/
           cp -R docs dist/kernel-runtime-${{ matrix.target_label }}/docs
           mkdir -p dist/kernel-runtime-${{ matrix.target_label }}/sdk/python dist/kernel-runtime-${{ matrix.target_label }}/sdk/nodejs
           cp sdk/python/README.md dist/kernel-runtime-${{ matrix.target_label }}/sdk/python/README.md

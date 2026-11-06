@@ -4,7 +4,7 @@
 本模块只负责协议与能力，不关心 Windows 命名管道 / Unix domain socket 的差异。
 """
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 import asyncio
 import json
@@ -267,6 +267,17 @@ class AtelierDomain:
 
     async def query_runtime(self, **params):
         return await self._query("kernel.runtime", "QueryRuntime", params)
+
+    async def domain_info(self, domain_id):
+        """域存在性与运行态探测：读内核元数据，不发送业务消息、不产生 target_invalid。"""
+        runtime = await self.query_runtime(domain=str(domain_id))
+        single = runtime.get("domain")
+        if isinstance(single, dict):
+            return single
+        for item in runtime.get("domains") or []:
+            if isinstance(item, dict) and item.get("domain_id") == domain_id:
+                return item
+        return None
 
     async def query_observer(self, **params):
         return await self._query("kernel.observer", "QueryObserver", params)

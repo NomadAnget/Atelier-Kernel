@@ -300,3 +300,27 @@ test("a receipt with no submission is counted as unmatched", () => {
   domain._receiveResult({ frame_type: "receipt", message_id: "m-x", target: "t.h", status: "completed", seq: 999 });
   assert.equal(domain.stats().unmatched_receipts, 1);
 });
+
+test("domainInfo reads kernel metadata instead of probing with a business message", async () => {
+  const domain = makeDomain();
+  const task = domain.domainInfo("pipelines");
+  await tick();
+  const frame = domain.frames[0];
+  assert.equal(frame.targets[0], "kernel.runtime");
+  assert.equal(frame.message_type, "QueryRuntime");
+  assert.deepEqual(frame.params, { domain: "pipelines" });
+  receipt(domain, "m-info", "kernel.runtime", "sent", null, frame.seq);
+  await tick();
+  receipt(domain, "m-info", "kernel.runtime", "completed", { domain: { domain_id: "pipelines", status: "Active", instance_id: 3 } });
+  const info = await task;
+  assert.equal(info.domain_id, "pipelines");
+  assert.equal(info.status, "Active");
+
+  const missing = domain.domainInfo("nope");
+  await tick();
+  const second = domain.frames.at(-1);
+  receipt(domain, "m-missing", "kernel.runtime", "sent", null, second.seq);
+  await tick();
+  receipt(domain, "m-missing", "kernel.runtime", "completed", { count: 0, domains: [], domain: null });
+  assert.equal(await missing, null);
+});

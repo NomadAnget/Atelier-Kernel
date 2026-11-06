@@ -283,3 +283,22 @@ class TransportFailureTest(unittest.IsolatedAsyncioTestCase):
         domain = make_fake()
         domain._receive_result({"message_id": "m-x", "target": "t.h", "status": "completed", "seq": 999})
         self.assertEqual(domain.stats()["unmatched_receipts"], 1)
+
+    async def test_domain_info_reads_kernel_metadata(self):
+        domain = make_fake()
+        calls = []
+
+        async def fake(**params):
+            calls.append(params)
+            return {"domain": {"domain_id": "pipelines", "status": "Active"}, "domains": []}
+
+        domain.query_runtime = fake
+        info = await domain.domain_info("pipelines")
+        self.assertEqual(info["domain_id"], "pipelines")
+        self.assertEqual(calls, [{"domain": "pipelines"}])
+
+        async def empty(**params):
+            return {"count": 0, "domains": [], "domain": None}
+
+        domain.query_runtime = empty
+        self.assertIsNone(await domain.domain_info("missing"))

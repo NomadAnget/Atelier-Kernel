@@ -36,21 +36,19 @@ payload through; there is no required application error schema.
 System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationEvent`) delivered from kernel pipes to registered listeners use `DeliveryPolicy::Ephemeral`:
 - Zero receipt frames: Domains never report receipt acknowledgements (`received`, `started`, `completed`) for system push events.
 - Explicit subscription: `on_log` / `onLog` and the other callbacks only register a **local** handler; they do not subscribe. A domain receives events only after it calls `subscribe_logs` / `subscribe_telemetry` / `subscribe_notify` / `subscribe_observer` (camelCase in Node), and should call the matching `unsubscribe_*` when done. There is no automatic subscription at `run` / `run_async` startup.
-- Automatic teardown: When a subscriber domain terminates or faults, the kernel automatically unregisters its subscriptions to prevent stale pipes or memory leaks.
+- Automatic teardown: When a subscriber domain terminates or faults, the kernel automatically unregisters its subscriptions to prevent stale subscriptions or memory leaks.
 
 ## Local Transport Safeguards
 
-Only local transport safeguards remain: max_pending=1024, max_outbox=256,
-max_frame_bytes=16777216, shutdown_grace=5 seconds (Node camelCase). These limit
-connection resources, not business data shape or global task scheduling. Local
-connection states new/open/draining/closed are private, not kernel domain states.
-shutdown drains local handler calls and pending waits within a deadline, then
-cancels cooperatively and calls the cleanup hook. It cannot kill arbitrary native
-work; process termination and restart remain the kernel supervisor's job.
-An IPC bridge that exits early cancels its cleanup deadline timer; a finished
-connection must not retain the Node event loop until shutdown_grace expires.
-When its cleanup deadline expires, the SDK terminates its own IPC bridge helper;
-it never waits for the kernel input to close before completing an explicit shutdown.
+SDK 侧只有少量本地资源上限，用来约束自己的等待槽，与业务数据形状、全局调度无关：
+
+| 项 | Python | Node.js | 说明 |
+| :--- | :--- | :--- | :--- |
+| 待处理提交 | `max_pending=1024` | `maxPending: 1024` | 未完成提交 + 未读取结果的槽位总数 |
+| 保留结果 | `max_results=4096`、`result_ttl=30.0` 秒 | `resultTtlMs: 30000` | 没人等待的终态回执保留多久后被驱逐 |
+| 单次请求超时 | `timeout=30` | `options.timeout`，默认 30 秒 | 超时只放弃本地等待，不取消内核侧执行 |
+
+`shutdown()` 是协作式的：把实例标记为已关闭、结束 `run` / `runAsync` 主循环、销毁端点流并让出事件循环。**它不会中断语言运行时里正在执行的业务函数**；进程停止与重启是内核 supervisor 的职责。SDK 没有独立的入站并发配额，也没有可配置的排空宽限期。
 
 Async storage helpers send existing kernel.storage CRUD messages and return kernel
 response data. They do not implement storage, transactions, migration or paging.
@@ -75,7 +73,7 @@ and connection cleanup. Runtime integration is tested with the installed package
 
 ## 内部执行和观察资源
 
-Python/Node 的现有调用保持不变。SDK 同时执行的入站业务调用有独立的内部上限（1024），不与出站请求额度关联；达到上限时经标准 ExecutionFailed 回执报告 `sdk_execution_capacity_exhausted`，不创建无限等待任务。该额度不代表业务调度或自动重试。同步阻塞或不响应取消的业务代码由进程停止隔离，SDK 不承诺能强制终止语言运行时中的任意函数。
+Python/Node 的现有调用保持不变。SDK **没有独立的入站并发配额**，也不会因为本地容量拒绝内核投递；在途工作量由业务域自己控制（B6：handler 必须快速返回，长任务丢后台任务或队列）。同步阻塞或不响应取消的业务代码由进程停止隔离，SDK 不承诺能强制终止语言运行时中的任意函数。
 
 观察与实时日志订阅仍为尽力副本，内核历史、每个订阅和进程出口均有内部资源上限。慢订阅、超大事件、订阅资源不足或断开可能产生缺口；不提供持久重放保证，不新增队列/背压/重连参数。普通日志的持久接收独立于这些副本，主库写入落后可由独立 WAL 缓冲及游标恢复。
 
@@ -83,7 +81,7 @@ Python/Node 的现有调用保持不变。SDK 同时执行的入站业务调用�
 
 `domain.bindings` exposes the kernel-assigned private endpoint for each configured public port binding. See [端口绑定](capabilities/port-bindings.md). `probe_handler` is compatibility-only and does not execute a health probe. Updates without explicit spec reread the source boot file.
 
-`on_observation` / `onObservation` also receives DomainStatusChanged and DomainStateSnapshot. The former is best-effort; the latter retains the latest current-state image and coalesces slow delivery. Cache: Python `domain.observer.domain_states`, Node `domain.observer.domainStates`. No polling, persistent replay, or subscriber queue settings. See [域状态观察](capabilities/domain-state-observation.md). The snapshot does not make ordinary lifecycle observations lossless.
+`on_observation` / `onObservation` also receives DomainStatusChanged and DomainStateSnapshot (after `subscribe_observer` / `subscribeObserver`). The former is best-effort; the latter carries the latest current-state image and coalesces slow delivery. **The SDK keeps no state cache** — there is no `domain.observer` sub-object and no `domain_states` / `domainStates`; a caller that needs the latest image must retain it from the events it receives. No polling, persistent replay, or subscriber queue settings. See [域状态观察](capabilities/domain-state-observation.md). The snapshot does not make ordinary lifecycle observations lossless.
 
 ## C4 virtual file namespace (`vfs://`)
 

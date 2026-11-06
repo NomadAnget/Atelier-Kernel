@@ -1,6 +1,6 @@
 # 无轮询的域状态观察
 
-使用既有 Python `domain.on_observation` / Node `domain.onObservation`，无需队列参数、恢复循环或定时查询。
+用一个观察订阅就能拿到域状态，无需队列参数、恢复循环或定时查询：**先 `await subscribe_observer()`，再用 `on_observation` / `onObservation` 收事件**。只注册回调不会订阅。
 
 ## 实际状态转换
 
@@ -26,21 +26,27 @@ active表示内核处理器注册状态，不等同业务ping.ready或模型加�
 
 转换事件仍是可丢失的诊断记录，不承诺逐条重放所有中间状态。状态镜像是当前状态的可替换内存值：内核保留一份最新待发镜像，SDK慢回调保留一份最新待回调镜像；普通可丢失事件为镜像让出预算，不因它们填满队列而漏掉最后状态。不写持久消息账本/磁盘，不引入持久事件系统。状态表及镜像固有空间随当前已知域数量变化，不随历史转换次数增长。停止读取的客户端恢复读取后取得最新状态，而不是重放全部历史。
 
-Python `domain.observer.domain_states`、Node `domain.observer.domainStates`为只读拷贝，尚未订阅时为None/null。它们缓存最新完整details。Web在浏览器SSE重连时直接发送该镜像，不请求轮询；新的Web进程正常订阅即重新取得初始镜像。底层IPC断开后SDK仍遵循原退出契约，由监督器恢复域，恢复后的新进程重新订阅；不宣称能在死进程中重连IPC。
+**SDK 不缓存状态镜像**：v0.2 的 `AtelierDomain` 没有 `observer` 子对象，也不暴露 `domain_states` / `domainStates`。需要"最新镜像"的调用方（例如给浏览器 SSE 重连补基线）必须在自己的域里保存收到的最新 `details`，见下方示例。镜像只存在于内核出口与你自己保存的那一份；内核不保证重放历史转换。
 
 同stream_id下忽略旧revision，允许等revision的幂等初始重发；stream_id变化时完整替换基线。ObservationEvent顶层event_id仍属于普通观察历史，镜像中的event_id只是观察水位；状态排序必须使用details中的stream_id/revision，不能按message_id统计状态事件。
 
 ## Web接入示例
 
 ```js
+await domain.subscribeObserver();          // 必须先订阅，onObservation 只是登记回调
+let latestSnapshot = null;                 // 自己保存最新镜像（SDK 不提供缓存）
 domain.onObservation(event => {
   if (event.message_type === 'DomainStateSnapshot') {
-    publishStateToSse(event.details);
+    const prev = latestSnapshot;
+    // 同 stream_id 下忽略旧 revision；stream_id 变化时整体替换基线。
+    if (!prev || prev.stream_id !== event.details.stream_id || event.details.revision >= prev.revision) {
+      latestSnapshot = event.details;
+    }
+    publishStateToSse(latestSnapshot);
   }
 });
 // 每个新浏览器连接：
-const latest = domain.observer.domainStates;
-if (latest) sendInitialState(latest);
+if (latestSnapshot) sendInitialState(latestSnapshot);
 ```
 
 不增加状态轮询兜底。普通消息生命周期与逐条转换历史仍允许丢失，当前状态镜像负责最终收敛；用户回调永不返回或进程永不恢复时，不承诺该客户端能继续接收。

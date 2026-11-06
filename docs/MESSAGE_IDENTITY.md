@@ -7,9 +7,24 @@ source_domain, original targets, parameters and data. Single-target submissions 
 have both IDs. IDs include a kernel-instance UUID to avoid collisions across restarts.
 
 Submission identity is (authenticated source domain, physical process generation, seq)
-within the source process session; generation remains internal to the kernel. Repeating a positive seq replays the original children's authoritative
-receipts and ID list, without allocating new IDs or executing again. seq=0 opts out.
-The kernel allocates the complete split before dispatching the first child.
+within the source process session; generation remains internal to the kernel. The kernel
+allocates the complete split before dispatching the first child.
+
+Repeating a positive `seq` has three distinct outcomes, not one:
+
+1. **Inside the dedup window** (the most recent 2048 submissions for that source
+   generation): replay the original children's authoritative receipts and ID list without
+   allocating new IDs or executing again.
+2. **Below the high-water mark but evicted from the window**: the kernel must not guess.
+   For any submission that requires deduplication (a `Durable` or `Volatile` target, or a
+   mixed split), it **rejects explicitly** with `ContractInvalid` and error code
+   `stale_submission`, naming the high-water mark. It never allocates a fresh identity and
+   never silently re-executes.
+3. **Pure `Ephemeral` submissions** opt out of the stale check (C3:56): while in flight a
+   repeated seq still reuses the identity; after the submission reaches terminal and its
+   identity is reclaimed, the same seq is a **new** transient delivery.
+
+`seq=0` opts out of deduplication entirely.
 
 The ledger keys each independent delivery by message_id. Target ownership is still
 checked for every receipt. Repeated or regressing stages are absorbed; terminal

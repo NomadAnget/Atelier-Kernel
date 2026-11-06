@@ -301,14 +301,22 @@ domain.logger.info(`库存 ${sku} 扣减完毕`, { phase: "finish" });
    ```
    构建产物自动输出至 `dist/sdk/` 与 `dist/kernel-runtime/`。
 
-2. **GitHub Actions 自动构建与 Release 发布**：
-   - 每次推送代码到 `main` 分支：GitHub Actions（[`.github/workflows/build-and-release.yml`](https://github.com/NomadAnget/Atelier-Kernel/blob/v0.1.14/.github/workflows/build-and-release.yml)）自动构建 Python `.whl`、Node.js `.tgz` 以及 Linux / Windows / macOS 三端预编译运行包，并上传至 **Actions -> Artifacts**。
-   - 推送版本标签时自动发布正式 Release：
-     ```bash
-     git tag v0.1.0
-     git push origin v0.1.0
-     ```
-     GitHub Actions 将自动创建 Release 页面并挂载全部平台运行包与 SDK 安装包。
+2. **GitHub Actions 的构建与发布**（[`.github/workflows/build-and-release.yml`](../.github/workflows/build-and-release.yml)）：
+
+   | 触发 | 实际执行的 job | 产物 |
+   | :--- | :--- | :--- |
+   | 推送到 `main` | 只在 Linux / Windows / macOS 跑 `ci-test` | **无产物**，仅测试 |
+   | 推版本标签 `v*` | `ci-test` + 构建 SDK + 构建三平台运行包 + 发布 Release | Wheel、npm 包、三平台 tar.gz，挂到 Release 页面 |
+   | 手动 `workflow_dispatch` | 同标签，但不创建 Release | 上传到 Actions Artifacts |
+
+   发布正式版本：
+
+   ```bash
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+   注意：**普通 push 不会产出任何安装包**，需要 Artifacts 时手动触发 workflow。
 
 # v0.1.2: unexpected process exit recovery
 
@@ -316,10 +324,17 @@ Each external domain accepts `auto_restart` (default true), `max_restarts` (defa
 
 # Async SDK contract
 
-Python `await domain.run_async(on_start=...)` and Node `await domain.runAsync({onStart})` keep receiving frames while asynchronous handlers await other domains. `run` and receipt callbacks remain available. `send` and storage submission helpers now require await and return kernel IDs instead of local sequences. Both SDKs add single-target `request(target, message_type, params, data, timeout)` (Node takes `{timeout, signal}` as its last options argument); timeout is in seconds, default 30. A successful request returns the full completed receipt. Intermediate receipts never resolve it. Failed terminal receipts raise `DomainRequestError` with `status`, `data`, `message_id`; local timeout and disconnected transport use `timeout` and `connection_closed`. Timeout/cancellation stops local waiting but preserves public result slots for later wait-by-ID; consuming or explicitly forgetting a result releases its slot. Transport close ends pending waits. Python cancellation propagates `CancelledError`; Node AbortSignal raises a request error with status `cancelled`. Local cancellation does not cancel remote business work. Local sequence numbers are private transport details. The SDK default frame limit is 16MiB, replacing the accidental 64KiB limit; it remains a transport safeguard, not a claim of unlimited frame size. Blocking Python business work must run via asyncio.to_thread to keep the event loop responsive.
+- 生命周期：Python `await domain.run_async(on_start=..., on_close=...)`，Node `await domain.runAsync({onStart, onClose})`。异步 handler 在 `await` 其他域时仍能继续收帧。
+- `send` / `request` / 存储方法全部是 async，需要 `await`。
+- `request(target, message_type, params, data, timeout=30)`：**target 只接受单个字符串**；成功返回**整条终态回执**，中间回执不会让它 resolve。
+- 终态不是 `completed` 时抛 `DomainRequestError`，带 `status` / `data` / `message_id`。除真实终态外还会出现 `unknown_message`、`busy`；Node 本地超时抛 `status="timeout"`，Python 本地超时抛 `asyncio.TimeoutError`。**SDK 没有 `connection_closed` 这个状态，也不支持 AbortSignal**。
+- 本地超时或取消只是停止本地等待，**不取消内核侧的业务执行**；之后仍可用 id 再 `wait_result`。
+- 帧大小上限由**内核**执行（`MAX_IPC_FRAME` = 16 MiB，域→内核方向超限会被断连并记录诊断）。**SDK 自己不设帧上限**，也不代表任意大的消息都能过。
+- 阻塞式 Python 业务代码请用 `asyncio.to_thread` 跑，否则会占住该域事件循环。
 
+# Waiting by ID
 
-See [SDK_CONTRACT.md](SDK_CONTRACT.md): send returns one ID for a string target or ordered IDs for a target list. wait_result/waitResult and wait_results/waitResults consume results by ID; request_many/requestMany only waits existing IDs. A timed-out or cancelled public wait can be retried by ID; unread slots are bounded and can be explicitly forgotten.
+`send` 返回内核分配的 id：字符串 target 返回单个 id，列表 target 返回有序 id 列表。`wait_result` / `waitResult` 与 `wait_results` / `waitResults` 按 id 消费结果（后者只等待已存在的 id，绝不重新发送）。超时或取消的等待可以用 id 重试；未读取的结果槽有上限，也可以显式 `forget_result` 释放。
 
 ### 滚动更新重读启动配置
 

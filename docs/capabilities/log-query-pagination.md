@@ -21,19 +21,23 @@ Omit `before_id` (or use null) for the newest page. It must otherwise be a posit
 ## SDK
 
 ```python
-page = await domain.logger.query_logs_async(limit=200)
+page = await domain.query_logs(limit=200)
 while page['has_more']:
-    page = await domain.logger.query_logs_async(limit=200, before_id=page['next_before_id'])
+    page = await domain.query_logs(limit=200, before_id=page['next_before_id'])
 ```
 
 ```javascript
-let page = await domain.logger.queryLogsAsync({limit: 200});
+let page = await domain.queryLogs({ limit: 200 });
 while (page.has_more) {
-  page = await domain.logger.queryLogsAsync({limit: 200, beforeId: page.next_before_id});
+  page = await domain.queryLogs({ before_id: page.next_before_id, limit: 200 });
 }
 ```
 
-Direct send/wait log query methods also accept the cursor. Node accepts both `beforeId` and `before_id`. Python's optional cursor is appended after existing arguments; existing positional calls retain their meaning.
+两个 SDK 都只有 `query_logs` / `queryLogs`，没有 `logger.query_logs_async` 这类门面，也没有 `queryLogsAsync`。
+
+**参数名必须用内核字段名（snake_case）**：`before_id`、`limit`、`since_ts`、`level`、`layer`、`component`、`phase`、`domain_id`。SDK 把 params 原样转给内核，不做 camelCase 转换 —— 传 `beforeId` 会被内核当成未知字段**静默忽略**，返回的是最新一页而不是游标页。`queryObserver` 的 `message_id` / `source_domain` 同理。
+
+返回值就是内核响应的 `data`：`{logs, total, has_more, next_before_id}`。
 
 ## Consistency and resource ownership
 
@@ -44,6 +48,6 @@ Page JSON has a 2 MiB budget including space for metadata. Reaching the byte bud
 ## Validation
 
 - Five Rust regression groups cover traversal beyond 2000 rows, identical text/timestamps, filters, concurrent append, restart continuation, empty/exact-last pages, invalid input, byte-budget continuation, oversized records and journal backlog.
-- A real-kernel Python/Node integration verifies facade and legacy send/wait methods, both Node cursor aliases, page metadata and invalid-cursor errors.
+- A real-kernel Python/Node integration verifies the query methods, page metadata and invalid-cursor errors.
 - The native integration is included in the existing three-platform main CI SDK step.
 - Web integration and deployment are intentionally outside this change. Existing Web-only history window limits remain until its owner connects the new SDK fields.

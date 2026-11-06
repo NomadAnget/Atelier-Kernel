@@ -258,3 +258,34 @@ class LocalLimitTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DomainRequestError) as ctx2:
             await domain.wait_result("gone")
         self.assertTrue(ctx2.exception.data["evicted"])
+
+
+class TransportFailureTest(unittest.IsolatedAsyncioTestCase):
+    async def test_send_after_shutdown_is_rejected_locally(self):
+        domain = make_fake()
+        domain._closed = True
+        with self.assertRaises(DomainRequestError) as ctx:
+            await domain.send("t.h", "T")
+        self.assertEqual(ctx.exception.status, "local_backpressure")
+        self.assertFalse(ctx.exception.data["submitted"])
+
+    async def test_transport_loss_settles_a_pending_send(self):
+        domain = make_fake()
+        task = asyncio.create_task(domain.send("t.h", "T"))
+        await asyncio.sleep(0.01)
+        domain._on_transport_closed("socket closed")
+        await asyncio.sleep(0.01)
+        with self.assertRaises(DomainRequestError) as ctx:
+            await task
+        self.assertEqual(ctx.exception.status, "transport_closed")
+        self.assertTrue(domain.stats()["transport_closed"])
+
+    async def test_unknown_status_is_counted(self):
+        domain = make_fake()
+        domain._receive_result({"message_id": "m", "target": "t.h", "status": "weird_status", "seq": 1})
+        self.assertEqual(domain.stats()["unknown_statuses"], 1)
+
+    async def test_receipt_without_submission_is_counted(self):
+        domain = make_fake()
+        domain._receive_result({"message_id": "m-x", "target": "t.h", "status": "completed", "seq": 999})
+        self.assertEqual(domain.stats()["unmatched_receipts"], 1)

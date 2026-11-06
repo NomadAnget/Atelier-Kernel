@@ -62,7 +62,16 @@ class AtelierDomain:
         self._results = {}  # message_id -> {"target", "future", "waiters", "evict"}
         self._orphans = {}  # seq -> 与 _pending 同构，供已停止等待的提交继续认领回执
         self._evicted_ids = set()
-        self._stats = {"evicted_results": 0, "dropped_orphan_receipts": 0, "local_backpressure": 0}
+        self._transport_closed = False
+        self._stats = {
+            "evicted_results": 0,
+            "dropped_orphan_receipts": 0,
+            "local_backpressure": 0,
+            "unmatched_receipts": 0,
+            "malformed_frames": 0,
+            "unknown_statuses": 0,
+            "dropped_frames": 0,
+        }
         self._events = {kind: [] for kind in ("receipt", "log", "notify", "observation", "telemetry")}
         self._logger = _Logger(self)
         self._namespace = None
@@ -99,6 +108,13 @@ class AtelierDomain:
 
     # ── 能力 3/4：发消息 / 请求 ────────────────────────────────────────
     async def send(self, targets, message_type, params=None, data=None, *, timeout=30):
+        if self._closed or self._transport_closed:
+            # 端到端已关闭：消息不可能交给内核，必须显式拒绝而不是静默丢弃后等超时。
+            self._stats["local_backpressure"] += 1
+            raise DomainRequestError(
+                "local_backpressure",
+                {"submitted": False, "reason": "sdk closed" if self._closed else "transport closed"},
+            )
         names = [targets] if isinstance(targets, str) else list(targets)
         names = list(dict.fromkeys(names))
         if not names:
@@ -212,6 +228,11 @@ class AtelierDomain:
             "evicted_results": self._stats["evicted_results"],
             "dropped_orphan_receipts": self._stats["dropped_orphan_receipts"],
             "local_backpressure": self._stats["local_backpressure"],
+            "unmatched_receipts": self._stats["unmatched_receipts"],
+            "malformed_frames": self._stats["malformed_frames"],
+            "unknown_statuses": self._stats["unknown_statuses"],
+            "dropped_frames": self._stats["dropped_frames"],
+            "transport_closed": self._transport_closed,
         }
 
     # ── 能力 6：上报回执 ──────────────────────────────────────────────
@@ -513,6 +534,7 @@ class AtelierDomain:
     # ── 传输 ──────────────────────────────────────────────────────────
     def _write(self, frame):
         if self._closed or self._write_pipe is None:
+            self._stats["dropped_frames"] += 1
             return
         line = json.dumps(frame, ensure_ascii=False) + "\n"
         with self._lock:
@@ -520,12 +542,15 @@ class AtelierDomain:
 
     def _read_loop(self):
         buffer = b""
+        reason = "read loop ended"
         while not self._closed:
             try:
                 chunk = os.read(self._read_pipe.fileno(), 8192)
-            except Exception:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001
+                reason = f"read failed: {error}"
                 break
             if not chunk:
+                reason = "read stream closed"
                 break
             buffer += chunk
             while b"\n" in buffer:
@@ -536,10 +561,35 @@ class AtelierDomain:
                 try:
                     frame = json.loads(raw.decode("utf-8"))
                 except Exception:  # noqa: BLE001
+                    self._stats["malformed_frames"] += 1
                     continue
                 if self._loop is not None:
                     # 不阻塞读线程：处理器里可能再发 request，需要读线程继续处理回执。
                     asyncio.run_coroutine_threadsafe(self._handle(frame), self._loop)
+        self._on_transport_closed(reason)
+
+    # 传输死亡是内核已经给出结论的场景（在途消息会被内核收敛为 ExecutionFailed）。
+    # SDK 不能沉默：用本地 transport_closed 终结所有等待，绝不让调用方挂到自己的超时。
+    def _on_transport_closed(self, reason):
+        if self._transport_closed:
+            return
+        self._transport_closed = True
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._fail_pending_on_transport_close, reason)
+
+    def _fail_pending_on_transport_close(self, reason):
+        error = DomainRequestError("transport_closed", {"submitted": True, "reason": reason})
+        for entry in list(self._pending.values()):
+            if not entry["future"].done():
+                entry["future"].set_exception(error)
+        self._pending.clear()
+        self._orphans.clear()
+        for message_id, result in list(self._results.items()):
+            if result["waiters"] and not result["future"].done():
+                result["future"].set_exception(error)
+            self._results.pop(message_id, None)
 
     async def _handle(self, frame):
         if frame.get("frame_type") == "receipt":
@@ -556,11 +606,16 @@ class AtelierDomain:
         message_id = frame.get("message_id")
         target = frame.get("target")
         status = frame.get("status")
-        if not isinstance(message_id, str) or status not in {"sent", "received", "started", *TERMINAL}:
+        if not isinstance(message_id, str):
+            return
+        if status not in {"sent", "received", "started", *TERMINAL}:
+            # 内核给出了 SDK 不认识的状态：计入可观测计数，绝不静默当作非终态。
+            self._stats["unknown_statuses"] += 1
             return
         seq = frame.get("seq")
         # 本地已停止等待的提交同样要认出归属：内核已经发出的回执不能被丢弃。
         entry = self._pending.get(seq) or self._orphans.get(seq)
+        claimed = False
         if entry and target not in entry["ids"] and target in entry["targets"]:
             entry["ids"][target] = message_id
             self._results[message_id] = {
@@ -569,6 +624,7 @@ class AtelierDomain:
                 "waiters": 0,
                 "evict": None,
             }
+            claimed = True
             if len(entry["ids"]) == len(entry["targets"]):
                 if not entry["future"].done():
                     entry["future"].set_result([entry["ids"][t] for t in entry["targets"]])
@@ -587,6 +643,9 @@ class AtelierDomain:
                             self._evicted_ids.discard(next(iter(self._evicted_ids)))
 
                 result["evict"] = self._loop.call_later(self._result_ttl, _evict)
+        if not claimed and not result:
+            # 回执找不到任何归属（超出孤儿窗口、或来自其他代际）：计数，不静默。
+            self._stats["unmatched_receipts"] += 1
 
     async def _dispatch(self, frame):
         target = frame.get("target", "")

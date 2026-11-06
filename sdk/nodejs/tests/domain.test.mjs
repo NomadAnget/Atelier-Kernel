@@ -268,3 +268,48 @@ test("unknown_message reports whether the local result was evicted", async () =>
     return true;
   });
 });
+
+// ── 传输失败与可观测性 ────────────────────────────────────────────────
+test("send after shutdown is rejected locally instead of waiting for a timeout", async () => {
+  const domain = makeDomain();
+  domain._closed = true;
+  await assert.rejects(domain.send("t.h", "T"), (error) => {
+    assert.equal(error.status, "local_backpressure");
+    assert.equal(error.data.submitted, false);
+    assert.equal(error.data.reason, "sdk closed");
+    return true;
+  });
+});
+
+test("transport loss settles a pending send instead of hanging", async () => {
+  const domain = makeDomain();
+  const task = domain.send("t.h", "T");
+  await tick();
+  domain._onTransportClosed("socket closed");
+  await assert.rejects(task, (error) => error.status === "transport_closed");
+  assert.equal(domain.stats().transport_closed, true);
+});
+
+test("transport loss rejects a waiting result", async () => {
+  const domain = makeDomain();
+  const send = domain.send("t.h", "T");
+  await tick();
+  receipt(domain, "m-wait", "t.h", "sent", null, domain.frames[0].seq);
+  await send;
+  const waiting = domain.waitResult("m-wait", { timeout: 30 });
+  await tick();
+  domain._onTransportClosed("eof");
+  await assert.rejects(waiting, (error) => error.status === "transport_closed");
+});
+
+test("an unknown receipt status is counted instead of being treated as non-terminal", () => {
+  const domain = makeDomain();
+  domain._receiveResult({ frame_type: "receipt", message_id: "m", target: "t.h", status: "weird_status", seq: 1 });
+  assert.equal(domain.stats().unknown_statuses, 1);
+});
+
+test("a receipt with no submission is counted as unmatched", () => {
+  const domain = makeDomain();
+  domain._receiveResult({ frame_type: "receipt", message_id: "m-x", target: "t.h", status: "completed", seq: 999 });
+  assert.equal(domain.stats().unmatched_receipts, 1);
+});

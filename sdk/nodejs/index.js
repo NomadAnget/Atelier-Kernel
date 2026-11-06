@@ -83,7 +83,16 @@ class AtelierDomain {
     this._orphans = new Map();
     this._orphanLimit = ORPHAN_LIMIT;
     this._evictedIds = new Set();
-    this._stats = { evicted_results: 0, dropped_orphan_receipts: 0, local_backpressure: 0 };
+    this._transportClosed = false;
+    this._stats = {
+      evicted_results: 0,
+      dropped_orphan_receipts: 0,
+      local_backpressure: 0,
+      unmatched_receipts: 0,
+      malformed_frames: 0,
+      unknown_statuses: 0,
+      dropped_frames: 0,
+    };
     this._events = { receipt: [], log: [], notify: [], observation: [], telemetry: [] };
     this._seq = 1;
     this._namespace = null;
@@ -106,6 +115,15 @@ class AtelierDomain {
 
   // 能力 3：发消息（返回消息 id）
   async send(targets, messageType, params = {}, data = {}, options = {}) {
+    if (this._closed || this._transportClosed) {
+      // 端到端已关闭：这条消息不可能交给内核，必须显式拒绝而不是静默丢弃后等超时。
+      this._stats.local_backpressure += 1;
+      throw new DomainRequestError(
+        "local_backpressure",
+        { submitted: false, reason: this._closed ? "sdk closed" : "transport closed" },
+        null
+      );
+    }
     const names = typeof targets === "string" ? [targets] : [...new Set(targets)];
     const timeout = options.timeout ?? 30;
     params = this._encodeFiles(params);
@@ -214,6 +232,11 @@ class AtelierDomain {
       evicted_results: this._stats.evicted_results,
       dropped_orphan_receipts: this._stats.dropped_orphan_receipts,
       local_backpressure: this._stats.local_backpressure,
+      unmatched_receipts: this._stats.unmatched_receipts,
+      malformed_frames: this._stats.malformed_frames,
+      unknown_statuses: this._stats.unknown_statuses,
+      dropped_frames: this._stats.dropped_frames,
+      transport_closed: this._transportClosed,
     };
   }
 
@@ -490,7 +513,10 @@ class AtelierDomain {
   }
 
   _write(frame) {
-    if (this._closed || !this._output) return;
+    if (this._closed || !this._output) {
+      this._stats.dropped_frames += 1;
+      return;
+    }
     this._output.write(JSON.stringify(frame) + "\n");
   }
 
@@ -504,10 +530,31 @@ class AtelierDomain {
       try {
         frame = JSON.parse(trimmed);
       } catch (_) {
+        this._stats.malformed_frames += 1;
         return;
       }
       this._handle(frame);
     });
+    this._rl.on("close", () => this._onTransportClosed("read stream closed"));
+    if (this._input?.on) {
+      this._input.on("error", (error) => this._onTransportClosed(String(error?.message || error)));
+    }
+  }
+
+  // 传输死亡是内核已经给出结论的场景（在途消息会被内核收敛为 ExecutionFailed）。
+  // SDK 不能沉默：用本地 transport_closed 终结所有等待，绝不让调用方挂到自己的超时。
+  _onTransportClosed(reason) {
+    if (this._transportClosed) return;
+    this._transportClosed = true;
+    const error = new DomainRequestError("transport_closed", { submitted: true, reason }, null);
+    for (const entry of this._pending.values()) entry.reject(error);
+    this._pending.clear();
+    for (const entry of this._orphans.values()) entry.reject?.(error);
+    this._orphans.clear();
+    for (const [messageId, result] of this._results) {
+      if (result.waiters > 0) result.reject?.(error);
+      this._results.delete(messageId);
+    }
   }
 
   _handle(frame) {
@@ -528,15 +575,24 @@ class AtelierDomain {
     const messageId = frame.message_id;
     const target = frame.target;
     const status = frame.status;
-    if (typeof messageId !== "string" || !(status === "sent" || status === "received" || status === "started" || TERMINAL.has(status))) return;
+    if (typeof messageId !== "string") return;
+    const nonTerminal = status === "sent" || status === "received" || status === "started";
+    if (!nonTerminal && !TERMINAL.has(status)) {
+      // 内核给出了 SDK 不认识的状态：计入可观测计数，绝不静默当作非终态。
+      this._stats.unknown_statuses += 1;
+      return;
+    }
     // 本地已停止等待的提交同样要认出归属：内核已经发出的回执不能被丢弃。
     const entry = this._pending.get(frame.seq) ?? this._orphans.get(frame.seq);
+    let claimed = false;
     if (entry && !entry.ids.has(target) && entry.targets.includes(target)) {
       entry.ids.set(target, messageId);
       let resolve;
-      const promise = new Promise((yes) => { resolve = yes; });
-      const result = { target, promise, resolve, waiters: 0, observed: false, evict: null };
+      let reject;
+      const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+      const result = { target, promise, resolve, reject, waiters: 0, observed: false, evict: null };
       this._results.set(messageId, result);
+      claimed = true;
       if (entry.ids.size === entry.targets.length) {
         entry.resolve(entry.targets.map((t) => entry.ids.get(t)));
         this._orphans.delete(frame.seq);
@@ -554,6 +610,10 @@ class AtelierDomain {
           if (this._evictedIds.size > 1024) this._evictedIds.delete(this._evictedIds.values().next().value);
         }, this._resultTtlMs);
       }
+    }
+    if (!claimed && !result) {
+      // 回执找不到任何归属（超出孤儿窗口、或来自其他代际）：计数，不静默。
+      this._stats.unmatched_receipts += 1;
     }
   }
 

@@ -50,11 +50,19 @@ SDK 侧只有少量本地资源上限，用来约束自己的等待槽，与业�
 
 ### 本地限制与内核终态的边界（硬约束）
 
-内核是全系统唯一具备准入判定权的一方：每条真正提交给内核的消息都由内核给出明确终态。SDK 的本地上限**只允许推迟写入**，不允许替内核判决，具体三条：
+内核是全系统唯一具备准入判定权的一方：每条真正提交给内核的消息都由内核给出明确终态。SDK 的本地上限**只允许推迟写入**，不允许替内核判决，具体五条：
 
 1. **未写入 ≠ 终态**。`local_backpressure` 表示帧还在 SDK 里，内核从未见过这条消息；它必须与 `completed` / `execution_failed` / `target_invalid` / `contract_invalid` 这些内核状态严格区分，调用方可以据此安全重试。
 2. **已经写入就不许忘**。帧写进管道后，即使本地等待超时，SDK 仍保留该提交的回执归属（有界，`ORPHAN_LIMIT=4096`，先进先出），迟到的回执照样能关联到 `message_id` 并进入 `wait_result`。丢弃计入 `stats().dropped_orphan_receipts`，正常为 0。
-3. **驱逐可观测**。`stats()` 暴露 `pending` / `results` / `orphans` / `evicted_results` / `dropped_orphan_receipts` / `local_backpressure` 六个计数；它们只描述 SDK 自己的内存，不代表内核状态。
+3. **关闭后不许假装提交**。`shutdown()` 之后调用 `send` / `request` 立即以 `local_backpressure`（`data.reason="sdk closed"`）拒绝，不再"静默不写然后等超时"；被丢弃的帧计入 `stats().dropped_frames`。
+4. **传输死亡不得沉默**。读端点 EOF 或读错误时，内核已经把该代际的在途消息收敛为 `ExecutionFailed`；SDK 必须以本地 `transport_closed` 立即终结所有等待（在途提交与正在等待的结果），不允许让调用方挂到自己的超时。`stats().transport_closed` 随之为真。
+5. **一切丢弃都要可观测**。`stats()` 暴露十一个计数：`pending` / `results` / `orphans` / `evicted_results` / `dropped_orphan_receipts` / `local_backpressure` / `unmatched_receipts` / `malformed_frames` / `unknown_statuses` / `dropped_frames` / `transport_closed`。它们只描述 SDK 自己的内存与本地失败，不代表内核状态。
+
+### 两处"用内核词汇说话"的说明
+
+- `_dispatch` 在域内**没有该 handler** 时回 `target_invalid`：路由仍在，是**本域自己**对无法处理的消息给出的回执，不是内核的准入裁决。
+- handler 抛出的非 `DomainExecutionFailed` 异常由 SDK 兜底上报 `execution_failed`，载荷固定为 `{error:"handler_exception", reason}`。这是 SDK 定义的兜底 schema；业务需要自己的错误结构时应显式抛 `DomainExecutionFailed`。
+- 回执状态若既不在四阶段（`sent`/`received`/`started`）也不在终态集合内，计入 `stats().unknown_statuses` 并丢弃，绝不静默当作"非终态"永久等待；找不到归属的回执计入 `unmatched_receipts`，无法解析的帧计入 `malformed_frames`。
 
 > SDK 侧的构造参数只有这三个（Python `max_pending` / `result_ttl`，Node `maxPending` / `resultTtlMs`）。历史上 Python 还有一个 `max_results=4096`，它只被赋值、不参与任何容量判断，已删除——**不要再按它调优**。孤儿保留上限是模块常量，不是构造参数。
 

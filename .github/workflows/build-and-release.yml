@@ -50,6 +50,12 @@ jobs:
       - name: Run Kernel Unit & Integration Tests
         run: cargo test
 
+      # 文档漂移门禁：只做可判定断言（链接、SDK 成员、kernel 目标、环境变量、
+      # 源码路径、CLI 参数、两语言能力表、发布包目录树）。平台无关，跑一次即可。
+      - name: Check Docs Against Code
+        if: runner.os == 'Linux'
+        run: python3 scripts/check_docs.py
+
       - name: Build Kernel for Native SDK Regression
         run: cargo build --locked
 

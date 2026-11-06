@@ -120,10 +120,11 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 
 ## 5. 换骨顺序（已更新：不是"重写 ledger.rs"，是"路由器级重接 + 删旧四表"）
 
-> **已完成**（`0d5dfde`）：`src/ledger.rs` 已改写为 nucleus 门面——`Nucleus` 持有活跃/审计/提交去重唯一权威，SQLite 只镜像 Durable 子集为 `messages`（活）+ `audit`（终态，只增）；`identities` / `highwater` / `kernel_sessions` / 旧 `kernel_ledger` 四表删除。下列 §1–§4 的三表设计即该实现的出处。
+> ~~**已完成**（`0d5dfde`）：`src/ledger.rs` 已改写为 nucleus 门面——`Nucleus` 持有活跃/审计/提交去重唯一权威，SQLite 只镜像 Durable 子集……~~
+> **已作废（见 §8）**：该描述里的"`Nucleus` 持有审计唯一权威"违反宪法 C3:54，已改为"核只存活跃行，历史只存 SQLite"。保留本行仅为记录演进。
 
 > **终局记录（换骨终止，2026-11）**：§1–§4 的三表设计已由 `src/core/nucleus.rs`（消息状态机）实现，并由 `src/services/ledger.rs` 作为门面**完整接入生产路径**：
-> 入口 `allocate_submission → nucleus.allocate_submission_with_ids`（`ledger.rs:471`）、逐 target `record_initial_target_state → nucleus.put`（`ledger.rs:647`）、终态 `commit_advance → nucleus.advance`（`ledger.rs:790`）+ `record_terminal`（`ledger.rs:641`）、Durable 接收 `record_delivery`（`ledger.rs:696`）。
+> 入口 `allocate_submission → nucleus.allocate_submission_with_ids`、逐 target `record_initial_target_state → nucleus.put`、终态 `commit_advance → nucleus.advance`、Durable 接收 `record_delivery`。
 >
 > 据此，原第 1/2/3 步（把 `nucleus` 调用搬进 router）**已无功能价值**：行为完全相同，只是把同一批调用换了个文件；唯一"收益"是让未接线模块变成"在用"。
 >
@@ -131,7 +132,7 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 >
 > 原第 4 步（outbox → transport）**不执行**：`Transport` 当时只是无界内存帧日志（`Vec<Frame>`），不承担 C3 要求的持久 spool（`kernel_outbox`）、内存上界（2 MiB / 256 KiB / 1024 项）、临时文件溢出、「实际写完后才清除」以及重启收敛；顶替 `outbox` 会直接降级 C3，属于用能力换整洁。
 >
-> **现行固定分工**：`nucleus` = 消息状态机；`outbox` = C3 传输持久化/有界/溢出；`ledger` = 两者门面 + SQLite 镜像（`messages` 活行 / `audit` 终态）。
+> **现行固定分工**：`nucleus` = 消息状态机，**只存活跃行**；`outbox` = C3 传输持久化/有界/溢出；`ledger` = 两者门面 + **终态历史的唯一权威**（SQLite `audit` 表，按需索引点查）。
 
 ### 关键断点：核的粒度（已按方案 B 定案并落地）
 
@@ -153,3 +154,33 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 `fail_inflight_for_channel` 的旧注释要求"即使磁盘不可用也能关死代际"，旧结构靠 `identities.record` 内存缓存兜底。**已定案 A**：放弃磁盘无关兜底——磁盘坏时死域 Durable 在途消息留在 `execution_outcome: unknown`，不强行收敛。依据宪法 C3:48"无法持久化的失败反馈仅为当前进程中的明确失败，不伪称其本身已有跨重启持久保证"；不为极端故障维护常驻第二真相源。
 
 我建议 **A**：宪法 C3:48 已经写死"无法持久化的失败反馈仅为当前进程中的明确失败，不伪称其本身已有跨重启持久保证"，磁盘坏属于极端场景，不该为它维护常驻第二真相源。
+
+---
+
+## 8. C3:54 落地记录：历史只存 SQLite（2026-11）
+
+**违规事实（修复前）**：`Nucleus.audit: Vec<AuditRecord>` 是生产环境里终态历史的唯一权威副本——生产从不安装 `Store`，SQLite 只是"镜像"。启动时 `SELECT … FROM audit ORDER BY id` 全量载入并反序列化；终态持续 `push`；`get_audit` 为 `iter().find()` 线性扫描；`audit` 表无二级索引。这同时违反 C3:54 的三句原文（直接查 SQLite / 不建立全量内存索引 / 不得把全部历史结果一次性展开到内存）与 §2"留日志不留状态"。
+
+**还有一条隐藏的性能塌陷**：`record_delivery` 的存在性探测发生在 `nucleus.put` **之前**，因此对每个新消息必然落到 `get_audit` 的全量扫描——投递成本是 `O(|audit|)`，历史越长越慢。
+
+**落地方式（四步，每步独立可验证）**
+
+| 步 | 改动 | 提交 |
+|---|---|---|
+| 1 | `audit` 加 `idx_audit_message` / `idx_audit_logical`；投递与入口路径的存在性探测改为 `O(1)` active 守卫，并把 `write_messages_tx` 的 upsert 改成纯 `INSERT`（重复写必须显式失败而非静默覆盖）；`logical_id` 由调用方显式传入，删掉 `logical_id_for_message` 的隐式回退 | `93d143d` |
+| 2 | 删除 `Nucleus.audit` / `Store` / `VecStore` / `with_store` / `recover` / `get_audit` / `audit_snapshot` / `load_audit` / `record_terminal`；启动不再载入历史；`record_for_message` = active → `read_audit`（索引点查）；`receipts_for_logical` 去掉内存分支 | `249ce5a` |
+| 3 | `Binding.terminal` 在终态提交时写入，代际退役 `clear_session_dedup_for_domain` 零回查 | `ef72081` |
+| 4 | 迁走 `core` 里依赖内存审计的测试；新增存储级 I1 断言与 5 万行历史下的按需读取测试 | 同上 |
+
+**修复后的权威唯一性（8 条不变量）**
+
+1. 单一权威：终态结果只在 SQLite `audit`；内存无副本。
+2. 单点写入：`persist_advance` 的终态分支，`DELETE messages` + `DELETE kernel_outbox` + `INSERT audit` 同一事务。
+3. 先盘后存：DB 提交成功后才改核内状态；失败走 `mark_unpersisted_failure`。
+4. I1 互斥：同一 id 不同时出现在 `messages` 与 `audit`（`i1_live_and_historical_rows_never_coexist_on_disk` 在存储级断言）。
+5. 读路径单源：active 命中 → 核；未命中 → 只有一条 SQL 索引路径。
+6. 锁序：`record_for_message` 释放 nucleus 锁之后才取 db 锁，不引入 `db → nucleus` 嵌套。
+7. 启动不建内存索引：核从空状态开始。
+8. 载荷按需：只查被点名的 `message_id` / `logical_id`。
+
+**仍然保留的 O(n) I/O**：启动期的账本完整性扫描（`ledger.rs` 的 `SELECT … LIMIT 1` 坏行检查）仍会遍历 `messages` 与 `audit`。这是被 `corrupt_durable_rows_must_not_be_silently_reinterpreted_on_restore` 明确要求的安全检查，且**内存 O(1)、不反序列化载荷**，因此不违反 C3:54；若将来在意冷启动延迟，应把它挪到显式的 `--check` 或改成按需校验，而不是恢复内存索引。

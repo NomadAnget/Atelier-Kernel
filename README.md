@@ -81,6 +81,7 @@ sdk/python/            Python 域 SDK
 sdk/nodejs/            Node.js 域 SDK
 docs/                  契约、能力与 SDK 文档（入口 docs/INDEX.md）
 tests/                 分层测试（unit / transport / lifecycle / reliability / logging / c4 / sdk_e2e）
+AGENTS.md              给 AI 编程代理的工作约定（怎么用对、怎么改不破坏契约）
 ```
 
 ## 状态

@@ -39,13 +39,48 @@ async def add(msg):
 @domain.handler("file")
 async def file_handler(msg):
     domain.enable_file_interception()
-    await domain.refresh_file_index()
+    listed = await domain.refresh_file_index()
     with open("vfs://out/payload.bin", "wb") as f:
         f.write(b"v2-file-object")
+    tracked = domain.file_object_id("vfs://out/payload.bin")
     with open("vfs://out/payload.bin", "rb") as f:
         encoded = domain._encode_files({"f": f})
         decoded = await domain._decode_files(encoded)
-    return {"content": decoded["f"].read().decode(), "encoded": "__atelier_file__" in encoded["f"]}
+    return {
+        "content": decoded["f"].read().decode(),
+        "encoded": "__atelier_file__" in encoded["f"],
+        "tracked": isinstance(tracked, str) and len(tracked) == 32,
+        "listed": isinstance(listed, dict),
+    }
+
+@domain.handler("api")
+async def api_handler(msg):
+    rid = "api-" + msg.message_id
+    await domain.storage_insert(rid, "api", {"value": 1})
+    await domain.storage_update(rid, {"value": 2})
+    updated_rows = (await domain.storage_query(record_id=rid)).get("items") or []
+    await domain.storage_delete(rid)
+    gone_rows = (await domain.storage_query(record_id=rid)).get("items") or []
+    observer = await domain.query_observer()
+    progress = await domain.query_progress()
+    unsubscribed = all(
+        isinstance(result, dict)
+        for result in (
+            await domain.unsubscribe_logs(),
+            await domain.unsubscribe_telemetry(),
+            await domain.unsubscribe_notify(),
+            await domain.unsubscribe_observer(),
+        )
+    )
+    stop = await domain.supervisor_stop("no-such-domain")
+    return {
+        "updated": bool(updated_rows) and updated_rows[0].get("data", {}).get("value") == 2,
+        "removed": not gone_rows,
+        "observer_ok": isinstance(observer, dict),
+        "progress_ok": isinstance(progress, dict),
+        "unsubscribed": unsubscribed,
+        "stop_ok": isinstance(stop, dict) and stop.get("was_running") is False,
+    }
 
 @domain.handler("storage")
 async def storage_handler(msg):
@@ -196,12 +231,25 @@ fn sdk_v2_round_trip() {
     let file_data = file_result.data.unwrap();
     assert_eq!(file_data["content"], "v2-file-object");
     assert_eq!(file_data["encoded"], true);
+    assert_eq!(file_data["tracked"], true, "file_object_id: {file_data}");
+    assert_eq!(file_data["listed"], true, "refresh_file_index: {file_data}");
 
     verifier.send(vec!["v2test.storage".into()], "Storage", json!({}), json!({}));
     let stored = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(stored.status, atelier_kernel::ContractStatus::Completed, "{:?}", stored.data);
     let stored_data = stored.data.unwrap();
     assert!(stored_data["rows"].as_u64().unwrap_or(0) >= 1, "{stored_data}");
+
+    verifier.send(vec!["v2test.api".into()], "Api", json!({}), json!({}));
+    let api = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(api.status, atelier_kernel::ContractStatus::Completed, "{:?}", api.data);
+    let api_data = api.data.unwrap();
+    assert_eq!(api_data["updated"], true, "storage_update: {api_data}");
+    assert_eq!(api_data["removed"], true, "storage_delete: {api_data}");
+    assert_eq!(api_data["observer_ok"], true, "query_observer: {api_data}");
+    assert_eq!(api_data["progress_ok"], true, "query_progress: {api_data}");
+    assert_eq!(api_data["unsubscribed"], true, "unsubscribe_*: {api_data}");
+    assert_eq!(api_data["stop_ok"], true, "supervisor_stop: {api_data}");
 
     verifier.send(vec!["v2test.query".into()], "Query", json!({}), json!({}));
     let queried = terminal(&verifier, Duration::from_secs(10));

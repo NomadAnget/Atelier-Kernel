@@ -1,4 +1,4 @@
-//! SDK v2 Node 鐪熷疄鍐呮牳 e2e锛氭敞鍐屽鐞嗗櫒銆乻end/request 涓婚摼璺€佸洓闃舵鍥炴墽銆?
+//! SDK v2 Node 真实内核 e2e：注册处理器、send/request 主链路、四阶段回执。
 use atelier_kernel::{AtelierKernel, DomainProcessSpec, KernelBootConfig, KernelToDomainFrame as F};
 use serde_json::json;
 use std::path::PathBuf;
@@ -30,21 +30,47 @@ domain.handler("echo", async (msg) => ({{ echo: msg.data.value }}));
 domain.handler("add", async (msg) => ({{ sum: Number(msg.data.a) + Number(msg.data.b) }}));
 domain.handler("file", async () => {{
   domain.enableFileInterception();
-  await domain.refreshFileIndex();
+  const listed = await domain.refreshFileIndex();
   const fsp = require("fs/promises");
   await fsp.writeFile("vfs://out/payload.bin", "v2-file-object");
+  const tracked = domain.fileObjectId("vfs://out/payload.bin");
   const handle = await fsp.open("vfs://out/payload.bin", "r+");
   const encoded = domain._encodeFiles({{ f: handle }});
   const decoded = await domain._decodeFiles(encoded);
   const buffer = Buffer.alloc(64);
   const {{ bytesRead }} = await decoded.f.read(buffer, 0, 64, 0);
-  return {{ content: buffer.subarray(0, bytesRead).toString(), encoded: !!encoded.f.__atelier_file__, handle_path: String(handle.path || ""), ns_count: domain._namespace.byPhysical.size }};
+  return {{ content: buffer.subarray(0, bytesRead).toString(), encoded: !!encoded.f.__atelier_file__, handle_path: String(handle.path || ""), ns_count: domain._namespace.byPhysical.size, tracked: typeof tracked === "string" && tracked.length === 32, listed: !!listed && typeof listed === "object" }};
 }});
 domain.handler("storage", async (msg) => {{
   const recordId = "e2e-" + msg.message_id;
   await domain.storageInsert(recordId, "e2e", {{ value: 7 }});
   const query = await domain.storageQuery({{ record_id: recordId }});
   return {{ rows: (query.items || []).length, count: query.count }};
+}});
+domain.handler("api", async (msg) => {{
+  const rid = "api-" + msg.message_id;
+  await domain.storageInsert(rid, "api", {{ value: 1 }});
+  await domain.storageUpdate(rid, {{ value: 2 }});
+  const updatedRows = (await domain.storageQuery({{ record_id: rid }})).items || [];
+  await domain.storageDelete(rid);
+  const goneRows = (await domain.storageQuery({{ record_id: rid }})).items || [];
+  const observer = await domain.queryObserver();
+  const progress = await domain.queryProgress();
+  const unsubscribed = [
+    await domain.unsubscribeLogs(),
+    await domain.unsubscribeTelemetry(),
+    await domain.unsubscribeNotify(),
+    await domain.unsubscribeObserver(),
+  ].every((r) => !!r && typeof r === "object");
+  const stop = await domain.supervisorStop("no-such-domain");
+  return {{
+    updated: updatedRows.length > 0 && !!updatedRows[0].data && updatedRows[0].data.value === 2,
+    removed: goneRows.length === 0,
+    observer_ok: !!observer && typeof observer === "object",
+    progress_ok: !!progress && typeof progress === "object",
+    unsubscribed,
+    stop_ok: !!stop && typeof stop === "object" && stop.was_running === false,
+  }};
 }});
 domain.handler("query", async () => {{
   const handlers = await domain.queryHandlers();
@@ -149,12 +175,25 @@ domain.run();
     let file_data = file_result.data.unwrap();
     assert_eq!(file_data["content"], "v2-file-object", "{file_data}");
     assert_eq!(file_data["encoded"], true, "{file_data}");
+    assert_eq!(file_data["tracked"], true, "fileObjectId: {file_data}");
+    assert_eq!(file_data["listed"], true, "refreshFileIndex: {file_data}");
 
     verifier.send(vec!["v2node.storage".into()], "Storage", json!({}), json!({}));
     let stored = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(stored.status, atelier_kernel::ContractStatus::Completed, "{:?}", stored.data);
     let stored_data = stored.data.unwrap();
     assert!(stored_data["rows"].as_u64().unwrap_or(0) >= 1, "{stored_data}");
+
+    verifier.send(vec!["v2node.api".into()], "Api", json!({}), json!({}));
+    let api = terminal(&verifier, Duration::from_secs(10));
+    assert_eq!(api.status, atelier_kernel::ContractStatus::Completed, "{:?}", api.data);
+    let api_data = api.data.unwrap();
+    assert_eq!(api_data["updated"], true, "storageUpdate: {api_data}");
+    assert_eq!(api_data["removed"], true, "storageDelete: {api_data}");
+    assert_eq!(api_data["observer_ok"], true, "queryObserver: {api_data}");
+    assert_eq!(api_data["progress_ok"], true, "queryProgress: {api_data}");
+    assert_eq!(api_data["unsubscribed"], true, "unsubscribe*: {api_data}");
+    assert_eq!(api_data["stop_ok"], true, "supervisorStop: {api_data}");
 
     verifier.send(vec!["v2node.query".into()], "Query", json!({}), json!({}));
     let queried = terminal(&verifier, Duration::from_secs(10));

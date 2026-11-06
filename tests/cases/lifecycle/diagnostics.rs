@@ -92,8 +92,10 @@ fn natural_child_signal_is_observed_before_cleanup() {
 #[cfg(unix)]
 #[test]
 fn oversized_rx_records_original_error_before_cleanup() {
+    // 必须像真实域一样先连 IN 再连 OUT：只开 OUT 时内核的 tx 线程会永远卡在 accept，
+    // 回收路径一旦置 `stop`，`pump_lines` 就不记录 rx 诊断，这条断言会退化成超时。
     let row = probe(
-        &format!("{IPC_OPEN}\nimport time\nw=_ipc('ATELIER_IPC_OUT','wb'); w.write(b'x'*(16*1024*1024+1)); time.sleep(30)"),
+        &format!("{IPC_OPEN}\nimport time\nr=_ipc('ATELIER_IPC_IN','rb'); w=_ipc('ATELIER_IPC_OUT','wb'); w.write(b'x'*(16*1024*1024+1)); time.sleep(30)"),
         &["rx_read"],
     );
     assert_eq!(row["diagnostic"]["details"]["kind"], "InvalidData");

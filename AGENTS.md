@@ -36,7 +36,7 @@ Atelier Kernel 的主要使用者就是 AI 编程代理。这份文件只回答�
 | 3 | **不直接打开内核 SQLite**（`data/*.db`） | M4，账本是内核私有状态 | `--check` 报 M4 违规；可能损坏账本 |
 | 4 | **域间禁止发布订阅**。只有 `kernel.*` 的流可以订阅 | C2.3 | 架构违规，评审会退回 |
 | 5 | `domain_id` 只能是 ASCII 字母/数字/`_` 且全局唯一；handler 名**不含 `.`** | M1 | 启动校验失败 |
-| 6 | **handler 必须快速返回**，长任务丢后台任务/队列 | B6：一个域只有一个事件循环 | 该域事件循环被占住，所有消息排队 |
+| 6 | **正常异步 I/O 的 `await` 不会占住事件循环**；真正要挪走的是**长时间 CPU 计算**（丢线程 / 进程 / 任务执行器） | B6：一个域只有一个事件循环 | CPU 阻塞会卡住该域所有消息；而**提前 `return {"accepted": true}` 会立刻发出 `Completed` 回执**，调用方会当成业务已完成 |
 | 7 | **显式失败**，不要 try/except 后返回 `{"ok": true}` | B3 | 故障被掩盖，回执说谎 |
 | 8 | **用 SDK 的 15 项能力**，不手搓 JSON 帧 | 协议细节会变，SDK 是唯一入口 | 升级即坏 |
 
@@ -214,7 +214,8 @@ Linux/macOS 的行为由 CI 覆盖（`cargo check --tests --target x86_64-unknow
 | 在 `env` 里写 `ATELIER_IPC_IN` | 启动被拒 | 端点由内核注入 |
 | handler 名写成 `"order.create"` | 注册失败或被当成非法 | 只写 `"create"` |
 | 直接 `sqlite3.connect("data/atelier_kernel.db")` | M4 违规 | `storage_query` / `storage_insert` |
-| handler 里 `await` 一个几十秒的操作 | 该域事件循环被占住，后续消息全排队 | 起后台任务，先回 `{"accepted": true}` |
+| handler 里跑几十秒的 **CPU 计算** | 该域事件循环被占住，后续消息全排队 | 丢到 `asyncio.to_thread` / 子进程 / 任务执行器；handler 只负责登记 |
+| 为了"不阻塞"先 `return {"accepted": true}` 再后台干活 | 调用方收到 `Completed`，把"已接收"当成"已完成" | 除非契约明确就是"受理即完成"，否则等真正做完再返回；异步 I/O 的 `await` 本来就该等 |
 | 为了"复用"从另一个域 `import` 工具函数 | M4 违规 | 复制到本域，或让那个域暴露 handler |
 | 用 `sleep` 等回执 | 结果不稳 | `await domain.request(...)` |
 | 新增 `tests/foo.rs` | 测试目标数量变了 | 加到 `tests/cases/` 现有文件 |

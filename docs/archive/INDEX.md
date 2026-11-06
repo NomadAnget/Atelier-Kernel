@@ -24,6 +24,8 @@
 | [CORE_RELIABILITY_FIX_ACCEPTANCE.md](CORE_RELIABILITY_FIX_ACCEPTANCE.md) | 六项修复的验收记录 |
 | [RELIABILITY_STATUS.md](RELIABILITY_STATUS.md) | 当时的可靠性状态与已知边界 |
 | [PROCESS_REAPING_INVESTIGATION.md](PROCESS_REAPING_INVESTIGATION.md) | 进程回收状态提前清空的专项调查 |
+| [process-reaping-fix.md](process-reaping-fix.md) | 进程回收可见性的专项修复记录（缺陷证据、实现、回归）；当前契约见 [进程回收](../capabilities/process-reaping.md) |
+| [process-diagnostics-patch.md](process-diagnostics-patch.md) | 每代际进程诊断的本地补丁记录（基线、部署前置、当时的验证状态）；当前接口见 [进程诊断事件](../capabilities/process-diagnostics.md) |
 
 ## 重构与迁移方案
 

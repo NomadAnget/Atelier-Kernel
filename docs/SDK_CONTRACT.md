@@ -44,9 +44,11 @@ SDK 侧只有少量本地资源上限，用来约束自己的等待槽，与业�
 
 | 项 | Python | Node.js | 说明 |
 | :--- | :--- | :--- | :--- |
-| 待处理提交 | `max_pending=1024` | `maxPending: 1024` | 未完成提交 + 未读取结果的槽位总数 |
-| 保留结果 | `max_results=4096`、`result_ttl=30.0` 秒 | `resultTtlMs: 30000` | 没人等待的终态回执保留多久后被驱逐 |
-| 单次请求超时 | `timeout=30` | `options.timeout`，默认 30 秒 | 超时只放弃本地等待，不取消内核侧执行 |
+| 待处理提交 | `max_pending=1024` | `maxPending: 1024` | **只约束未完成的提交**（等待子消息 id / 等待终态回执的那些）。到上限时新的 send 会阻塞等释放，不会静默丢弃 |
+| 未读结果的存活期 | `result_ttl=30.0` 秒 | `resultTtlMs: 30000` | 没人等待的终态回执在多久后被驱逐。这是未读结果的**唯一**实际上限 |
+| 单次请求超时 | `timeout=30` | `options.timeout`，默认 30 秒 | 与上面无关：超时只放弃本地等待，不取消内核侧执行 |
+
+> Python 的 `max_results=4096` 构造参数**当前只被赋值，不参与任何容量判断** —— 它不是上限，不要依赖它。Node 没有对应参数。
 
 `shutdown()` 是协作式的：把实例标记为已关闭、结束 `run` / `runAsync` 主循环、销毁端点流并让出事件循环。**它不会中断语言运行时里正在执行的业务函数**；进程停止与重启是内核 supervisor 的职责。SDK 没有独立的入站并发配额，也没有可配置的排空宽限期。
 
@@ -57,8 +59,9 @@ string target yields one id, a target list yields an id list.
 wait_result/wait_results consume results by ID and never trigger a second send.
 request combines send/wait with one deadline and a single target.
 Timeout/cancellation preserves a public wait slot; completed/failed result consumption
-releases it. Explicit forget_result releases an unwanted slot. Unread results and
-submissions share max_pending capacity and are never silently evicted.
+releases it. Explicit forget_result releases an unwanted slot. `max_pending` counts
+outstanding submissions only; an unread terminal result is retained for `result_ttl`
+(Python) / `resultTtlMs` (Node) and is never silently evicted while someone waits on it.
 
 Request context is a read-only snapshot of the current kernel envelope identity:
 logical_id, message_id, source_domain, target and message_type. The SDK generates
@@ -154,11 +157,12 @@ Naming rules:
 
 | 环境变量 | 方向 | 域侧打开方式 |
 |---|---|---|
-| `ATELIER_IPC_IN` | 内核 → 域 | Python `open(IN, "rb", buffering=0)`；Node `net.createConnection(IN)` |
-| `ATELIER_IPC_OUT` | 域 → 内核 | Python `open(OUT, "wb", buffering=0)`；Node `net.createConnection(OUT)` |
+| `ATELIER_IPC_IN` | 内核 → 域 | Python：Windows `open(IN, "rb", buffering=0)`；Unix `socket(AF_UNIX).connect(IN)` 后 `makefile("rb", buffering=0)`。Node：`net.createConnection(IN)` |
+| `ATELIER_IPC_OUT` | 域 → 内核 | Python：Windows `open(OUT, "wb", buffering=0)`；Unix 同上再 `makefile("wb", buffering=0)`。Node：`net.createConnection(OUT)` |
 
-- Windows 用命名管道（`\\.\pipe\atelier-<domain>-<nonce>-{in,out}`），Unix 用 domain socket；
-- 两条管道各自单向——**不要**合成一条双向管道：Windows 上同一句柄的阻塞读会串行化写；
+- Windows 用命名管道（`\\.\pipe\atelier-<domain>-<nonce>-{in,out}`），可以用文件 API 直接开；
+- Unix 是 domain socket，**必须 `connect()`**：`open()` 对 socket 文件会失败。自带客户端时别照抄 Windows 的写法；
+- 两条端点各自单向——**不要**合成一条双向连接：Windows 上同一句柄的阻塞读会串行化写；
 - 域在 `on_start` 完成后，若带 `ATELIER_MANAGED_READY=1`，必须发 `{"frame_type":"ready"}` 帧，内核据此激活端口转发。
 
 **SDK**：单层 `AtelierDomain`、全异步、无门面客户端类、无同步 API、无 `_async` 别名。旧版 `domain.registry` / `domain.supervisor` / `attach_stdlib_logging` / `discover_handlers` / `get_handler_description` / `close` 均已移除，对应能力改为上表中的主类方法。

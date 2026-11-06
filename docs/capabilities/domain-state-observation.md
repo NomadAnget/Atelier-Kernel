@@ -1,6 +1,8 @@
 # 无轮询的域状态观察
 
-用一个观察订阅就能拿到域状态，无需队列参数、恢复循环或定时查询：**先 `await subscribe_observer()`，再用 `on_observation` / `onObservation` 收事件**。只注册回调不会订阅。
+用一个观察订阅就能拿到域状态，无需队列参数、恢复循环或定时查询。
+
+**顺序很关键：先注册 `on_observation` / `onObservation` 回调，再 `await subscribe_observer()`。** 内核一收到 `SubscribeObserver` 就**立刻推一条 `DomainStateSnapshot`**，然后才回订阅确认；而 SDK 在没有回调时直接丢弃事件（不缓存）。反过来写就会丢掉那条初始镜像。
 
 ## 实际状态转换
 
@@ -33,8 +35,8 @@ active表示内核处理器注册状态，不等同业务ping.ready或模型加�
 ## Web接入示例
 
 ```js
-await domain.subscribeObserver();          // 必须先订阅，onObservation 只是登记回调
 let latestSnapshot = null;                 // 自己保存最新镜像（SDK 不提供缓存）
+// 1) 先登记回调——内核在订阅被处理时会立刻推一条初始快照，那时回调必须已经在。
 domain.onObservation(event => {
   if (event.message_type === 'DomainStateSnapshot') {
     const prev = latestSnapshot;
@@ -45,6 +47,8 @@ domain.onObservation(event => {
     publishStateToSse(latestSnapshot);
   }
 });
+// 2) 再订阅，才会真正收到事件（含那条初始快照）。
+await domain.subscribeObserver();
 // 每个新浏览器连接：
 if (latestSnapshot) sendInitialState(latestSnapshot);
 ```

@@ -4,16 +4,20 @@
 
 优先使用官方 SDK，不要在业务域里手拼 `kernel.*` 协议。
 
-## 共同前提：订阅必须显式
+## 共同前提：先登记回调，再订阅
 
-`on_observation` / `on_log` / `on_telemetry` / `on_notify` **只登记一个本地回调**，不会向内核订阅。**必须先调 `subscribe_*` 才收得到事件**，用完调 `unsubscribe_*`：
+`on_observation` / `on_log` / `on_telemetry` / `on_notify` **只登记一个本地回调**，不会向内核订阅；只调 `subscribe_*` 而没有回调，事件会被直接丢弃（SDK **不缓存**）。
+
+所以顺序固定是：**先登记回调 → 再 `await subscribe_*()`**。
 
 ```python
-domain.on_notify(lambda alert: print(alert))   # 登记回调，此时还收不到
-await domain.subscribe_notify()                # 真正订阅
+domain.on_notify(lambda alert: print(alert))   # 1) 先登记回调
+await domain.subscribe_notify()                # 2) 再订阅，才有事件
 # ...
 await domain.unsubscribe_notify()
 ```
+
+对 `kernel.observer` 尤其关键：内核一收到订阅就**立刻推一条 `DomainStateSnapshot`**，回调没就位就会丢掉这条初始镜像。详见 [域状态观察](domain-state-observation.md)。
 
 订阅生命周期绑定进程代际，进程退出即回收；新代际需要重新订阅。
 

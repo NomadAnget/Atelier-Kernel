@@ -10,8 +10,10 @@ fn large_checkpoint_query_returns_over_real_pipe_without_replacing_domain() {
     ));
     let script = r#"
 import os,json,sys,socket
+# 响应帧可达 12 MiB：必须用带缓冲的 makefile，否则 readline() 会退化成逐字节
+# syscall（实测 buffering=0 读 12 MiB 一行要 15s 以上，缓冲后 0.06s）。
 def _o(n,m):
- s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ[n]); return s.makefile(m,buffering=0)
+ s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(os.environ[n]); return s.makefile(m,buffering=1<<20)
 r=_o('ATELIER_IPC_IN','rb')
 w=_o('ATELIER_IPC_OUT','wb')
 def call(seq,kind,params,data):

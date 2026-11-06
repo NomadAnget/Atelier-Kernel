@@ -277,7 +277,6 @@ impl KernelRouter {
         let observer_pump_handle = thread::Builder::new()
             .name("kernel-observer-fanout".to_string())
             .spawn(move || {
-                let mut last_stats = std::time::Instant::now();
                 while !obs_stop_flag.load(Ordering::Relaxed) {
                     if state_rx.try_recv().is_ok() {
                         let event = state_observer.domain_state_snapshot();

@@ -126,8 +126,20 @@ fn boot_manual_restart_and_saved_spec_preserve_environment_without_parent_mutati
     assert_eq!(a["custom"], "literal $HOME ~ 权重=ok");
     assert_eq!(a["empty"], "");
     assert_eq!(a["path"], path);
-    assert!(a["in_pipe"].as_str().unwrap().contains("atelier-"));
-    assert!(a["out_pipe"].as_str().unwrap().contains("atelier-"));
+    // 端点命名由内核按平台决定（Windows `\\.\pipe\atelier-<域>-…`，Unix `/tmp/atl-<域>-….sock`）。
+    // 从真实的 endpoint_path 推出前缀，避免把某一平台的命名写死进断言。
+    let pipe_prefix = atelier_kernel::edge::endpoint::endpoint_path("env_probe", "")
+        .split("env_probe")
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let in_pipe = a["in_pipe"].as_str().unwrap();
+    let out_pipe = a["out_pipe"].as_str().unwrap();
+    assert!(pipe_prefix.len() > 1, "unexpected endpoint prefix: {pipe_prefix:?}");
+    assert!(!in_pipe.is_empty() && !out_pipe.is_empty());
+    assert_ne!(in_pipe, out_pipe, "in/out endpoints must differ");
+    assert!(in_pipe.starts_with(&pipe_prefix), "{in_pipe:?} vs {pipe_prefix:?}");
+    assert!(out_pipe.starts_with(&pipe_prefix), "{out_pipe:?} vs {pipe_prefix:?}");
     let next = k.supervisor().respawn_domain("env_probe").unwrap();
     assert_ne!(*first, next);
     assert_eq!(report(&root, next)["custom"], a["custom"]);

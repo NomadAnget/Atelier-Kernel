@@ -326,9 +326,9 @@ Each external domain accepts `auto_restart` (default true), `max_restarts` (defa
 
 - 生命周期：Python `await domain.run_async(on_start=..., on_close=...)`，Node `await domain.runAsync({onStart, onClose})`。异步 handler 在 `await` 其他域时仍能继续收帧。
 - `send` / `request` / 存储方法全部是 async，需要 `await`。
-- `request(target, message_type, params, data, timeout=30)`：**target 只接受单个字符串**；成功返回**整条终态回执**，中间回执不会让它 resolve。
-- 终态不是 `completed` 时抛 `DomainRequestError`，带 `status` / `data` / `message_id`。除真实终态外还会出现 `unknown_message`、`busy`；Node 本地超时抛 `status="timeout"`，Python 本地超时抛 `asyncio.TimeoutError`。**SDK 没有 `connection_closed` 这个状态，也不支持 AbortSignal**。
-- 本地超时或取消只是停止本地等待，**不取消内核侧的业务执行**；之后仍可用 id 再 `wait_result`。
+- `request(target, message_type, params, data, timeout=None)`：**target 只接受单个字符串**；成功返回**整条终态回执**，中间回执不会让它 resolve。**不传 `timeout` 就没有超时**——SDK 不替内核决定这条消息失败。
+- 终态不是 `completed` 时抛 `DomainRequestError`，带 `status` / `data` / `message_id`。除真实终态外还会出现 `unknown_message`（id 从未见过）、`local_backpressure`（端到端已关闭，帧从未写入内核，带 `submitted=false`）、`transport_closed`（读端点 EOF/错误，内核已把在途收敛为 `ExecutionFailed`）；显式传 `timeout` 才抛 `status="timeout"`（Node）或 `asyncio.TimeoutError`（Python）。**SDK 没有 `connection_closed` 这个状态，也不支持 AbortSignal**。
+- 本地超时或取消只是停止本地等待，**不取消内核侧的业务执行**；之后仍可用 id 再 `wait_result`（SDK 保留有界的回执归属，迟到的回执照样能关联）。
 - 帧大小上限由**内核**执行（`MAX_IPC_FRAME` = 16 MiB，域→内核方向超限会被断连并记录诊断）。**SDK 自己不设帧上限**，也不代表任意大的消息都能过。
 - 阻塞式 Python 业务代码请用 `asyncio.to_thread` 跑，否则会占住该域事件循环。
 

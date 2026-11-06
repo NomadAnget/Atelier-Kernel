@@ -41,7 +41,7 @@ class ConstructorSurfaceTest(unittest.TestCase):
             for name in inspect.signature(AtelierDomain.__init__).parameters
             if name not in ("self", "domain")
         ]
-        self.assertEqual(params, ["max_pending", "result_ttl"])
+        self.assertEqual(params, [])
 
 
 class MessagePathTest(unittest.IsolatedAsyncioTestCase):
@@ -219,17 +219,16 @@ def make_fake(**kwargs):
 
 
 class LocalLimitTest(unittest.IsolatedAsyncioTestCase):
-    async def test_full_window_raises_local_backpressure(self):
-        domain = make_fake(max_pending=1)
-        first = asyncio.create_task(domain.send("t.h", "T"))
+    async def test_no_submission_window_accepts_many_in_flight_sends(self):
+        domain = make_fake()
+        tasks = [asyncio.create_task(domain.send("t.h", "T")) for _ in range(20)]
         await asyncio.sleep(0.01)
-        with self.assertRaises(DomainRequestError) as ctx:
-            await domain.send("t.h", "T", timeout=0.02)
-        self.assertEqual(ctx.exception.status, "local_backpressure")
-        self.assertFalse(ctx.exception.data["submitted"])
-        domain.receipt("m1", "t.h", "sent", seq=domain.frames[0]["seq"])
-        self.assertEqual(await first, "m1")
-        self.assertEqual(domain.stats()["local_backpressure"], 1)
+        self.assertEqual(domain.stats()["pending"], 20)
+        for index, frame in enumerate(domain.frames):
+            domain.receipt(f"m-{index}", "t.h", "sent", seq=frame["seq"])
+        ids = await asyncio.gather(*tasks)
+        self.assertEqual(len(ids), 20)
+        self.assertEqual(domain.stats()["pending"], 0)
 
     async def test_timed_out_send_still_accepts_the_kernel_receipt(self):
         domain = make_fake()
@@ -247,17 +246,12 @@ class LocalLimitTest(unittest.IsolatedAsyncioTestCase):
         receipt = await domain.wait_result("m-late", timeout=1)
         self.assertEqual(receipt["data"], {"ok": 1})
 
-    async def test_unknown_message_reports_eviction(self):
+    async def test_unknown_message_names_the_message_id(self):
         domain = make_fake()
         with self.assertRaises(DomainRequestError) as ctx:
             await domain.wait_result("never-seen")
         self.assertEqual(ctx.exception.status, "unknown_message")
-        self.assertFalse(ctx.exception.data["evicted"])
-
-        domain._evicted_ids.add("gone")
-        with self.assertRaises(DomainRequestError) as ctx2:
-            await domain.wait_result("gone")
-        self.assertTrue(ctx2.exception.data["evicted"])
+        self.assertEqual(ctx.exception.data["message_id"], "never-seen")
 
 
 class TransportFailureTest(unittest.IsolatedAsyncioTestCase):

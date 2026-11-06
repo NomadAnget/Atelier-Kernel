@@ -49,22 +49,18 @@ class DomainExecutionFailed(Exception):
 class AtelierDomain:
     """单层公开面。全异步，snake_case，无 `_async` 后缀。"""
 
-    def __init__(self, domain, *, max_pending=1024, result_ttl=30.0):
+    def __init__(self, domain):
         self.domain = domain
-        self._max_pending = max_pending
-        self._result_ttl = result_ttl
-        # 提交窗口超时后帧已经写进管道：内核仍可能回执，归属必须保留，不能丢弃内核发出的回执。
+        # 显式超时后帧已经写进管道：内核仍可能回执，归属必须保留，不能丢弃内核发出的回执。
         self._orphan_limit = _ORPHAN_LIMIT
 
         self._handlers = {}
         self._descriptions = {}
         self._pending = {}  # seq -> {"targets", "ids", "future"}
-        self._results = {}  # message_id -> {"target", "future", "waiters", "evict"}
+        self._results = {}  # message_id -> {"target", "future", "waiters"}
         self._orphans = {}  # seq -> 与 _pending 同构，供已停止等待的提交继续认领回执
-        self._evicted_ids = set()
         self._transport_closed = False
         self._stats = {
-            "evicted_results": 0,
             "dropped_orphan_receipts": 0,
             "local_backpressure": 0,
             "unmatched_receipts": 0,
@@ -107,7 +103,7 @@ class AtelierDomain:
         return register
 
     # ── 能力 3/4：发消息 / 请求 ────────────────────────────────────────
-    async def send(self, targets, message_type, params=None, data=None, *, timeout=30):
+    async def send(self, targets, message_type, params=None, data=None, *, timeout=None):
         if self._closed or self._transport_closed:
             # 端到端已关闭：消息不可能交给内核，必须显式拒绝而不是静默丢弃后等超时。
             self._stats["local_backpressure"] += 1
@@ -122,17 +118,6 @@ class AtelierDomain:
         params = self._encode_files(params or {})
         data = self._encode_files(data or {})
         loop = asyncio.get_running_loop()
-        deadline = None if timeout is None else loop.time() + timeout
-
-        while len(self._pending) + len(names) > self._max_pending:
-            if deadline is not None and loop.time() >= deadline:
-                # 本地提交窗口已满：这条消息从未交给内核，所以它不是一个内核终态。
-                self._stats["local_backpressure"] += 1
-                raise DomainRequestError(
-                    "local_backpressure",
-                    {"submitted": False, "reason": "local submission window is full", "max_pending": self._max_pending},
-                )
-            await asyncio.sleep(0.01)
 
         with self._lock:
             seq = self._seq
@@ -171,7 +156,7 @@ class AtelierDomain:
             self._orphans.pop(oldest, None)
             self._stats["dropped_orphan_receipts"] += 1
 
-    async def request(self, target, message_type, params=None, data=None, *, timeout=30):
+    async def request(self, target, message_type, params=None, data=None, *, timeout=None):
         message_id = await self.send(target, message_type, params, data, timeout=timeout)
         try:
             return await self.wait_result(message_id, timeout=timeout)
@@ -179,18 +164,11 @@ class AtelierDomain:
             self.forget_result(message_id)
 
     # ── 能力 5：等待 / 遗忘 ────────────────────────────────────────────
-    async def wait_result(self, message_id, *, timeout=30):
+    async def wait_result(self, message_id, *, timeout=None):
         entry = self._results.get(message_id)
         if entry is None:
             # 区分"从没收到过"和"收到过但本地条目已过期"，调用方才能判断是否自己错过了回执。
-            raise DomainRequestError(
-                "unknown_message",
-                {"message_id": message_id, "evicted": message_id in self._evicted_ids},
-                message_id,
-            )
-        handle = entry.pop("evict", None)
-        if handle:
-            handle.cancel()
+            raise DomainRequestError("unknown_message", {"message_id": message_id}, message_id)
         entry["waiters"] += 1
         observed = False
         try:
@@ -206,17 +184,13 @@ class AtelierDomain:
             if observed and not entry["waiters"]:
                 self._results.pop(message_id, None)
 
-    async def wait_results(self, message_ids, *, timeout=30):
+    async def wait_results(self, message_ids, *, timeout=None):
         return await asyncio.gather(*(self.wait_result(mid, timeout=timeout) for mid in message_ids))
 
     def forget_result(self, message_id):
         entry = self._results.get(message_id)
         if entry and entry["waiters"]:
-            raise DomainRequestError("busy", message_id=message_id)
-        if entry:
-            handle = entry.pop("evict", None)
-            if handle:
-                handle.cancel()
+            raise DomainRequestError("result_in_use", message_id=message_id)
         return self._results.pop(message_id, None) is not None
 
     def stats(self):
@@ -225,7 +199,6 @@ class AtelierDomain:
             "pending": len(self._pending),
             "results": len(self._results),
             "orphans": len(self._orphans),
-            "evicted_results": self._stats["evicted_results"],
             "dropped_orphan_receipts": self._stats["dropped_orphan_receipts"],
             "local_backpressure": self._stats["local_backpressure"],
             "unmatched_receipts": self._stats["unmatched_receipts"],
@@ -622,7 +595,6 @@ class AtelierDomain:
                 "target": target,
                 "future": self._loop.create_future(),
                 "waiters": 0,
-                "evict": None,
             }
             claimed = True
             if len(entry["ids"]) == len(entry["targets"]):
@@ -631,18 +603,8 @@ class AtelierDomain:
                 self._orphans.pop(seq, None)
         result = self._results.get(message_id)
         if result and result["target"] == target and not result["future"].done() and status in TERMINAL:
+            # 结果不自动过期：取走或用 forget_result 释放，寿命由域自己决定。
             result["future"].set_result(frame)
-            if not result["waiters"] and self._result_ttl > 0:
-                def _evict(mid=message_id, res=result):
-                    if res["waiters"]:
-                        return
-                    if self._results.pop(mid, None) is not None:
-                        self._stats["evicted_results"] += 1
-                        self._evicted_ids.add(mid)
-                        if len(self._evicted_ids) > 1024:
-                            self._evicted_ids.discard(next(iter(self._evicted_ids)))
-
-                result["evict"] = self._loop.call_later(self._result_ttl, _evict)
         if not claimed and not result:
             # 回执找不到任何归属（超出孤儿窗口、或来自其他代际）：计数，不静默。
             self._stats["unmatched_receipts"] += 1

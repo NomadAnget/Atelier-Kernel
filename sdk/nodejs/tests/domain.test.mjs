@@ -219,23 +219,16 @@ test("logger writes a dedicated log frame", () => {
 });
 
 // ── 本地限制与内核终态的边界 ──────────────────────────────────────────
-test("a full submission window raises local_backpressure, not a kernel terminal", async () => {
-  const domain = new AtelierDomain("test", { maxPending: 1 });
-  domain.frames = [];
-  domain._write = (frame) => domain.frames.push(frame);
-
-  const first = domain.send("t.h", "T", {}, {}, { timeout: 5 });
+test("no submission window: many in-flight sends are all accepted", async () => {
+  const domain = makeDomain();
+  const tasks = [];
+  for (let i = 0; i < 20; i += 1) tasks.push(domain.send("t.h", "T", {}, {}, { timeout: 5 }));
   await tick();
-  await assert.rejects(domain.send("t.h", "T", {}, {}, { timeout: 0.02 }), (error) => {
-    assert.equal(error.status, "local_backpressure");
-    assert.equal(error.data.submitted, false);
-    assert.equal(error.message_id, null);
-    return true;
-  });
-
-  receipt(domain, "m-local", "t.h", "sent", null, domain.frames[0].seq);
-  assert.equal(await first, "m-local");
-  assert.equal(domain.stats().local_backpressure, 1);
+  assert.equal(domain.stats().pending, 20);
+  domain.frames.forEach((frame, index) => receipt(domain, `m-${index}`, "t.h", "sent", null, frame.seq));
+  const ids = await Promise.all(tasks);
+  assert.equal(ids.length, 20);
+  assert.equal(domain.stats().pending, 0);
 });
 
 test("a submission that timed out locally still accepts the kernel receipt", async () => {
@@ -254,17 +247,11 @@ test("a submission that timed out locally still accepts the kernel receipt", asy
   assert.deepEqual(value.data, { ok: 1 });
 });
 
-test("unknown_message reports whether the local result was evicted", async () => {
+test("unknown_message names the message id", async () => {
   const domain = makeDomain();
   await assert.rejects(domain.waitResult("never-seen"), (error) => {
     assert.equal(error.status, "unknown_message");
-    assert.equal(error.data.evicted, false);
-    return true;
-  });
-  domain._evictedIds.add("gone");
-  await assert.rejects(domain.waitResult("gone"), (error) => {
-    assert.equal(error.status, "unknown_message");
-    assert.equal(error.data.evicted, true);
+    assert.equal(error.data.message_id, "never-seen");
     return true;
   });
 });

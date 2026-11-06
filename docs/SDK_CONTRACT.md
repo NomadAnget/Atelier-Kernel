@@ -40,23 +40,23 @@ System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationE
 
 ## Local Transport Safeguards
 
-SDK 侧只有少量本地资源上限，用来约束自己的等待槽，与业务数据形状、全局调度无关：
+SDK 只承担协议传输：连接两条命名端点、JSON-Lines 编解码、handler 分发与四阶段回执上报、回执关联。**它不实现任何策略**——没有默认超时、没有提交窗口、没有结果过期：
 
 | 项 | Python | Node.js | 说明 |
 | :--- | :--- | :--- | :--- |
-| 待处理提交 | `max_pending=1024` | `maxPending: 1024` | **只约束还在等初始消息 id 的提交**：id 一到就从 `_pending` 移除，之后等待终态回执**不占**这个额度。窗口满时新的 send 先等待；等满 `timeout` 仍未腾出，则抛 **`local_backpressure`**（`data.submitted=false`）——这条消息**从未交给内核**，所以它不是内核终态 |
-| 未读结果的存活期 | `result_ttl=30.0` 秒 | `resultTtlMs: 30000` | 没人等待的终态回执在多久后被驱逐；驱逐会计入 `stats().evicted_results`，此后 `wait_result` 报 `unknown_message` 并带 `data.evicted=true` |
-| 单次请求超时 | `timeout=30` | `options.timeout`，默认 30 秒 | 与上面无关：超时只放弃本地等待，不取消内核侧执行，**也不丢弃已经写入内核那条消息的回执归属** |
+| 超时 | `timeout=None`（默认不超时） | `options.timeout` 缺省 = 不超时 | 只有调用方显式传入才生效。超时只放弃本地等待，不取消内核侧执行，**也不丢弃已经写入内核那条消息的回执归属** |
+| 结果寿命 | 取走或 `forget_result` | 取走或 `forgetResult` | 终态回执**不会自动过期**；未取走的结果占用的内存由域自己负责 |
+| 构造参数 | 无 | 无 | `AtelierDomain(domain)`。历史上的 `max_pending` / `result_ttl` / `max_results` 全部删除——**不要再按它们调优** |
 
 ### 本地限制与内核终态的边界（硬约束）
 
-内核是全系统唯一具备准入判定权的一方：每条真正提交给内核的消息都由内核给出明确终态。SDK 的本地上限**只允许推迟写入**，不允许替内核判决，具体五条：
+内核是全系统唯一具备准入判定权的一方：每条真正提交给内核的消息都由内核给出明确终态。SDK 不得替内核判决，具体五条：
 
-1. **未写入 ≠ 终态**。`local_backpressure` 表示帧还在 SDK 里，内核从未见过这条消息；它必须与 `completed` / `execution_failed` / `target_invalid` / `contract_invalid` 这些内核状态严格区分，调用方可以据此安全重试。
+1. **没有默认超时**。不传 `timeout` 就一直等内核的初始回执与终态；只有调用方显式要求才允许本地放弃等待——这正是"SDK 不替内核决定这条消息失败"。
 2. **已经写入就不许忘**。帧写进管道后，即使本地等待超时，SDK 仍保留该提交的回执归属（有界，`ORPHAN_LIMIT=4096`，先进先出），迟到的回执照样能关联到 `message_id` 并进入 `wait_result`。丢弃计入 `stats().dropped_orphan_receipts`，正常为 0。
-3. **关闭后不许假装提交**。`shutdown()` 之后调用 `send` / `request` 立即以 `local_backpressure`（`data.reason="sdk closed"`）拒绝，不再"静默不写然后等超时"；被丢弃的帧计入 `stats().dropped_frames`。
+3. **关闭后不许假装提交**。`shutdown()` 之后调用 `send` / `request` 立即以 `local_backpressure`（`data.reason="sdk closed"`、`submitted=false`）拒绝，不再"静默不写然后等超时"；被丢弃的帧计入 `stats().dropped_frames`。
 4. **传输死亡不得沉默**。读端点 EOF 或读错误时，内核已经把该代际的在途消息收敛为 `ExecutionFailed`；SDK 必须以本地 `transport_closed` 立即终结所有等待（在途提交与正在等待的结果），不允许让调用方挂到自己的超时。`stats().transport_closed` 随之为真。
-5. **一切丢弃都要可观测**。`stats()` 暴露十一个计数：`pending` / `results` / `orphans` / `evicted_results` / `dropped_orphan_receipts` / `local_backpressure` / `unmatched_receipts` / `malformed_frames` / `unknown_statuses` / `dropped_frames` / `transport_closed`。它们只描述 SDK 自己的内存与本地失败，不代表内核状态。
+5. **一切丢弃都要可观测**。`stats()` 暴露十个计数：`pending` / `results` / `orphans` / `dropped_orphan_receipts` / `local_backpressure` / `unmatched_receipts` / `malformed_frames` / `unknown_statuses` / `dropped_frames` / `transport_closed`。它们只描述 SDK 自己的内存与本地失败，不代表内核状态。
 
 ### 两处"用内核词汇说话"的说明
 
@@ -64,7 +64,9 @@ SDK 侧只有少量本地资源上限，用来约束自己的等待槽，与业�
 - handler 抛出的非 `DomainExecutionFailed` 异常由 SDK 兜底上报 `execution_failed`，载荷固定为 `{error:"handler_exception", reason}`。这是 SDK 定义的兜底 schema；业务需要自己的错误结构时应显式抛 `DomainExecutionFailed`。
 - 回执状态若既不在四阶段（`sent`/`received`/`started`）也不在终态集合内，计入 `stats().unknown_statuses` 并丢弃，绝不静默当作"非终态"永久等待；找不到归属的回执计入 `unmatched_receipts`，无法解析的帧计入 `malformed_frames`。
 
-> SDK 侧的构造参数只有这三个（Python `max_pending` / `result_ttl`，Node `maxPending` / `resultTtlMs`）。历史上 Python 还有一个 `max_results=4096`，它只被赋值、不参与任何容量判断，已删除——**不要再按它调优**。孤儿保留上限是模块常量，不是构造参数。
+本地状态与内核状态用词分离：`local_backpressure`（端到端已关闭，帧从未写入）、`transport_closed`（读端点 EOF/错误）、`result_in_use`（`forget_result` 时该结果仍有等待者）、`unknown_message`（id 从未在此 SDK 实例出现过）——**这四个都不是内核终态**，不会被内核发出，也不代表内核对这些消息的任何判断。
+
+> `local_backpressure` 现在只有一个来源：端到端已关闭（`shutdown()` 或传输断开）。它表示帧**从未交给内核**，与 `completed` / `execution_failed` / `target_invalid` / `contract_invalid` 这些内核状态严格区分，调用方可以据此安全重试。孤儿保留上限是模块常量，不是构造参数。
 
 `shutdown()` 是协作式的：把实例标记为已关闭、结束 `run` / `runAsync` 主循环、销毁端点流并让出事件循环。**它不会中断语言运行时里正在执行的业务函数**；进程停止与重启是内核 supervisor 的职责。SDK 没有独立的入站并发配额，也没有可配置的排空宽限期。
 
@@ -73,11 +75,12 @@ response data. They do not implement storage, transactions, migration or paging.
 send returns kernel-assigned ID(s) after initial receipts for all unique targets: a
 string target yields one id, a target list yields an id list.
 wait_result/wait_results consume results by ID and never trigger a second send.
-request combines send/wait with one deadline and a single target.
-Timeout/cancellation preserves a public wait slot; completed/failed result consumption
-releases it. Explicit forget_result releases an unwanted slot. `max_pending` counts
-outstanding submissions only; an unread terminal result is retained for `result_ttl`
-(Python) / `resultTtlMs` (Node) and is never silently evicted while someone waits on it.
+request combines send/wait for a single target.
+Timeout is a caller decision, not an SDK policy: without an explicit timeout the SDK
+waits for the kernel's receipt, and a local timeout only stops local waiting while the
+receipt correlation is kept (bounded orphan retention). Results do not expire; consume
+them with wait_result or release them with forget_result. `stats()` exposes transport
+counters only and never represents kernel state.
 
 Request context is a read-only snapshot of the current kernel envelope identity:
 logical_id, message_id, source_domain, target and message_type. The SDK generates

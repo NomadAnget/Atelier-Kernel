@@ -71,21 +71,17 @@ class FileNamespace {
 }
 
 class AtelierDomain {
-  constructor(domain, options = {}) {
+  constructor(domain) {
     this.domain = domain;
-    this._maxPending = options.maxPending ?? 1024;
-    this._resultTtlMs = options.resultTtlMs ?? 30000;
     this._handlers = new Map();
     this._descriptions = new Map();
     this._pending = new Map();
     this._results = new Map();
-    // 提交窗口超时后，帧已经写进管道：内核仍可能回执，归属必须保留，不能丢掉内核发出的回执。
+    // 显式超时后帧已经写进管道：内核仍可能回执，归属必须保留，不能丢掉内核发出的回执。
     this._orphans = new Map();
     this._orphanLimit = ORPHAN_LIMIT;
-    this._evictedIds = new Set();
     this._transportClosed = false;
     this._stats = {
-      evicted_results: 0,
       dropped_orphan_receipts: 0,
       local_backpressure: 0,
       unmatched_receipts: 0,
@@ -125,23 +121,10 @@ class AtelierDomain {
       );
     }
     const names = typeof targets === "string" ? [targets] : [...new Set(targets)];
-    const timeout = options.timeout ?? 30;
+    // 超时是调用方的选择，不是 SDK 的策略：不传就一直等内核的初始回执。
+    const timeout = options.timeout ?? null;
     params = this._encodeFiles(params);
     data = this._encodeFiles(data);
-    const deadline = Date.now() + timeout * 1000;
-    while (this._pending.size + names.length > this._maxPending) {
-      if (Date.now() >= deadline) {
-        // 本地提交窗口已满：这条消息从未交给内核，所以它不是一个内核终态。
-        // 用独立状态暴露，避免把"SDK 没写出去"混同成"内核拒绝了"。
-        this._stats.local_backpressure += 1;
-        throw new DomainRequestError(
-          "local_backpressure",
-          { submitted: false, reason: "local submission window is full", max_pending: this._maxPending },
-          null
-        );
-      }
-      await new Promise((r) => setTimeout(r, 10));
-    }
     const seq = this._seq++;
     const promise = new Promise((resolve, reject) => {
       this._pending.set(seq, { targets: names, ids: new Map(), resolve, reject, seq });
@@ -174,7 +157,7 @@ class AtelierDomain {
 
   // 能力 4：请求（send + 等终态 + forget）
   async request(target, messageType, params = {}, data = {}, options = {}) {
-    const timeout = options.timeout ?? 30;
+    const timeout = options.timeout ?? null;
     const messageId = await this.send(target, messageType, params, data, { timeout });
     try {
       return await this.waitResult(messageId, { timeout });
@@ -187,20 +170,11 @@ class AtelierDomain {
   async waitResult(messageId, options = {}) {
     const entry = this._results.get(messageId);
     if (!entry) {
-      // 区分"从没收到过"和"收到过但本地条目已过期"，否则调用方无法判断是不是自己错过了回执。
-      throw new DomainRequestError(
-        "unknown_message",
-        { message_id: messageId, evicted: this._evictedIds.has(messageId) },
-        messageId
-      );
-    }
-    if (entry.evict) {
-      clearTimeout(entry.evict);
-      entry.evict = null;
+      throw new DomainRequestError("unknown_message", { message_id: messageId }, messageId);
     }
     entry.waiters++;
     try {
-      const receipt = await withTimeout(entry.promise, options.timeout ?? 30);
+      const receipt = await withTimeout(entry.promise, options.timeout ?? null);
       entry.observed = true;
       if (receipt.status !== "completed") {
         throw new DomainRequestError(receipt.status, receipt.data, messageId);
@@ -218,8 +192,7 @@ class AtelierDomain {
 
   forgetResult(messageId) {
     const entry = this._results.get(messageId);
-    if (entry?.waiters) throw new DomainRequestError("busy", null, messageId);
-    if (entry?.evict) clearTimeout(entry.evict);
+    if (entry?.waiters) throw new DomainRequestError("result_in_use", null, messageId);
     return this._results.delete(messageId);
   }
 
@@ -229,7 +202,6 @@ class AtelierDomain {
       pending: this._pending.size,
       results: this._results.size,
       orphans: this._orphans.size,
-      evicted_results: this._stats.evicted_results,
       dropped_orphan_receipts: this._stats.dropped_orphan_receipts,
       local_backpressure: this._stats.local_backpressure,
       unmatched_receipts: this._stats.unmatched_receipts,
@@ -600,16 +572,8 @@ class AtelierDomain {
     }
     const result = this._results.get(messageId);
     if (result && result.target === target && !result.observed && TERMINAL.has(status)) {
+      // 结果不自动过期：取走或用 forgetResult 释放，寿命由域自己决定。
       result.resolve(frame);
-      if (!result.waiters && this._resultTtlMs > 0) {
-        result.evict = setTimeout(() => {
-          if (result.waiters) return;
-          this._results.delete(messageId);
-          this._stats.evicted_results += 1;
-          this._evictedIds.add(messageId);
-          if (this._evictedIds.size > 1024) this._evictedIds.delete(this._evictedIds.values().next().value);
-        }, this._resultTtlMs);
-      }
     }
     if (!claimed && !result) {
       // 回执找不到任何归属（超出孤儿窗口、或来自其他代际）：计数，不静默。
@@ -674,7 +638,7 @@ function openStreams(paths) {
 }
 
 function withTimeout(promise, seconds) {
-  if (seconds === null) return promise;
+  if (seconds === null || seconds === undefined) return promise;
   return Promise.race([
     promise,
     new Promise((_, reject) => setTimeout(() => reject(new DomainRequestError("timeout")), seconds * 1000)),

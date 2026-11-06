@@ -52,9 +52,12 @@ jobs:
 
       # 文档漂移门禁：只做可判定断言（链接、SDK 成员、kernel 目标、环境变量、
       # 源码路径、CLI 参数、两语言能力表、发布包目录树）。平台无关，跑一次即可。
-      - name: Check Docs Against Code
+      # 发版一致性：4 处版本号、打包脚本动态取版本、当前版本的发版说明就位。
+      - name: Check Docs & Release Consistency
         if: runner.os == 'Linux'
-        run: python3 scripts/check_docs.py
+        run: |
+          python3 scripts/check_docs.py
+          python3 scripts/check_release.py
 
       - name: Build Kernel for Native SDK Regression
         run: cargo build --locked
@@ -114,8 +117,10 @@ jobs:
         run: |
           mkdir -p dist/sdk
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          # 发版记录统一归档在 docs/archive/；旧位置仍兼容一次，避免历史 tag 重跑失败。
-          notes="docs/archive/RELEASE_${version}.md"
+          # 当前版本的发布说明放 docs/releases/（内容是最新的，不带归档横幅）；
+          # 历史 tag 重跑时回落到 docs/archive/ 与旧位置。
+          notes="docs/releases/RELEASE_${version}.md"
+          [ -f "$notes" ] || notes="docs/archive/RELEASE_${version}.md"
           [ -f "$notes" ] || notes="docs/RELEASE_${version}.md"
           cp "$notes" dist/sdk/RELEASE_NOTES.md
           python3 sdk/python/build_wheel.py dist/sdk

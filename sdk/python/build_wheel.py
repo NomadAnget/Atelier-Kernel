@@ -8,13 +8,19 @@ succeed in both offline/sandboxed environments and CI/CD runners.
 import base64
 import hashlib
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
 
 PKG_NAME = "atelier_sdk"
 DIST_NAME = "atelier-sdk"
-VERSION = "0.2.0"
+# 单一版本源：直接从包里的 `__version__` 读，避免三处硬编码漂移。
+VERSION = re.search(
+    r'^__version__\s*=\s*"([^"]+)"',
+    (Path(__file__).resolve().parent / "atelier_sdk" / "__init__.py").read_text(encoding="utf-8"),
+    re.MULTILINE,
+).group(1)
 TAG = "py3-none-any"
 
 

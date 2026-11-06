@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "atelier-sdk"
-version = "0.2.0"
-description = "Official Python Domain SDK for Atelier Kernel (Stdio JSON-Lines IPC, 4-stage receipts, and Storage-as-Messaging)"
+dynamic = ["version"]
+description = "Official Python Domain SDK for Atelier Kernel (named-endpoint IPC, 4-stage receipts, C4 virtual files)"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -13,6 +13,9 @@ authors = [
   { name = "Atelier Kernel Team" }
 ]
 dependencies = []
+
+[tool.setuptools.dynamic]
+version = { attr = "atelier_sdk.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]

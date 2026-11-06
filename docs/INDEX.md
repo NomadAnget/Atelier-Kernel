@@ -38,6 +38,12 @@
 | :--- | :--- |
 | [VARIANT_GUIDE.md](VARIANT_GUIDE.md) | 变体开发指南：发布包结构、三步创建变体、命令行参数、发布流程 |
 
+## 发版说明
+
+| 文档 | 内容 |
+| :--- | :--- |
+| [releases/RELEASE_0.3.0.md](releases/RELEASE_0.3.0.md) | 当前版本：分层落定、SDK 契约收敛、门禁补齐、破坏性变更与升级方式 |
+
 ## 归档
 
 [archive/INDEX.md](archive/INDEX.md) —— 旧的设计方案、验收记录与逐版发版说明。**这些不代表当前契约**，仅用于追溯。

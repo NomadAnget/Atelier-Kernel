@@ -1,6 +1,6 @@
 [package]
 name = "atelier_kernel"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Atelier Kernel: single-machine multi-domain microkernel with named-endpoint supervision, two-layer contract routing, 4-stage receipts, a durable delivery ledger, per-domain storage and unified structured logs."
 

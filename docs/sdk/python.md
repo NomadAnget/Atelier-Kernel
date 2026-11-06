@@ -36,7 +36,7 @@ asyncio.run(domain.run_async())
 | 1 | 生命周期 | `run_async(on_start=, on_close=)` / `shutdown()` |
 | 2 | 注册处理器 | `handler(name)`（docstring 首行自动注册为描述） |
 | 3 | 发消息 | `send(targets, message_type, params, data)` → 消息 id |
-| 4 | 请求-响应 | `request(...)` → 终态回执的 `data`；非 `completed` 抛 `DomainRequestError` |
+| 4 | 请求-响应 | `request(target, ...)` → **整条终态回执**（业务载荷在 `receipt["data"]`）；`target` 只接受单个字符串；非 `completed` 抛 `DomainRequestError` |
 | 5 | 等待/遗忘 | `wait_result` / `wait_results` / `forget_result` |
 | 6 | 上报回执 | `report_receipt(message_id, target, status, data)` |
 | 7 | 事件回调 | `on_receipt` / `on_log` / `on_notify` / `on_observation` / `on_telemetry` |

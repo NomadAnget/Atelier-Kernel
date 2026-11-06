@@ -120,12 +120,15 @@ domain.run();
 ### 3.4 域之间怎么协作
 
 ```python
-# 只发不收：拿到子消息 id 列表（send 也是 async）
+# 只发不收：targets 可传字符串或列表；传字符串返回单个 id，传列表返回 id 列表（send 也是 async）
 ids = await domain.send(["billing.charge"], "Charge", {"amount": 10}, {"order_id": "o-1"})
 
-# 要结果：等终态回执，返回的是那条回执的 data；非 completed 抛 DomainRequestError
-data = await domain.request(["billing.charge"], "Charge", {"amount": 10}, {"order_id": "o-1"})
+# 要结果：target 只接受**单个** "<domain>.<handler>" 字符串；返回**整条终态回执**，不是业务 data
+receipt = await domain.request("billing.charge", "Charge", {"amount": 10}, {"order_id": "o-1"})
+payload = receipt["data"]
 ```
+
+`request` 传列表**会失败**（`send` 对列表返回 id 列表，`wait_result` 拿到的不是单个 id → `unknown_message`）。要等一组结果用 `send` + `wait_results(ids)`。非 `completed` 终态会抛 `DomainRequestError`，其 `.status` 是真实终态。
 
 `send` / `request` 的目标是 `"<domain>.<handler>"`。**不要**为了让两个域"更快地"协作而共享文件或直接调用——那会同时破坏 M4 和可观测性。
 

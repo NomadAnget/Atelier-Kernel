@@ -36,7 +36,7 @@ domain.run();
 | 1 | 生命周期 | `runAsync({onStart, onClose})` / `run()` / `shutdown()` |
 | 2 | 注册处理器 | `handler(name, fn, description?)` |
 | 3 | 发消息 | `send(targets, messageType, params, data)` → 消息 id |
-| 4 | 请求-响应 | `request(...)` → 终态回执；非 `completed` 抛 `DomainRequestError` |
+| 4 | 请求-响应 | `request(target, ...)` → **整条终态回执**（业务载荷在 `receipt.data`）；`target` 只接受单个字符串；非 `completed` 抛 `DomainRequestError` |
 | 5 | 等待/遗忘 | `waitResult` / `waitResults` / `forgetResult` |
 | 6 | 上报回执 | `reportReceipt(messageId, target, status, data)` |
 | 7 | 事件回调 | `onReceipt` / `onLog` / `onNotify` / `onObservation` / `onTelemetry` |

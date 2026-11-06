@@ -54,9 +54,10 @@ it never waits for the kernel input to close before completing an explicit shutd
 
 Async storage helpers send existing kernel.storage CRUD messages and return kernel
 response data. They do not implement storage, transactions, migration or paging.
-send returns kernel-assigned ID(s) after initial receipts for all unique targets.
-wait_result/wait_results consume results by ID; request_many is an alias for waiting
-existing IDs, never a second send. request combines send/wait with one deadline.
+send returns kernel-assigned ID(s) after initial receipts for all unique targets: a
+string target yields one id, a target list yields an id list.
+wait_result/wait_results consume results by ID and never trigger a second send.
+request combines send/wait with one deadline and a single target.
 Timeout/cancellation preserves a public wait slot; completed/failed result consumption
 releases it. Explicit forget_result releases an unwanted slot. Unread results and
 submissions share max_pending capacity and are never silently evicted.
@@ -119,10 +120,12 @@ Two primitives, one rule:
 
 | Primitive | Returns | Use for |
 |---|---|---|
-| `send(targets, type, params, data)` | message id(s) | fire-and-forget, pipelining, callback-driven flows |
-| `request(target, type, params, data)` | the terminal result's `data` | request/response, business CRUD, queries |
+| `send(targets, type, params, data)` | message id (string target) or id list (list target) | fire-and-forget, pipelining, callback-driven flows |
+| `request(target, type, params, data)` | the **whole terminal receipt** (`{status, data, message_id, …}`) | request/response, business CRUD, queries |
 
-Business APIs MUST use `request` semantics and return data; `send` is the explicit low-level escape hatch. `send`-returning-id variants of business APIs are removed.
+`request` takes a **single** target string, not a list: it forwards to `send` and then waits on the returned id, so a list would hand `wait_result` a list instead of an id and fail with `unknown_message`. To wait on several results, use `send` + `wait_results(ids)`. Read the business payload from `receipt["data"]`; a non-`completed` terminal raises `DomainRequestError` carrying the real status.
+
+Business APIs MUST use `request` semantics and return the terminal receipt's `data`; `send` is the explicit low-level escape hatch. `send`-returning-id variants of business APIs are removed.
 
 Naming rules:
 

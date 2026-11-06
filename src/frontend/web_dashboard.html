@@ -556,6 +556,7 @@
           <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
             <select id="filter-log-level" onchange="renderLogs()" style="background:#0b0f17;color:#e2e8f0;border:1px solid #26334d;border-radius:5px;padding:2px 6px;font-size:11px;">
               <option value="ALL">全部级别</option>
+              <option value="DEBUG">DEBUG</option>
               <option value="INFO">INFO</option>
               <option value="WARNING">WARNING</option>
               <option value="ERROR">ERROR</option>
@@ -612,12 +613,32 @@
       } catch (_) {}
     }
 
+    // 内核的活动进度身份是 (source_domain, key)；只用 key 会让不同域的同名进度互相覆盖。
+    function activeProgressKey(rec) {
+      return `${rec.source_domain || ''}\u0000${rec.key || ''}`;
+    }
+    const terminalProgressTimers = new Map();
+
     function handleIncomingLogRecord(rec) {
       if (rec.ephemeral) {
-        if (rec.done) {
-          activeProgressMap.delete(rec.key);
-        } else if (rec.key) {
-          activeProgressMap.set(rec.key, rec);
+        if (rec.key) {
+          const k = activeProgressKey(rec);
+          const state = rec.state || (rec.done ? 'completed' : 'running');
+          const isTerminal = state !== 'running';
+          activeProgressMap.set(k, { ...rec, state, terminal: isTerminal });
+          const prev = terminalProgressTimers.get(k);
+          if (prev) {
+            clearTimeout(prev);
+            terminalProgressTimers.delete(k);
+          }
+          if (isTerminal) {
+            // 终态保留几秒，让界面能区分 completed / failed / cancelled，而不是无声消失。
+            terminalProgressTimers.set(k, setTimeout(() => {
+              activeProgressMap.delete(k);
+              terminalProgressTimers.delete(k);
+              renderProgress();
+            }, 5000));
+          }
         }
         renderProgress();
       } else if (!rec.console_only) {
@@ -638,7 +659,17 @@
       pContainer.innerHTML = items.map(item => {
         let barHtml = '';
         let statusHtml = '';
-        if (item.waiting) {
+        const state = item.state || 'running';
+        if (state === 'failed') {
+          statusHtml = `<span style="color:#ef4444;font-weight:600;">✗ 失败</span>`;
+          barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill" style="width:100%;background:#ef4444;"></div></div>`;
+        } else if (state === 'cancelled') {
+          statusHtml = `<span style="color:#94a3b8;font-weight:600;">⊘ 已取消</span>`;
+          barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill" style="width:100%;background:#94a3b8;"></div></div>`;
+        } else if (state === 'completed') {
+          statusHtml = `<span style="color:#22c55e;font-weight:600;">✓ 完成</span>`;
+          barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill" style="width:100%;background:#22c55e;"></div></div>`;
+        } else if (item.waiting) {
           statusHtml = `<span class="pulse-waiting">⏳ 等待资源中...</span>`;
           barHtml = `<div class="progress-bar-bg"><div class="progress-bar-fill progress-bar-indeterminate" style="background:#f59e0b;"></div></div>`;
         } else if (typeof item.frac === 'number') {
@@ -672,9 +703,13 @@
       const lyrFilter = document.getElementById('filter-log-layer')?.value || 'ALL';
 
       const filtered = logRecords.filter(r => {
+        // SDK 上报的 level 是小写（debug/info/warn/error），选择器是大小写不敏感的语义名；
+        // 严格比较会把业务域日志全部滤掉，且 SDK 发的是 warn 而不是 warning。
+        let lvl = String(r.level || 'info').toUpperCase();
+        if (lvl === 'WARN') lvl = 'WARNING';
         if (lvlFilter === 'PHASE') {
           if (!r.phase) return false;
-        } else if (lvlFilter !== 'ALL' && r.level !== lvlFilter) {
+        } else if (lvlFilter !== 'ALL' && lvl !== lvlFilter) {
           return false;
         }
         if (lyrFilter !== 'ALL' && r.layer !== lyrFilter) {
@@ -731,7 +766,7 @@
         }
         if (latestSnapshot.active_progress && activeProgressMap.size === 0) {
           for (const p of latestSnapshot.active_progress) {
-            if (p.key) activeProgressMap.set(p.key, p);
+            if (p.key) activeProgressMap.set(activeProgressKey(p), { ...p, state: p.state || 'running', terminal: false });
           }
           renderProgress();
         }

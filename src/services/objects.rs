@@ -1,6 +1,6 @@
 //! ObjectHub —— C4 存储枢纽：虚拟路径 → 唯一 id → 平铺物理文件的索引。
 //!
-//! 模型（见 CONSTITUTION.md C4）：
+//! 模型（见 docs/CONSTITUTION.md C4）：
 //!   - 启动配置只有一个项目根 `project_root`（默认 `./data`）；域根 = `<project_root>/<domain>/`。
 //!   - 物理落盘：**平铺的唯一 id 文件** `<project_root>/<domain>/<object_id>`，无子目录。
 //!   - 业务域的目录结构（如 `users/avatars/a.png`）是**虚拟**的，只存在于本索引：

@@ -1,7 +1,7 @@
 //! 宪法派生不变量 —— 重构的测试预言。
 //!
 //! 旧测试固化了实现事故（重启后查旧结果、无绑定回执回落到当前代际等），不作为重构判据。
-//! 这里只断言宪法语义（见 CONSTITUTION.md C2/C3 与 docs/KERNEL_CONVERGENCE.md §4）：
+//! 这里只断言宪法语义（见 docs/CONSTITUTION.md C2/C3 与 docs/archive/KERNEL_CONVERGENCE.md §4）：
 //!   I1 唯一性：一条消息至多一份可读结果；
 //!   I2 单调性：回执只沿 Sent→Received→Started→终态推进，终态恰一次且不可回退；
 //!   I3 有界性：非持久终态不留常驻状态，提交去重索引有界。

@@ -1,4 +1,4 @@
-// Atelier SDK v2（Node）：单层、全异步、无遗留别名。15 项能力见 sdk/v2/README.md。
+// Atelier SDK v2（Node）：单层、全异步、无遗留别名。15 项能力见 docs/sdk/nodejs.md。
 "use strict";
 
 const crypto = require("crypto");

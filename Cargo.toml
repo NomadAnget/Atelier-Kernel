@@ -2,7 +2,7 @@
 name = "atelier_kernel"
 version = "0.2.0"
 edition = "2024"
-description = "Atelier Kernel: Single-machine multi-domain microkernel with Stdio pipe supervision, two-layer contract routing, 4-stage receipts, real-time observer, and message-driven domain storage."
+description = "Atelier Kernel: single-machine multi-domain microkernel with named-endpoint supervision, two-layer contract routing, 4-stage receipts, a durable delivery ledger, per-domain storage and unified structured logs."
 
 [lib]
 name = "atelier_kernel"

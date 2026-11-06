@@ -87,7 +87,10 @@ jobs:
         run: |
           mkdir -p dist/sdk
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
-          cp "docs/RELEASE_${version}.md" dist/sdk/RELEASE_NOTES.md
+          # 发版记录统一归档在 docs/archive/；旧位置仍兼容一次，避免历史 tag 重跑失败。
+          notes="docs/archive/RELEASE_${version}.md"
+          [ -f "$notes" ] || notes="docs/RELEASE_${version}.md"
+          cp "$notes" dist/sdk/RELEASE_NOTES.md
           python3 sdk/python/build_wheel.py dist/sdk
           cd sdk/nodejs && npm pack --pack-destination ../../dist/sdk
 
@@ -168,8 +171,8 @@ jobs:
           mkdir -p dist/kernel-runtime-${{ matrix.target_label }}
           cp target/release/${{ matrix.bin_name }} dist/kernel-runtime-${{ matrix.target_label }}/
           cp kernel_boot.json dist/kernel-runtime-${{ matrix.target_label }}/kernel_boot.template.json
-          cp VARIANT_GUIDE.md dist/kernel-runtime-${{ matrix.target_label }}/VARIANT_GUIDE.md
-          cp README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDENTITY.md ADVERSARIAL_AUDIT.md RELEASE_NOTES_v0.1.8.md dist/kernel-runtime-${{ matrix.target_label }}/
+          # 根目录只有 README 与图标；契约、能力与 SDK 文档全部随 docs/ 一起打包。
+          cp README.md kernel.svg dist/kernel-runtime-${{ matrix.target_label }}/
           cp -R docs dist/kernel-runtime-${{ matrix.target_label }}/docs
           mkdir -p dist/kernel-runtime-${{ matrix.target_label }}/sdk/python dist/kernel-runtime-${{ matrix.target_label }}/sdk/nodejs
           cp sdk/python/README.md dist/kernel-runtime-${{ matrix.target_label }}/sdk/python/README.md

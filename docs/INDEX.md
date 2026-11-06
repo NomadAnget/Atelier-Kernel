@@ -1,39 +1,43 @@
-# 文档索引（0.1.15）
+# 文档索引
 
-## 当前接口与契约
+内核只有**一份**根文档：[README.md](../README.md)。它给出内核定位、最高准则与最高宪法入口；具体契约、能力与 SDK 用法都在这份索引里往下展开。
 
-- [0.1.15 发布说明](RELEASE_0.1.15.md)
+## 最高契约
 
-- [README.md](../README.md)
-- [CONSTITUTION.md](../CONSTITUTION.md)
-- [ARCHITECTURE.md](../ARCHITECTURE.md)
-- [SDK_CONTRACT.md](../SDK_CONTRACT.md)
-- [MESSAGE_IDENTITY.md](../MESSAGE_IDENTITY.md)
-- [VARIANT_GUIDE.md](../VARIANT_GUIDE.md)
-- [sdk/python/README.md](../sdk/python/README.md)
-- [sdk/nodejs/README.md](../sdk/nodejs/README.md)
-- [docs/DOMAIN_STATE_OBSERVATION.md](DOMAIN_STATE_OBSERVATION.md)
-- [docs/OBSERVATION_USAGE.md](OBSERVATION_USAGE.md)
-- [docs/PORT_BINDINGS.md](PORT_BINDINGS.md)
-- [docs/PROGRESS_STATE.md](PROGRESS_STATE.md)
-- [docs/LOG_QUERY_PAGINATION.md](LOG_QUERY_PAGINATION.md)
-- [docs/TEMPORARY_TRANSPORT_OVERFLOW.md](TEMPORARY_TRANSPORT_OVERFLOW.md)
+| 文档 | 内容 |
+| :--- | :--- |
+| [CONSTITUTION.md](CONSTITUTION.md) | **最高宪法（V4.1）**：四大内核契约 C1–C4、机器宪法 M1–M7、行为规范 B1–B6，以及后续追加的专项契约 |
+| [MESSAGE_IDENTITY.md](MESSAGE_IDENTITY.md) | 消息身份与扇出：`logical_id` / `message_id`、提交去重与 seq 语义、重启后的收敛 |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 架构与源码映射：11 条基线铁律、模块职责、8 大内置基础设施 |
 
-## 历史验收与发布记录
+## SDK
 
-以下记录保留原基线、故障证据、测试计数与当时部署状态；不作为当前接口保证。旧记录中的“待提交”、零磁盘、旧观察队列或探活描述，以当前宪法、SDK契约与专项文档为准。
+| 文档 | 内容 |
+| :--- | :--- |
+| [SDK_CONTRACT.md](SDK_CONTRACT.md) | 跨语言 SDK 责任边界：能力集合、事件流投递契约、传输保护、C4 命名空间 |
+| [sdk/python.md](sdk/python.md) | Python SDK：安装、最小示例、15 项能力表、传输与 C4 用法 |
+| [sdk/nodejs.md](sdk/nodejs.md) | Node.js SDK：同上（方法名为 camelCase） |
 
-- [ADVERSARIAL_AUDIT.md](../ADVERSARIAL_AUDIT.md)
-- [RELEASE_NOTES_v0.1.8.md](../RELEASE_NOTES_v0.1.8.md)
-- [docs/CORE_RELIABILITY_ACCEPTANCE.md](CORE_RELIABILITY_ACCEPTANCE.md)
-- [docs/CORE_RELIABILITY_FIX_ACCEPTANCE.md](CORE_RELIABILITY_FIX_ACCEPTANCE.md)
-- [docs/CORE_RELIABILITY_FIX_PLAN.md](CORE_RELIABILITY_FIX_PLAN.md)
-- [docs/CORE_RELIABILITY_REIMPLEMENTATION.md](CORE_RELIABILITY_REIMPLEMENTATION.md)
-- [docs/FINAL_RELIABILITY_REVIEW.md](FINAL_RELIABILITY_REVIEW.md)
-- [docs/PROCESS_EXIT_DIAGNOSTICS.md](PROCESS_EXIT_DIAGNOSTICS.md)
-- [docs/PROCESS_REAPING.md](PROCESS_REAPING.md)
-- [docs/PROCESS_REAPING_INVESTIGATION.md](PROCESS_REAPING_INVESTIGATION.md)
-- [docs/RELEASE_0.1.13.md](RELEASE_0.1.13.md)
-- [docs/RELEASE_0.1.14.md](RELEASE_0.1.14.md)
-- [docs/RELIABILITY_STATUS.md](RELIABILITY_STATUS.md)
-- [docs/STORAGE_QUERY_PROJECTION_REVIEW.md](STORAGE_QUERY_PROJECTION_REVIEW.md)
+## 内核能力
+
+| 文档 | 内容 |
+| :--- | :--- |
+| [transport.md](capabilities/transport.md) | 命名端点传输：`ATELIER_IPC_IN` / `OUT`、平台路径、读写语义、安全边界 |
+| [port-bindings.md](capabilities/port-bindings.md) | 内核托管的域端口绑定：薄转发进程、代际切换、连接排空 |
+| [observation.md](capabilities/observation.md) | 观察能力：调用与执行观察、运行指标、异常事件，以及丢失边界 |
+| [domain-state-observation.md](capabilities/domain-state-observation.md) | 域状态镜像：真实状态写入驱动、初始快照与最新状态合并、无轮询 |
+| [progress.md](capabilities/progress.md) | 进度终态：`running` / `completed` / `failed` / `cancelled` 与活动键回收 |
+| [log-query-pagination.md](capabilities/log-query-pagination.md) | `QueryLogs` 游标分页：`before_id`、页预算、继续游标 |
+| [outbox-overflow.md](capabilities/outbox-overflow.md) | 出口溢出：超过内存窗口时临时磁盘暂存及其边界 |
+| [process-diagnostics.md](capabilities/process-diagnostics.md) | 每代际进程故障诊断事件的字段与用法 |
+| [process-reaping.md](capabilities/process-reaping.md) | 进程回收可见性：回收完成前状态仍可观察 |
+
+## 使用与运维
+
+| 文档 | 内容 |
+| :--- | :--- |
+| [VARIANT_GUIDE.md](VARIANT_GUIDE.md) | 变体开发指南：发布包结构、三步创建变体、命令行参数、发布流程 |
+
+## 归档
+
+[archive/INDEX.md](archive/INDEX.md) —— 旧的设计方案、验收记录与逐版发版说明。**这些不代表当前契约**，仅用于追溯。

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-labelledby="title">
+  <title id="title">Atelier Kernel</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3B6FE0"/>
+      <stop offset="1" stop-color="#5FA8FF"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="256" height="256" rx="56" ry="56" fill="url(#bg)"/>
+
+  <!-- 内核与域的连接：先画连线，再压上端点 -->
+  <g stroke="#FFFFFF" stroke-width="5" stroke-linecap="round" opacity="0.45">
+    <line x1="174" y1="128"   x2="220" y2="128"/>
+    <line x1="151" y1="88.2"  x2="174" y2="48.3"/>
+    <line x1="105" y1="88.2"  x2="82"  y2="48.3"/>
+    <line x1="82"  y1="128"   x2="36"  y2="128"/>
+    <line x1="105" y1="167.8" x2="82"  y2="207.7"/>
+    <line x1="151" y1="167.8" x2="174" y2="207.7"/>
+  </g>
+
+  <!-- 内核本体：六边形 -->
+  <path d="M174 128 L151 88.2 L105 88.2 L82 128 L105 167.8 L151 167.8 Z"
+        fill="none" stroke="#FFFFFF" stroke-width="11"
+        stroke-linejoin="round" stroke-linecap="round"/>
+
+  <!-- 内核核心 -->
+  <circle cx="128" cy="128" r="15" fill="#FFFFFF"/>
+
+  <!-- 各域端点 -->
+  <g fill="#FFFFFF">
+    <circle cx="220" cy="128"   r="12"/>
+    <circle cx="174" cy="48.3"  r="12"/>
+    <circle cx="82"  cy="48.3"  r="12"/>
+    <circle cx="36"  cy="128"   r="12"/>
+    <circle cx="82"  cy="207.7" r="12"/>
+    <circle cx="174" cy="207.7" r="12"/>
+  </g>
+</svg>

@@ -35,6 +35,7 @@ pub use imp::{EndpointListener, EndpointReader, EndpointStream, EndpointWriter};
 #[cfg(unix)]
 mod imp {
     use std::io;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
     pub struct EndpointListener {
@@ -57,10 +58,11 @@ mod imp {
 
     pub fn bind(path: &str) -> io::Result<EndpointListener> {
         let _ = std::fs::remove_file(path);
-        Ok(EndpointListener {
-            listener: UnixListener::bind(path)?,
-            path: path.to_string(),
-        })
+        let listener = UnixListener::bind(path)?;
+        // 身份由"哪条端点"决定（宪法 M2），所以端点本身必须只有创建者可连：
+        // /tmp 下的 socket 若沿用默认 umask，本机其他用户就能连上进行身份冒充。
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(EndpointListener { listener, path: path.to_string() })
     }
 
     impl EndpointListener {

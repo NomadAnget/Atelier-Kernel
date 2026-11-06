@@ -44,46 +44,6 @@ pub struct AuditRecord {
     pub created_at: i64,
 }
 
-/// 持久层：核本身只做状态机，持久化是核外的一个 backend。
-/// Durable 活行与审计由它保存/读取；Volatile/Ephemeral 永不过它。
-pub trait Store: Send + Sync {
-    fn load_active(&self) -> Vec<Message> {
-        Vec::new()
-    }
-    fn load_audit(&self) -> Vec<AuditRecord> {
-        Vec::new()
-    }
-    fn save_active(&mut self, _m: &Message) {}
-    fn delete_active(&mut self, _id: &str) {}
-    fn append_audit(&mut self, _r: &AuditRecord) {}
-}
-
-/// 测试用的内存持久层。
-#[derive(Default)]
-pub struct VecStore {
-    pub active: Vec<Message>,
-    pub audit: Vec<AuditRecord>,
-}
-
-impl Store for VecStore {
-    fn load_active(&self) -> Vec<Message> {
-        self.active.clone()
-    }
-    fn load_audit(&self) -> Vec<AuditRecord> {
-        self.audit.clone()
-    }
-    fn save_active(&mut self, m: &Message) {
-        self.active.retain(|x| x.message_id != m.message_id);
-        self.active.push(m.clone());
-    }
-    fn delete_active(&mut self, id: &str) {
-        self.active.retain(|x| x.message_id != id);
-    }
-    fn append_audit(&mut self, r: &AuditRecord) {
-        self.audit.push(r.clone());
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Submission {
     pub logical_id: String,
@@ -266,11 +226,14 @@ impl SubmissionCache {
     }
 }
 
+/// 核只做状态机：持有**活跃行**与提交身份，不持有任何历史。
+///
+/// 终态结果的唯一权威是 SQLite 的 `audit` 表（宪法 C3:54：历史身份及结果直接查 SQLite，
+/// 不建立全量内存索引，不把全部历史结果一次性展开到内存）。因此这里没有 `audit` 字段，
+/// 也没有持久层 backend——持久化完全由 facade（`KernelLedger`）在核外完成。
 pub struct Nucleus {
     active: BTreeMap<String, Message>,
-    audit: Vec<AuditRecord>,
     cache: SubmissionCache,
-    store: Option<Box<dyn Store>>,
 }
 
 impl Default for Nucleus {
@@ -281,46 +244,7 @@ impl Default for Nucleus {
 
 impl Nucleus {
     pub fn new() -> Self {
-        Nucleus {
-            active: BTreeMap::new(),
-            audit: Vec::new(),
-            cache: SubmissionCache::new(),
-            store: None,
-        }
-    }
-
-    /// 挂一个持久层 backend（Durable 活行与审计由它保存）。
-    pub fn with_store<S: Store + 'static>(mut self, store: S) -> Self {
-        self.store = Some(Box::new(store));
-        self
-    }
-
-    /// 从持久层恢复（启动恢复这个出口的推导）：
-    /// 载入 Durable 活行与审计；把非终态活行收敛为终态（`execution_outcome: unknown`）。
-    /// 去重窗口与高水位是每代际状态，重启后从空开始——这正是"内核重启清会话"的语义。
-    pub fn recover<S: Store + 'static>(store: S) -> Self {
-        let mut n = Nucleus::new();
-        for a in store.load_audit() {
-            n.audit.push(a);
-        }
-        for m in store.load_active() {
-            n.active.insert(m.message_id.clone(), m);
-        }
-        n.store = Some(Box::new(store));
-        let ids: Vec<String> = n
-            .active
-            .values()
-            .filter(|m| !m.status.is_terminal())
-            .map(|m| m.message_id.clone())
-            .collect();
-        for id in ids {
-            let _ = n.advance(
-                &id,
-                ContractStatus::ExecutionFailed,
-                Some(serde_json::json!({"error":"kernel_restarted","execution_outcome":"unknown"})),
-            );
-        }
-        n
+        Nucleus { active: BTreeMap::new(), cache: SubmissionCache::new() }
     }
 
     /// 消息级基础操作：收进一条消息的活跃行。
@@ -380,6 +304,23 @@ impl Nucleus {
         self.cache.allocate_with(dedup_key, seq, logical_id, ids, dedup_required)
     }
 
+    /// 把一条活行就地标记为失败，但**保留在活跃集合**。
+    ///
+    /// 用于"持久化失败"：这条结果没有落盘，所以它不是历史（不能进 `audit`），
+    /// 但它必须继续可读，否则来源域连失败都无法重放（宪法 C3:48：显式失败，不静默兜底）。
+    /// 退役时由 `retire_source` 显式清除，避免驻留泄漏。
+    pub fn mark_live_failure(&mut self, message_id: &str, data: Option<serde_json::Value>) -> bool {
+        let Some(current) = self.active.get_mut(message_id) else {
+            return false;
+        };
+        current.status = ContractStatus::ExecutionFailed;
+        current.updated_at = now_millis();
+        if data.is_some() {
+            current.data = data;
+        }
+        true
+    }
+
     /// 由子消息 id 反查提交 logical_id。
     pub fn logical_id_for(&self, message_id: &str) -> Option<String> {
         self.cache
@@ -393,23 +334,9 @@ impl Nucleus {
         self.active.values().cloned().collect()
     }
 
-    pub fn audit_snapshot(&self) -> Vec<AuditRecord> {
-        self.audit.clone()
-    }
-
     /// 退役去重键（只清提交身份/高水位，不动消息状态）。
     pub fn retire_dedup(&mut self, dedup_key: &str) {
         self.cache.retire(dedup_key);
-    }
-
-    /// 直接追加一条终态审计（入口即终态 Durable 走这里，不经过 active）。
-    pub fn record_terminal(&mut self, r: AuditRecord) {
-        self.audit.push(r);
-    }
-
-    /// 启动恢复时批量载入历史审计。
-    pub fn load_audit(&mut self, records: Vec<AuditRecord>) {
-        self.audit.extend(records);
     }
 
     /// 收进一个提交。`dedup_key` 是 source 的去重键（`{domain}#{generation}`），
@@ -449,19 +376,10 @@ impl Nucleus {
                 data.clone(),
             );
         }
-        if policy == DeliveryPolicy::Durable {
-            if let Some(store) = self.store.as_mut() {
-                for id in &ids {
-                    if let Some(m) = self.active.get(id) {
-                        store.save_active(m);
-                    }
-                }
-            }
-        }
         Ok(Submission { logical_id, ids, replayed: false })
     }
 
-    /// 单调推进一条消息；推进到终态即自动"转审计或清除 + 回收去重窗口"。
+    /// 单调推进一条消息；推进到终态即清除活行并回收去重窗口。
     pub fn advance(
         &mut self,
         message_id: &str,
@@ -481,26 +399,8 @@ impl Nucleus {
             next.data = data;
         }
         if status.is_terminal() {
-            // 终态：Durable 转审计，其余清除。
-            if next.policy == DeliveryPolicy::Durable {
-                let rec = AuditRecord {
-                    message_id: next.message_id.clone(),
-                    logical_id: next.logical_id.clone(),
-                    source: next.source.clone(),
-                    seq: next.seq,
-                    target: next.target.clone(),
-                    message_type: next.message_type.clone(),
-                    policy: next.policy,
-                    status,
-                    data: next.data.clone(),
-                    created_at: now_millis(),
-                };
-                self.audit.push(rec.clone());
-                if let Some(store) = self.store.as_mut() {
-                    store.append_audit(&rec);
-                    store.delete_active(message_id);
-                }
-            }
+            // 终态：活行立即清除。Durable 的历史结果由 facade 在同一个事务里写入 `audit` 表，
+            // 核内不保留任何历史副本（权威唯一性：核只存活跃，盘只存历史）。
             self.active.remove(message_id);
             // 回收该 logical 的去重窗口：仅 Ephemeral 到达终态即回收；
             // Durable/Volatile 保留去重与重放契约，由 REPLAY_WINDOW 有界化（宪法 C3:56）。
@@ -536,24 +436,23 @@ impl Nucleus {
                 ContractStatus::ExecutionFailed,
                 Some(serde_json::json!({"error":"source_retired","execution_outcome":"unknown"})),
             );
+            // 未落盘的失败行可能已经是终态、无法再被 advance 推进；退役时必须显式清掉。
+            self.active.remove(&id);
         }
         self.cache.retire(dedup_key);
     }
 
-    /// 读活跃或审计结果（活行优先）。
+    /// 读活跃行（历史结果不在这里，按需查 SQLite）。
     pub fn get(&self, message_id: &str) -> Option<&Message> {
         self.active.get(message_id)
     }
 
-    pub fn get_audit(&self, message_id: &str) -> Option<&AuditRecord> {
-        self.audit.iter().find(|r| r.message_id == message_id)
-    }
-
-    /// 有界性/唯一性诊断（I3）。
-    pub fn retention(&self) -> (usize, usize, usize) {
-        (self.active.len(), self.cache.len(), self.audit.len())
+    /// 有界性诊断（I3）：(活跃行, 提交身份)。
+    pub fn retention(&self) -> (usize, usize) {
+        (self.active.len(), self.cache.len())
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -565,16 +464,15 @@ mod tests {
     }
 
     #[test]
-    fn i1_uniqueness_active_and_audit_never_coexist() {
+    fn i1_terminal_removes_the_active_row() {
         let mut n = Nucleus::new();
         let sub = n.admit("d#1", "d", 1, &[target("w.run")], "Run", DeliveryPolicy::Durable, None).unwrap();
         let id = &sub.ids[0];
         assert!(n.get(id).is_some());
-        assert!(n.get_audit(id).is_none());
         n.advance(id, ContractStatus::Completed, Some(json!({"ok":true})));
-        // 终态：活跃清除，审计追加，二者不同时存在
+        // 终态：活行立即离开核。历史结果由 facade 写盘，核内不留副本。
         assert!(n.get(id).is_none());
-        assert!(n.get_audit(id).is_some());
+        assert_eq!(n.retention().0, 0);
     }
 
     #[test]
@@ -589,7 +487,6 @@ mod tests {
         // 终态后再推进：消息已离开活跃集合，不会再次推进（Unknown 与 DuplicateOrStale 都表示"无状态变更"）。
         assert!(!matches!(n.advance(id, ContractStatus::ExecutionFailed, None), Advance::Advanced { .. }));
         assert!(n.get(id).is_none());
-        assert!(n.get_audit(id).is_some());
     }
 
     #[test]
@@ -600,10 +497,9 @@ mod tests {
             let id = sub.ids[0].clone();
             n.advance(&id, ContractStatus::Completed, None);
         }
-        let (active, submissions, audit) = n.retention();
+        let (active, submissions) = n.retention();
         assert_eq!(active, 0, "terminal volatile leaves no active row");
         assert!(submissions <= REPLAY_WINDOW, "dedup window bounded: {submissions}");
-        assert_eq!(audit, 0, "volatile never audits");
     }
 
     #[test]
@@ -616,44 +512,20 @@ mod tests {
         assert_eq!(replay.ids, first.ids);
     }
 
+    /// 滑出窗口的过期重放必须被拒绝，不能重新分配身份（高水位参与判定）。
     #[test]
-    fn restart_closes_inflight_and_preserves_audit() {
-        let mut store = VecStore::default();
-        store.audit.push(AuditRecord {
-            message_id: "m1".into(),
-            logical_id: "l1".into(),
-            source: "d".into(),
-            seq: 1,
-            target: "w.run".into(),
-            message_type: "Run".into(),
-            policy: DeliveryPolicy::Durable,
-            status: ContractStatus::Completed,
-            data: Some(json!({"ok": true})),
-            created_at: 0,
-        });
-        store.active.push(Message {
-            message_id: "m2".into(),
-            logical_id: "l2".into(),
-            source: "d".into(),
-            seq: 2,
-            target: "w.run".into(),
-            message_type: "Run".into(),
-            policy: DeliveryPolicy::Durable,
-            status: ContractStatus::Sent,
-            data: None,
-            created_at: 0,
-            updated_at: 0,
-        });
-
-        let n = Nucleus::recover(store);
-        // 在途 Durable 被收敛为终态并转审计
-        assert!(n.get("m2").is_none());
-        let aud = n.get_audit("m2").expect("inflight durable closed to audit");
-        assert_eq!(aud.status, ContractStatus::ExecutionFailed);
-        assert_eq!(aud.data.as_ref().unwrap()["execution_outcome"], "unknown");
-        // 历史审计保留
-        assert_eq!(n.get_audit("m1").unwrap().status, ContractStatus::Completed);
-        // 活跃集合为空
-        assert_eq!(n.retention().0, 0);
+    fn stale_seq_beyond_the_window_is_rejected() {
+        let mut n = Nucleus::new();
+        for seq in 1..=REPLAY_WINDOW as u64 + 1 {
+            n.admit("d#1", "d", seq, &[target("w.run")], "Run", DeliveryPolicy::Durable, None).unwrap();
+        }
+        // seq=1 已被窗口淘汰但低于高水位
+        let stale = n.admit("d#1", "d", 1, &[target("w.run")], "Run", DeliveryPolicy::Durable, None);
+        assert!(
+            matches!(stale, Err(high) if high == REPLAY_WINDOW as u64 + 1),
+            "stale seq must be rejected with the high-water mark"
+        );
+        // 纯 Ephemeral 不受高水位限制（C3:56）
+        assert!(n.admit("e#1", "e", 1, &[target("w.run")], "Run", DeliveryPolicy::Ephemeral, None).is_ok());
     }
 }

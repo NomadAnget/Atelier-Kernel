@@ -158,3 +158,141 @@ fn i3_nondurable_terminal_leaves_no_resident_state() {
     assert_eq!(counts["volatile_records"], 0, "{counts}");
     assert_eq!(counts["child_links"], 0, "{counts}");
 }
+
+fn scratch_db(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!(
+        "atelier-{label}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("ledger.db");
+    (root, path)
+}
+
+/// I1 的存储级断言：同一个 message_id 绝不能同时出现在 `messages`（在途）与 `audit`（历史）。
+#[test]
+fn i1_live_and_historical_rows_never_coexist_on_disk() {
+    let (root, path) = scratch_db("i1-disk");
+    let id;
+    {
+        let k = AtelierKernel::open_with_db(&path).unwrap();
+        let sender = k.attach_domain("i1_disk_sender");
+        let worker = k.attach_domain("i1_disk_worker");
+        worker.register_handlers(&["run"]);
+        worker.drain_frames();
+        id = sender.send_one_with_seq(
+            1,
+            vec!["i1_disk_worker.run".into()],
+            MSG_DELIVERY_VOLATILE,
+            json!({}),
+            json!({}),
+        );
+        let F::Deliver(m) = worker.recv_frame_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("expected delivery")
+        };
+        assert_eq!(m.message_id, id);
+        worker.report_receipt(&m.message_id, &m.target, S::Completed, Some(json!({"ok": 1})));
+        let mut done = false;
+        while let Ok(frame) = sender.recv_frame_timeout(Duration::from_secs(5)) {
+            if matches!(&frame, F::Receipt(r) if r.status == S::Completed) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "terminal receipt never arrived");
+
+        // Durable 提交走一条独立的 Durable 消息，确保 audit 里有真实历史行。
+        let durable_id = sender.send_one_with_seq(
+            2,
+            vec!["i1_disk_worker.run".into()],
+            "Run",
+            json!({}),
+            json!({}),
+        );
+        let F::Deliver(m) = worker.recv_frame_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("expected durable delivery")
+        };
+        worker.report_receipt(&durable_id, &m.target, S::Completed, Some(json!({"ok": 2})));
+        let mut done = false;
+        while let Ok(frame) = sender.recv_frame_timeout(Duration::from_secs(5)) {
+            if matches!(&frame, F::Receipt(r) if r.status == S::Completed && r.message_id == durable_id) {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "durable terminal receipt never arrived");
+        drop(k);
+    }
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let overlap: i64 = db
+        .query_row(
+            "SELECT count(*) FROM messages WHERE message_id IN (SELECT message_id FROM audit)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(overlap, 0, "an id must never be both live and historical");
+    let audited: i64 = db
+        .query_row("SELECT count(*) FROM audit WHERE message_id=?1", [&id], |r| r.get(0))
+        .unwrap_or(0);
+    let live: i64 = db
+        .query_row("SELECT count(*) FROM messages WHERE message_id=?1", [&id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(live, 0, "terminal row must leave the live table");
+    // volatile 终态本就既不留活行也不进历史
+    assert_eq!(audited, 0, "volatile must never audit");
+    drop(db);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// 宪法 C3:54：历史终态结果留在 SQLite，按需按 id / logical 读取，不进入核的常驻状态。
+///
+/// 用一份 5 万行历史的账本启动：核内驻留记录必须为 0（历史不复活成状态），
+/// 而历史仍能通过 `idx_audit_message` / `idx_audit_logical` 按需点查。
+#[test]
+fn historical_results_stay_on_disk_and_are_read_by_id() {
+    let (root, path) = scratch_db("boot-history");
+    drop(AtelierKernel::open_with_db(&path).unwrap()); // 建表
+    {
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        {
+            let mut stmt = db
+                .prepare(
+                    "INSERT INTO audit(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at) \
+                     VALUES(?1,?2,?3,'d','w.run','Run','durable','completed',?4,0)",
+                )
+                .unwrap();
+            let payload = "{\"payload\":\"x\"}";
+            for i in 0..50_000i64 {
+                stmt.execute(rusqlite::params![format!("m{i}"), format!("l{i}"), i, payload])
+                    .unwrap();
+            }
+        }
+        db.execute_batch("COMMIT").unwrap();
+    }
+
+    let k = AtelierKernel::open_with_db(&path).unwrap();
+    let counts = k.ledger().retention_counts();
+    assert_eq!(counts["resident_records"], 0, "history must not resurrect: {counts}");
+    assert_eq!(counts["durable_records"], 0, "history must not resurrect: {counts}");
+
+    // 按 message_id 点查
+    let rec = k
+        .ledger()
+        .get_persisted_record("m42424")
+        .expect("historical result must be readable by id");
+    assert_eq!(rec.status, S::Completed);
+    assert_eq!(rec.logical_id, "l42424");
+
+    // 按 message_id 读回执（走 read_audit）
+    assert_eq!(k.ledger().receipts_for_message("m42424").len(), 1);
+    // 按 logical_id 读整条链路（走 idx_audit_logical）
+    assert_eq!(k.ledger().receipts_for_logical("l42424").len(), 1);
+    // 不存在的 id 不是错误，只是没有结果
+    assert!(k.ledger().get_persisted_record("m-missing").is_none());
+
+    drop(k);
+    let _ = std::fs::remove_dir_all(root);
+}

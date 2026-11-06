@@ -204,21 +204,6 @@ fn record_from_audit(a: &AuditRecord) -> DeliveryRecord {
     }
 }
 
-fn audit_from_record(r: &DeliveryRecord) -> AuditRecord {
-    AuditRecord {
-        message_id: r.message_id.clone(),
-        logical_id: r.logical_id.clone(),
-        source: r.source_domain.clone(),
-        seq: r.seq,
-        target: r.target.clone(),
-        message_type: r.message_type.clone(),
-        policy: r.policy,
-        status: r.status,
-        data: r.data.clone(),
-        created_at: r.created_at,
-    }
-}
-
 impl KernelLedger {
     pub fn new() -> Self {
         Self::open_with_db(None).expect("cannot initialize kernel ledger")
@@ -385,16 +370,9 @@ impl KernelLedger {
         }
         tx.commit()?;
 
-        // 载入历史审计到核（核是唯一权威，磁盘只是镜像）。
-        let audit_records: Vec<AuditRecord> = {
-            let mut stmt = db.prepare(
-                "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at FROM audit ORDER BY id",
-            )?;
-            stmt.query_map([], audit_row_to_record)?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let mut nucleus = Nucleus::new();
-        nucleus.load_audit(audit_records);
+        // 宪法 C3:54：历史身份及结果直接查 SQLite，启动不建立全量内存索引，
+        // 也不把全部历史结果一次性展开到内存。核从空状态开始，终态历史按需点查。
+        let nucleus = Nucleus::new();
 
         Ok(Self {
             next_id_seq: AtomicU64::new(1),
@@ -552,7 +530,7 @@ impl KernelLedger {
 
     pub fn retention_counts(&self) -> Value {
         let n = self.nucleus.lock();
-        let (active, submissions, _audit) = n.retention();
+        let (active, submissions) = n.retention();
         let mut durable = 0usize;
         let mut volatile = 0usize;
         let mut ephemeral = 0usize;
@@ -644,13 +622,12 @@ impl KernelLedger {
             .logical_id = r.logical_id.clone();
 
         if r.status.is_terminal() {
-            // 入口即终态（TargetInvalid / ContractInvalid）：不建活跃行。
+            // 入口即终态（TargetInvalid / ContractInvalid）：不建活跃行，只在盘上留历史。
             if r.policy == DeliveryPolicy::Durable {
                 if let Err(e) = self.append_audit_disk(&r) {
                     self.set_persistence_failed(id);
                     return (Self::failure(&r, e), false);
                 }
-                self.nucleus.lock().record_terminal(audit_from_record(&r));
             }
             self.maybe_retire_binding(id);
             return (r, true);
@@ -846,16 +823,12 @@ impl KernelLedger {
     pub fn receipts_for_logical(&self, logical: &str) -> Vec<MessageReceipt> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
+        // 在途（含 Volatile/Ephemeral，它们不落 messages 表）来自核；终态历史来自 SQLite。
         {
             let n = self.nucleus.lock();
             for m in n.active_snapshot() {
                 if m.logical_id == logical && seen.insert(m.message_id.clone()) {
                     out.push(record_from_message(&m).to_receipt());
-                }
-            }
-            for a in n.audit_snapshot() {
-                if a.logical_id == logical && seen.insert(a.message_id.clone()) {
-                    out.push(record_from_audit(&a).to_receipt());
                 }
             }
         }
@@ -945,16 +918,34 @@ impl KernelLedger {
         notifications
     }
 
-    /// 统一读路径：核（活跃 → 审计）是唯一权威，磁盘是镜像，读不回退到第二真相源。
+    /// 统一读路径：在途看核，终态看盘。
+    ///
+    /// 一个 id 只有一个权威来源——活跃行在核内，终态历史在 SQLite 的 `audit` 表。
+    /// I1 保证二者互斥（终态事务里 `DELETE messages` + `INSERT audit` 原子发生），
+    /// 所以这里不存在"两个来源给出不同答案"的可能。
     fn record_for_message(&self, id: &str) -> Option<DeliveryRecord> {
-        let n = self.nucleus.lock();
-        if let Some(m) = n.get(id) {
-            return Some(record_from_message(m));
+        {
+            let n = self.nucleus.lock();
+            if let Some(m) = n.get(id) {
+                return Some(record_from_message(m));
+            }
         }
-        if let Some(a) = n.get_audit(id) {
-            return Some(record_from_audit(a));
-        }
-        None
+        self.read_audit(id)
+    }
+
+    /// 按 message_id 对终态历史做索引点查（`idx_audit_message`）。
+    /// 宪法 C3:54：历史结果只在盘上，按需取载荷，不建内存索引。
+    fn read_audit(&self, id: &str) -> Option<DeliveryRecord> {
+        let db = self.db_conn.as_ref()?.lock();
+        db.query_row(
+            "SELECT message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at FROM audit WHERE message_id=?1 LIMIT 1",
+            [id],
+            audit_row_to_record,
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|a| record_from_audit(&a))
     }
 
     fn read_disk(&self, id: &str) -> Option<DeliveryRecord> {
@@ -1023,14 +1014,9 @@ impl KernelLedger {
     fn mark_unpersisted_failure(&self, r: &DeliveryRecord, e: impl ToString) -> DeliveryRecord {
         let failed = Self::failure(r, e);
         self.set_persistence_failed(&r.message_id);
-        let mut n = self.nucleus.lock();
-        if n.get(&r.message_id).is_some() {
-            let _ = n.advance(
-                &r.message_id,
-                ContractStatus::ExecutionFailed,
-                failed.data.clone(),
-            );
-        }
+        // 就地标记为失败但保留活行：结果没有落盘，所以它不是历史（不进 audit），
+        // 但仍须可读，否则来源域连这次失败都无法重放。
+        self.nucleus.lock().mark_live_failure(&r.message_id, failed.data.clone());
         failed
     }
 

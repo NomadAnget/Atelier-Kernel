@@ -253,3 +253,44 @@ fn ephemeral_replay_outside_the_window_is_not_treated_as_stale() {
     });
     assert!(!stale, "ephemeral replay must stay a fresh delivery; got {frames:?}");
 }
+
+/// C3:56：**完成后的** Ephemeral 不保留终态重放，同一序号再次提交是一次新瞬态投递。
+///
+/// 覆盖两条终态路径：入口即终态（目标不存在）与正常投递后终态。
+#[test]
+fn completed_ephemeral_resubmission_allocates_a_fresh_identity() {
+    let k = AtelierKernel::new_in_memory().unwrap();
+    let sender = k.attach_domain("eph_sender");
+
+    // 路径 A：入口即终态（TargetInvalid），不经过 Nucleus::advance
+    let first = sender.send_with_seq(1, vec!["missing.x".into()], "Ephemeral", json!({}), json!({}));
+    sender.drain_frames();
+    let again = sender.send_with_seq(1, vec!["missing.x".into()], "Ephemeral", json!({}), json!({}));
+    sender.drain_frames();
+    assert_ne!(
+        first, again,
+        "ephemeral that terminated at ingress must not replay its old identity"
+    );
+
+    // 路径 B：正常投递后终态（经过 Nucleus::advance 的 reclaim）
+    let worker = k.attach_domain("eph_worker");
+    worker.register_handlers(&["run"]);
+    worker.drain_frames();
+    let a = sender.send_with_seq(7, vec!["eph_worker.run".into()], "Ephemeral", json!({}), json!({}));
+    let F::Deliver(m) = worker.recv_frame_timeout(std::time::Duration::from_secs(5)).unwrap() else {
+        panic!("expected delivery")
+    };
+    worker.report_receipt(&m.message_id, &m.target, S::Completed, Some(json!({"ok": 1})));
+    let b = sender.send_with_seq(7, vec!["eph_worker.run".into()], "Ephemeral", json!({}), json!({}));
+    assert_ne!(a, b, "completed ephemeral must allocate a fresh identity");
+
+    // 反向守卫：**在途**期间同 seq 重提仍必须复用原身份（C3:56 的另一半），
+    // 否则回收就过度了，会把还在跑的瞬态消息去重能力砍掉。
+    let c = sender.send_with_seq(11, vec!["eph_worker.run".into()], "Ephemeral", json!({}), json!({}));
+    let F::Deliver(m2) = worker.recv_frame_timeout(std::time::Duration::from_secs(5)).unwrap() else {
+        panic!("expected second delivery")
+    };
+    let c_again = sender.send_with_seq(11, vec!["eph_worker.run".into()], "Ephemeral", json!({}), json!({}));
+    assert_eq!(c, c_again, "in-flight ephemeral replay must reuse the identity");
+    worker.report_receipt(&m2.message_id, &m2.target, S::Completed, Some(json!({"ok": 2})));
+}

@@ -615,6 +615,12 @@ impl KernelLedger {
                     return (Self::failure(&r, e), false);
                 }
             }
+            if r.policy == DeliveryPolicy::Ephemeral {
+                // 这条路径不经过 `Nucleus::advance`，必须在这里补一次瞬态身份回收，
+                // 否则已完成（入口即终态）的 Ephemeral 会一直占着去重窗口，
+                // 让同 seq 重提拿回旧失败回执而不是新瞬态投递（C3:56）。
+                self.nucleus.lock().reclaim_ephemeral(&r.logical_id);
+            }
             self.maybe_retire_binding(id);
             return (r, true);
         }

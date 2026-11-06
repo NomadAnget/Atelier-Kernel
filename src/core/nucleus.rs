@@ -405,11 +405,7 @@ impl Nucleus {
             // 回收该 logical 的去重窗口：仅 Ephemeral 到达终态即回收；
             // Durable/Volatile 保留去重与重放契约，由 REPLAY_WINDOW 有界化（宪法 C3:56）。
             if next.policy == DeliveryPolicy::Ephemeral {
-                let logical = next.logical_id.clone();
-                let all_children_done = !self.active.values().any(|m| m.logical_id == logical);
-                if all_children_done {
-                    self.cache.reclaim_logical(&logical);
-                }
+                self.reclaim_ephemeral(&next.logical_id);
             }
         } else {
             self.active.insert(message_id.to_string(), next.clone());
@@ -419,6 +415,17 @@ impl Nucleus {
             status,
             data: next.data.clone(),
             target: next.target.clone(),
+        }
+    }
+
+    /// 瞬态身份回收：该 logical 已无在途子消息时，释放其提交身份（含去重 seq）。
+    ///
+    /// 与 `advance` 终态分支同一规则，供**入口即终态**（未建活跃行、不经过 `advance`）
+    /// 的路径复用。C3:56：瞬态身份随在途生命周期回收，完成后同序号重提是新瞬态投递；
+    /// 在途期间仍保留身份，重提复用原身份。
+    pub fn reclaim_ephemeral(&mut self, logical_id: &str) {
+        if !self.active.values().any(|m| m.logical_id == logical_id) {
+            self.cache.reclaim_logical(logical_id);
         }
     }
 

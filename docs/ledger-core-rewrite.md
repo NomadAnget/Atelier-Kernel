@@ -122,31 +122,22 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 
 > **已完成**（`0d5dfde`）：`src/ledger.rs` 已改写为 nucleus 门面——`Nucleus` 持有活跃/审计/提交去重唯一权威，SQLite 只镜像 Durable 子集为 `messages`（活）+ `audit`（终态，只增）；`identities` / `highwater` / `kernel_sessions` / 旧 `kernel_ledger` 四表删除。下列 §1–§4 的三表设计即该实现的出处。
 
-> 上面 §1–§4 的三表设计，已由 `src/nucleus.rs` + `src/transport.rs` + `src/object_hub.rs` + `src/observer_proj.rs` + `src/routing.rs` 独立实现并验证。换骨 = 把这些模块接进 router/outbox/supervisor，删掉旧四表。
+> **终局记录（换骨终止，2026-11）**：§1–§4 的三表设计已由 `src/core/nucleus.rs`（消息状态机）实现，并由 `src/services/ledger.rs` 作为门面**完整接入生产路径**：
+> 入口 `allocate_submission → nucleus.allocate_submission_with_ids`（`ledger.rs:471`）、逐 target `record_initial_target_state → nucleus.put`（`ledger.rs:647`）、终态 `commit_advance → nucleus.advance`（`ledger.rs:790`）+ `record_terminal`（`ledger.rs:641`）、Durable 接收 `record_delivery`（`ledger.rs:696`）。
+>
+> 据此，原第 1/2/3 步（把 `nucleus` 调用搬进 router）**已无功能价值**：行为完全相同，只是把同一批调用换了个文件；唯一"收益"是让未接线模块变成"在用"。
+>
+> 未接线的三个脚手架已删除：`src/core/transport.rs`、`src/core/routing.rs`、`src/services/observer_proj.rs`，以及它们的唯一消费者 `tests/kernel_assembly.rs`。
+>
+> 原第 4 步（outbox → transport）**不执行**：`Transport` 当时只是无界内存帧日志（`Vec<Frame>`），不承担 C3 要求的持久 spool（`kernel_outbox`）、内存上界（2 MiB / 256 KiB / 1024 项）、临时文件溢出、「实际写完后才清除」以及重启收敛；顶替 `outbox` 会直接降级 C3，属于用能力换整洁。
+>
+> **现行固定分工**：`nucleus` = 消息状态机；`outbox` = C3 传输持久化/有界/溢出；`ledger` = 两者门面 + SQLite 镜像（`messages` 活行 / `audit` 终态）。
 
-1. **路由器入口** `handle_outbound_message_inner`：`allocate_submission + bind_origin + record_initial(逐 target)` 改为一次 `nucleus.admit(...)` + `routing.bind` + `transport.enqueue_delivers`；
-2. **路由器回执** `handle_inbound_receipt_inner`：改为 `nucleus.advance` + `transport.enqueue_receipt` + `routing.accepts` 校验；
-3. **代际退役**：`mark_domain_faulted` / `clear_session_dedup` 改为 `nucleus.retire_source` + `routing.retire`；
-4. **outbox**：删旧 SQLite spool + 内存 spool，用 `transport`；
-5. **删除** `ledger.rs` 四表 SQL、`identities`/`highwater`/`kernel_sessions`；
-6. 全量 `cargo test` + `tests/constitution_invariants.rs` + `tests/kernel_assembly.rs` 验收。
+### 关键断点：核的粒度（已按方案 B 定案并落地）
 
-### 关键断点：核的粒度（换骨前必须想清）
+旧 `KernelLedger` 的公共接口把「分配身份」与「逐 target 记录状态」拆成两步，这是四表结构（`identities` + `kernel_ledger`）的产物。
 
-旧 `KernelLedger` 的公共接口有一个与核不兼容的分裂：
-
-```
-allocate_submission(source, seq, count) → (logical_id, [ids], replayed)   // 分配身份，无 target
-record_initial_target_state(id, seq, source, target, kind, status, data)   // 每 target 记录状态
-```
-
-核的 `admit` 把"分配身份 + 建活跃行"合并成一次。**这个"先分配、再逐 target 记录"的分裂本身是四表结构的产物**（id 与状态曾分属 `identities` 与 `kernel_ledger`），无法无损映射到 `admit`。
-
-正确解法（二选一）：
-- **A**：核保持提交级 `admit`，路由器入口重构成"先校验全部 target，再一次 admit，再对入口即终态的 target 逐条 advance"；
-- **B**：核下沉到**消息级** `put` + `advance`（一条消息一行），提交身份/去重/多 target 变成核外的 `SubmissionCache` 推导——这样旧 API 的 `allocate`（→ SubmissionCache）与 `record`（→ put）自然对应。
-
-**B 更符合"极简核"**：核只懂"一条消息的状态机"，提交（多 target、去重、重放）是派生。换骨时优先按 B 重构路由器入口。
+**已按方案 B 落地**：核下沉到消息级 `Nucleus::put` + `Nucleus::advance`（一条消息一行状态机），提交身份/去重/多 target 由核外的 `SubmissionCache` 推导。因此旧 API 的 `allocate_submission` 对应 `SubmissionCache::allocate_with`、`record_initial_target_state` 对应 `Nucleus::put`——二者在 `ledger.rs` 门面里是一一对应，不是妥协。
 
 ---
 

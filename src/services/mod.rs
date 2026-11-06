@@ -4,7 +4,6 @@ pub mod ports;
 pub mod objects;
 pub mod ledger;
 pub mod storage;
-pub mod observer_proj;
 pub mod observer;
 pub mod outbox;
 pub mod logs;

@@ -55,12 +55,6 @@ fn cancel_worker(handle: &thread::JoinHandle<()>) {
         CancelSynchronousIo(handle.as_raw_handle());
     }
 }
-// IPC reads must be interruptible on every supported OS. Unlike diagnostic readers,
-// this endpoint drains bytes already in the pipe before transport failure is published.
-fn ipc_reader<R: std::io::Read>(input: R) -> impl std::io::Read {
-    // 端点 reader 已内建 PeekNamedPipe 轮询（Windows）与非阻塞语义（Unix）。
-    input
-}
 /// 在工作线程里接受端点并取出内核侧的一半（`in` 取写端、`out` 取读端）。
 /// accept 放在这里而不是 spawn 路径，避免「域没连上」阻塞 supervisor。
 ///
@@ -616,7 +610,7 @@ impl DomainSupervisorInner {
                                 return;
                             }
                         };
-                        let result = pump_lines(ipc_reader(rx), &stop, Some(&drain), |line| {
+                        let result = pump_lines(rx, &stop, Some(&drain), |line| {
                             if line.len() < 8192 {
                                 if let Ok(value)=serde_json::from_str::<Value>(line) {
                                     if value.get("frame_type").and_then(Value::as_str)==Some("ready") {
@@ -1374,7 +1368,7 @@ mod bounded_transport_drain_test {
             .unwrap();
         let mut lines = Vec::new();
         let result = pump_lines(
-            ipc_reader(input),
+            input,
             &AtomicBool::new(false),
             Some(&AtomicBool::new(true)),
             |line| lines.push(line.trim().to_owned()),

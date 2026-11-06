@@ -102,18 +102,20 @@ fn starting_own_domain_must_return_or_reject_without_recursive_gate_deadlock() {
     );
 }
 
+/// 坏行必须显式暴露，且校验位置按权威表区分：
+/// 在途行（`messages`）在启动时拒绝；历史行（`audit`）不在启动路径上，
+/// 由 `--check` 的 `verify_row_integrity` 负责（C3:54：历史按需读取）。
 #[test]
-fn corrupt_durable_rows_must_not_be_silently_reinterpreted_on_restore() {
+fn corrupt_rows_are_rejected_at_the_authority_that_owns_them() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tmp/adversarial-audit");
     std::fs::create_dir_all(&root).unwrap();
-    let mut accepted = Vec::new();
     for (field, value, status) in [
         ("status", "not-a-real-state", ContractStatus::Sent),
         ("data", "{broken-json", ContractStatus::Sent),
         ("status", "not-a-real-state", ContractStatus::Completed),
         ("data", "{broken-json", ContractStatus::Completed),
     ] {
-        let path = root.join(format!("corrupt-{}.db", uuid::Uuid::new_v4()));
+        let path = root.join(format!("corrupt-owner-{}.db", uuid::Uuid::new_v4()));
         let ledger = KernelLedger::open_with_db(Some(&path)).unwrap();
         ledger.record_initial_target_state(
             "audit-corrupt",
@@ -127,23 +129,32 @@ fn corrupt_durable_rows_must_not_be_silently_reinterpreted_on_restore() {
         );
         drop(ledger);
         let conn = rusqlite::Connection::open(&path).unwrap();
-        // 非终态 Durable 在 messages，终态 Durable 在 audit；按状态定位权威表。
         let table = if status.is_terminal() { "audit" } else { "messages" };
         conn.execute(&format!("UPDATE {table} SET {field}=?1"), [value])
             .unwrap();
         drop(conn);
-        if let Ok(restored) = KernelLedger::open_with_db(Some(&path)) {
-            eprintln!(
-                "corrupt {field} accepted: {:?}",
-                restored.get_record("audit-corrupt", "worker.run")
+
+        if status.is_terminal() {
+            // 历史坏行不得泄露进启动路径：启动必须成功（不读历史）……
+            let restored = KernelLedger::open_with_db(Some(&path)).unwrap_or_else(|e| {
+                panic!("history must not be read at boot ({field}={value}): {e}")
+            });
+            drop(restored);
+            // ……但完整性校验必须显式报出来。
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let verified = atelier_kernel::services::ledger::verify_row_integrity(&conn);
+            assert!(
+                verified.is_err(),
+                "corrupt audit row must be reported by the integrity check: {field}={value}"
             );
-            accepted.push(field);
+        } else {
+            // 在途行本来就要逐行读，坏行必须在启动时被拒绝。
+            assert!(
+                KernelLedger::open_with_db(Some(&path)).is_err(),
+                "corrupt live row must be rejected at boot: {field}={value}"
+            );
         }
     }
-    assert!(
-        accepted.is_empty(),
-        "Corrupt persisted fields silently accepted: {accepted:?}"
-    );
 }
 
 #[test]

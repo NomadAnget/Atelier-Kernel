@@ -272,6 +272,17 @@ fn check_sqlite_schema_drift(
             }
         }
     }
+
+    // M7 行级：坏行必须显式暴露，不能被静默重解释。
+    // 启动路径只校验在途行；这里补上历史行，使 `--check` 成为唯一的全量校验入口，
+    // 而日常启动不必遍历全部历史（C3:54：历史按需读取）。
+    if let Err(err) = crate::services::ledger::verify_row_integrity(&conn) {
+        report.violations.push(ConstitutionViolation {
+            rule: "M7".to_string(),
+            location: format!("{}::rows", db_path.display()),
+            detail: err.to_string(),
+        });
+    }
 }
 
 fn table_exists(conn: &Connection, table: &str) -> bool {

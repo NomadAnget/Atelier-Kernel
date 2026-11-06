@@ -183,4 +183,9 @@ fn commit_terminal(&self, r: &DeliveryRecord) -> ReceiptTransition::Advanced 等
 7. 启动不建内存索引：核从空状态开始。
 8. 载荷按需：只查被点名的 `message_id` / `logical_id`。
 
-**仍然保留的 O(n) I/O**：启动期的账本完整性扫描（`ledger.rs` 的 `SELECT … LIMIT 1` 坏行检查）仍会遍历 `messages` 与 `audit`。这是被 `corrupt_durable_rows_must_not_be_silently_reinterpreted_on_restore` 明确要求的安全检查，且**内存 O(1)、不反序列化载荷**，因此不违反 C3:54；若将来在意冷启动延迟，应把它挪到显式的 `--check` 或改成按需校验，而不是恢复内存索引。
+**启动期的 O(n) I/O 已消除**：坏行校验按权威表拆开——
+
+- **在途行（`messages`）**：启动时校验。界由 `MAX_LIVE` 控制，且启动恢复本来就要逐行读它，代价与历史长度无关。
+- **历史行（`audit`）**：不再在启动路径上。改由 `--check` 调 `services::ledger::verify_row_integrity`，作为唯一的全量校验入口。
+
+因此冷启动耗时不再随历史增长，而坏行依然**显式暴露、不被静默重解释**（C3:48）。`--check` 的违规定位是 `<db>::rows`，detail 带坏记录的 `message_id`。对应测试：`corrupt_rows_are_rejected_at_the_authority_that_owns_them`（按表分流）与 `test_machine_constitution_checker_m1_to_m7`（`--check` 端到端）。

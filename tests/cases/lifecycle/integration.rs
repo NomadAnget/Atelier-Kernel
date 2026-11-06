@@ -1526,6 +1526,61 @@ const rawFd = process.env.ATELIER_IPC_READ_FD;
     assert!(!rep_m7.is_ok());
     assert!(rep_m7.violations.iter().any(|v| v.rule == "M7"));
 
+    // M7 行级：历史坏行由 --check 负责（启动路径不再遍历全部历史）。
+    let rows_db = dir.join("corrupt_rows.db");
+    {
+        let conn = rusqlite::Connection::open(&rows_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audit(id INTEGER PRIMARY KEY AUTOINCREMENT,message_id TEXT NOT NULL,\
+             logical_id TEXT NOT NULL,seq INTEGER NOT NULL,source_domain TEXT NOT NULL,\
+             target TEXT NOT NULL,message_type TEXT NOT NULL,policy TEXT NOT NULL,\
+             status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL);\
+             INSERT INTO audit(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at) \
+             VALUES('bad','bad',1,'d','w.run','Run','durable','NOT_A_STATUS',NULL,0);",
+        )
+        .unwrap();
+    }
+    let rows_cfg = dir.join("kernel_boot_rows.json");
+    std::fs::write(
+        &rows_cfg,
+        r#"{
+            "db_path": "./corrupt_rows.db",
+            "domains": [
+                {
+                    "domain_id": "order",
+                    "command": "python3",
+                    "args": ["./domains/valid_order.py"]
+                }
+            ]
+        }"#,
+    )
+    .unwrap();
+    let rep_rows = check_constitution(&rows_cfg);
+    assert!(!rep_rows.is_ok(), "corrupt audit row must fail --check");
+    assert!(
+        rep_rows
+            .violations
+            .iter()
+            .any(|v| v.rule == "M7" && v.location.ends_with("::rows")),
+        "corrupt audit row must be reported by --check: {:?}",
+        rep_rows.violations
+    );
+    // 同一个库若行是完好的，--check 不应因为遍历历史而报 M7 行级违规。
+    {
+        let conn = rusqlite::Connection::open(&rows_db).unwrap();
+        conn.execute("UPDATE audit SET status='completed' WHERE message_id='bad'", [])
+            .unwrap();
+    }
+    let rep_rows_ok = check_constitution(&rows_cfg);
+    assert!(
+        !rep_rows_ok
+            .violations
+            .iter()
+            .any(|v| v.location.ends_with("::rows")),
+        "clean rows must not be flagged: {:?}",
+        rep_rows_ok.violations
+    );
+
     // Verify that multi-level nested package intra-domain relative imports are NOT falsely flagged as M4 violations!
     let nested_domain = domains_dir.join("reel_audio");
     let nested_services = nested_domain.join("services");

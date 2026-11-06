@@ -323,26 +323,10 @@ impl KernelLedger {
         }
 
         // 损坏显式拒绝（C3）：非法状态或 JSON 直接报错，不回退为 Sent。
-        let bad: Option<String> = db
-            .query_row(
-                "SELECT message_id FROM messages WHERE (data IS NOT NULL AND NOT json_valid(data)) \
-                 OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = bad {
-            return Err(StorageError::CorruptLedgerRecord(id));
-        }
-        let bad_audit: Option<String> = db
-            .query_row(
-                "SELECT message_id FROM audit WHERE (data IS NOT NULL AND NOT json_valid(data)) \
-                 OR status NOT IN ('completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = bad_audit {
+        // 只查 `messages`（在途行，界由 MAX_LIVE 控制，启动本来就要逐行读它）。
+        // 历史 `audit` 的坏行校验**不在启动路径上**：那会把每次启动变成一次全历史遍历，
+        // 与 C3:54「历史按需读取」冲突；改由 `--check` 调 `verify_row_integrity` 负责。
+        if let Some(id) = live_row_violation(&db)? {
             return Err(StorageError::CorruptLedgerRecord(id));
         }
 
@@ -1043,6 +1027,60 @@ impl KernelLedger {
         }));
         failed
     }
+}
+
+fn table_present(db: &Connection, table: &str) -> bool {
+    db.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+    .unwrap_or(false)
+}
+
+/// 在途行（`messages`）的坏行探测：非法 status 或非法 JSON。表不存在时视为无坏行。
+fn live_row_violation(db: &Connection) -> Result<Option<String>, StorageError> {
+    if !table_present(db, "messages") {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT message_id FROM messages WHERE (data IS NOT NULL AND NOT json_valid(data)) \
+             OR status NOT IN ('sent','received','started','completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// 历史行（`audit`）的坏行探测。表不存在时视为无坏行。
+fn audit_row_violation(db: &Connection) -> Result<Option<String>, StorageError> {
+    if !table_present(db, "audit") {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT message_id FROM audit WHERE (data IS NOT NULL AND NOT json_valid(data)) \
+             OR status NOT IN ('completed','target_invalid','contract_invalid','execution_failed') LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// 行级完整性校验（供 `--check` 使用）：坏行必须显式暴露，不能被静默重解释。
+///
+/// 启动路径只校验在途行；历史行在这里按需遍历，因此不会拖慢每次启动
+/// （宪法 C3:54：历史终态结果按需读取，不建立全量内存索引）。
+pub fn verify_row_integrity(db: &Connection) -> Result<(), StorageError> {
+    if let Some(id) = live_row_violation(db)? {
+        return Err(StorageError::CorruptLedgerRecord(id));
+    }
+    if let Some(id) = audit_row_violation(db)? {
+        return Err(StorageError::CorruptLedgerRecord(id));
+    }
+    Ok(())
 }
 
 fn messages_row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryRecord> {

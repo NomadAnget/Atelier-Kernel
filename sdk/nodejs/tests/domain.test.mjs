@@ -61,6 +61,34 @@ test("waitResult on an unknown id rejects", async () => {
   await assert.rejects(domain.waitResult("nope"));
 });
 
+test("waitResult rejects a non-completed terminal", async () => {
+  const domain = makeDomain();
+  const pending = domain.send("t.h", "T");
+  await tick();
+  const frame = domain.frames[0];
+  receipt(domain, "m4", "t.h", "sent", null, frame.seq);
+  assert.equal(await pending, "m4");
+  const task = domain.waitResult("m4");
+  receipt(domain, "m4", "t.h", "execution_failed", { error: "boom" });
+  await assert.rejects(task);
+});
+
+test("waitResults resolves every terminal receipt", async () => {
+  const domain = makeDomain();
+  const first = domain.send("t.h", "T");
+  const second = domain.send("t.h", "T");
+  await tick();
+  const [f1, f2] = domain.frames;
+  receipt(domain, "m5", "t.h", "sent", null, f1.seq);
+  receipt(domain, "m6", "t.h", "sent", null, f2.seq);
+  assert.deepEqual(await Promise.all([first, second]), ["m5", "m6"]);
+  const task = domain.waitResults(["m5", "m6"]);
+  receipt(domain, "m5", "t.h", "completed", { n: 1 });
+  receipt(domain, "m6", "t.h", "completed", { n: 2 });
+  const results = await task;
+  assert.deepEqual(results.map((r) => r.data.n), [1, 2]);
+});
+
 // ── 能力转发 ──────────────────────────────────────────────────────────
 async function capture(domain, coro) {
   const task = coro;

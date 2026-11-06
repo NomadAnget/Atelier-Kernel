@@ -132,7 +132,7 @@ Naming rules:
 | lifecycle | `run_async(on_start=, on_close=)` / `shutdown` | `runAsync({onStart, onClose})` / `run` / `shutdown` |
 | handler | `handler(name)`（docstring 注册描述） | `handler(name, fn, description?)` |
 | send / request | `send` / `request` | `send` / `request` |
-| wait / forget | `wait_result` / `wait_results` / `forget_result` | `waitResult` / `forgetResult` |
+| wait / forget | `wait_result` / `wait_results` / `forget_result` | `waitResult` / `waitResults` / `forgetResult` |
 | report receipt | `report_receipt` | `reportReceipt` |
 | events | `on_receipt/log/notify/observation/telemetry` | `onReceipt/Log/Notify/Observation/Telemetry` |
 | storage CRUD | `storage_insert/update/delete/query` | `storageInsert/Update/Delete/Query` |

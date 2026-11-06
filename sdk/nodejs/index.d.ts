@@ -67,6 +67,7 @@ export declare class AtelierDomain {
   send(targets: string | string[], messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<string | string[]>;
   request(target: string, messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<MessageReceipt>;
   waitResult(messageId: string, options?: { timeout?: number }): Promise<MessageReceipt>;
+  waitResults(messageIds: string[], options?: { timeout?: number }): Promise<MessageReceipt[]>;
   forgetResult(messageId: string): boolean;
 
   // 6. receipts

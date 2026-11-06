@@ -170,9 +170,7 @@ class AtelierDomain {
     const timeout = options.timeout ?? 30;
     const messageId = await this.send(target, messageType, params, data, { timeout });
     try {
-      const receipt = await this.waitResult(messageId, { timeout });
-      if (receipt.status !== "completed") throw new DomainRequestError(receipt.status, receipt.data, messageId);
-      return receipt;
+      return await this.waitResult(messageId, { timeout });
     } finally {
       this.forgetResult(messageId);
     }
@@ -190,11 +188,18 @@ class AtelierDomain {
     try {
       const receipt = await withTimeout(entry.promise, options.timeout ?? 30);
       entry.observed = true;
+      if (receipt.status !== "completed") {
+        throw new DomainRequestError(receipt.status, receipt.data, messageId);
+      }
       return receipt;
     } finally {
       entry.waiters--;
       if (entry.observed && !entry.waiters) this._results.delete(messageId);
     }
+  }
+
+  async waitResults(messageIds, options = {}) {
+    return Promise.all(messageIds.map((id) => this.waitResult(id, options)));
   }
 
   forgetResult(messageId) {

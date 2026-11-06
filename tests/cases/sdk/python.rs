@@ -63,6 +63,11 @@ async def api_handler(msg):
     gone_rows = (await domain.storage_query(record_id=rid)).get("items") or []
     observer = await domain.query_observer()
     progress = await domain.query_progress()
+    events = []
+    domain.on_notify(lambda payload: events.append("notify"))
+    await domain.subscribe_notify()
+    await domain.notify("info", "callback-probe")
+    await asyncio.sleep(0.3)
     unsubscribed = all(
         isinstance(result, dict)
         for result in (
@@ -72,6 +77,11 @@ async def api_handler(msg):
             await domain.unsubscribe_observer(),
         )
     )
+    try:
+        domain.report_receipt("no-such-message", "v2test.api", "completed", {"probe": 1})
+        receipt_ok = True
+    except Exception:  # noqa: BLE001
+        receipt_ok = False
     stop = await domain.supervisor_stop("no-such-domain")
     return {
         "updated": bool(updated_rows) and updated_rows[0].get("data", {}).get("value") == 2,
@@ -79,6 +89,8 @@ async def api_handler(msg):
         "observer_ok": isinstance(observer, dict),
         "progress_ok": isinstance(progress, dict),
         "unsubscribed": unsubscribed,
+        "callback_ok": "notify" in events,
+        "receipt_ok": receipt_ok,
         "stop_ok": isinstance(stop, dict) and stop.get("was_running") is False,
     }
 
@@ -249,6 +261,8 @@ fn sdk_v2_round_trip() {
     assert_eq!(api_data["observer_ok"], true, "query_observer: {api_data}");
     assert_eq!(api_data["progress_ok"], true, "query_progress: {api_data}");
     assert_eq!(api_data["unsubscribed"], true, "unsubscribe_*: {api_data}");
+    assert_eq!(api_data["callback_ok"], true, "on_notify callback: {api_data}");
+    assert_eq!(api_data["receipt_ok"], true, "report_receipt: {api_data}");
     assert_eq!(api_data["stop_ok"], true, "supervisor_stop: {api_data}");
 
     verifier.send(vec!["v2test.query".into()], "Query", json!({}), json!({}));

@@ -56,12 +56,24 @@ domain.handler("api", async (msg) => {{
   const goneRows = (await domain.storageQuery({{ record_id: rid }})).items || [];
   const observer = await domain.queryObserver();
   const progress = await domain.queryProgress();
+  const events = [];
+  domain.onNotify(() => events.push("notify"));
+  await domain.subscribeNotify();
+  await domain.notify("info", "callback-probe");
+  await new Promise((r) => setTimeout(r, 300));
   const unsubscribed = [
     await domain.unsubscribeLogs(),
     await domain.unsubscribeTelemetry(),
     await domain.unsubscribeNotify(),
     await domain.unsubscribeObserver(),
   ].every((r) => !!r && typeof r === "object");
+  let receiptOk = false;
+  try {{
+    domain.reportReceipt("no-such-message", "v2node.api", "completed", {{ probe: 1 }});
+    receiptOk = true;
+  }} catch (error) {{
+    receiptOk = false;
+  }}
   const stop = await domain.supervisorStop("no-such-domain");
   return {{
     updated: updatedRows.length > 0 && !!updatedRows[0].data && updatedRows[0].data.value === 2,
@@ -69,6 +81,8 @@ domain.handler("api", async (msg) => {{
     observer_ok: !!observer && typeof observer === "object",
     progress_ok: !!progress && typeof progress === "object",
     unsubscribed,
+    callback_ok: events.includes("notify"),
+    receipt_ok: receiptOk,
     stop_ok: !!stop && typeof stop === "object" && stop.was_running === false,
   }};
 }});
@@ -193,6 +207,8 @@ domain.run();
     assert_eq!(api_data["observer_ok"], true, "queryObserver: {api_data}");
     assert_eq!(api_data["progress_ok"], true, "queryProgress: {api_data}");
     assert_eq!(api_data["unsubscribed"], true, "unsubscribe*: {api_data}");
+    assert_eq!(api_data["callback_ok"], true, "onNotify callback: {api_data}");
+    assert_eq!(api_data["receipt_ok"], true, "reportReceipt: {api_data}");
     assert_eq!(api_data["stop_ok"], true, "supervisorStop: {api_data}");
 
     verifier.send(vec!["v2node.query".into()], "Query", json!({}), json!({}));

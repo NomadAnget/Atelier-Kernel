@@ -29,6 +29,8 @@ pub struct LogQuery<'a> {
     pub phase: Option<&'a str>,
     pub since_ts: Option<f64>,
     pub source_domain: Option<&'a str>,
+    /// 关键词：对 message 做大小写无关的包含匹配（%/_/\\ 自动转义）。
+    pub keyword: Option<&'a str>,
 }
 impl Default for LogQuery<'_> {
     fn default() -> Self {
@@ -41,6 +43,7 @@ impl Default for LogQuery<'_> {
             phase: None,
             since_ts: None,
             source_domain: None,
+            keyword: None,
         }
     }
 }
@@ -84,6 +87,12 @@ impl<'a> LogQuery<'a> {
                 .or_else(|| params.get("domain"))
                 .or_else(|| params.get("source_domain"))
                 .and_then(serde_json::Value::as_str),
+            keyword: params
+                .get("keyword")
+                .or_else(|| params.get("query"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
         })
     }
 }
@@ -310,6 +319,7 @@ impl LogStore {
             phase,
             since_ts,
             source_domain,
+            keyword,
         } = *query;
         if limit == 0
             || before_id.is_some_and(|id| id <= 0)
@@ -365,6 +375,16 @@ impl LogStore {
             if !ph.is_empty() {
                 sql.push_str(" AND phase = ?");
                 params_vec.push(Box::new(ph.to_string()));
+            }
+        }
+        if let Some(word) = keyword {
+            if !word.is_empty() {
+                let escaped = word
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_");
+                sql.push_str(" AND message LIKE ? ESCAPE '\\'");
+                params_vec.push(Box::new(format!("%{escaped}%")));
             }
         }
         if let Some(ts) = since_ts {

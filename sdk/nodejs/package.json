@@ -1,6 +1,6 @@
 {
   "name": "atelier-sdk",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Official Node.js Domain SDK for Atelier Kernel (named-endpoint IPC, 4-stage receipts, C4 virtual files)",
   "main": "index.js",
   "types": "index.d.ts",

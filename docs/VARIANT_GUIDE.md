@@ -312,8 +312,8 @@ domain.logger.info(`库存 ${sku} 扣减完毕`, { phase: "finish" });
    发布正式版本：
 
    ```bash
-   git tag v0.3.0
-   git push origin v0.3.0
+   git tag v0.3.1
+   git push origin v0.3.1
    ```
 
    注意：**普通 push 不会产出任何安装包**，需要 Artifacts 时手动触发 workflow。

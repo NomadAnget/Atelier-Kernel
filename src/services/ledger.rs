@@ -18,7 +18,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::core::nucleus::{AuditRecord, Message, Nucleus};
+use crate::core::nucleus::{Allocation, AuditRecord, Message, Nucleus};
 use crate::core::protocol::{
     ContractStatus, DeliveryPolicy, KernelMessage, MessageReceipt, now_millis, parse_target_address,
 };
@@ -443,16 +443,18 @@ impl KernelLedger {
         seq: u64,
         count: usize,
     ) -> (String, Vec<String>, bool) {
-        self.try_allocate_submission(source, seq, count, false)
+        self.try_allocate_submission(source, seq, count, true)
             .expect("kernel submission resources exhausted")
     }
 
+    /// `dedup_required` 为真时启用高水位过期判定（Durable/Volatile 及混合提交）；
+    /// 纯 Ephemeral 提交不启用：宪法 C3:56 允许同序号重放作为新的瞬态投递。
     pub(crate) fn try_allocate_submission(
         &self,
         source: &str,
         seq: u64,
         count: usize,
-        _durable: bool,
+        dedup_required: bool,
     ) -> Result<(String, Vec<String>, bool), StorageError> {
         if count > MAX_CHILDREN_PER_SUBMISSION {
             return Err(StorageError::ResourceExhausted(
@@ -468,7 +470,16 @@ impl KernelLedger {
                 "live message identities".into(),
             ));
         }
-        Ok(n.allocate_submission_with_ids(source, seq, logical, ids))
+        match n.allocate_submission_with_ids(source, seq, logical, ids, dedup_required) {
+            Allocation::New { logical_id, ids } => Ok((logical_id, ids, false)),
+            Allocation::Replay { logical_id, ids } => Ok((logical_id, ids, true)),
+            // 滑出窗口的过期重放：显式拒绝，绝不重新分发身份。
+            Allocation::Stale { high_water } => Err(StorageError::StaleSubmission {
+                key: source.to_string(),
+                seq,
+                high: high_water,
+            }),
+        }
     }
 
     pub fn logical_id_for_message(&self, id: &str) -> String {

@@ -104,12 +104,26 @@ pub enum Advance {
 /// 有界去重窗口：每个 source（去重键）只保留最近 `window` 个 seq 的提交身份。
 const REPLAY_WINDOW: usize = 2_048;
 
+/// 一次提交身份分配的结果。
+///
+/// `Stale` 是必须存在的第三态：`seq` 已滑出窗口（身份被回收）但仍低于高水位，
+/// 说明它是一次**过期重放**，而不是新提交。此时绝不能分发新身份，否则同一次提交
+/// 会被执行两次（`docs/ledger-core-rewrite.md` §2:79 明确要求高水位参与判定）。
+pub enum Allocation {
+    /// 窗口内未命中：分配了全新身份。
+    New { logical_id: String, ids: Vec<String> },
+    /// 窗口内命中：复用原身份，不产生新的活跃行。
+    Replay { logical_id: String, ids: Vec<String> },
+    /// 过期重放：`seq <= high_water` 但身份已离开窗口。
+    Stale { high_water: u64 },
+}
+
 /// SubmissionCache —— 提交身份/去重/高水位：核外的一个推导。
 /// 旧 `allocate_submission` 映射到这里；它不持有消息状态，只记录"哪次提交对应哪些 id"。
 pub struct SubmissionCache {
     /// 去重窗口 `(dedup_key, seq) -> Submission`，按 seq 有界。
     submissions: BTreeMap<(String, u64), Submission>,
-    /// 单调高水位：会话行被回收后仍记住"到过的最高 seq"，防止老 seq 被误判成新提交。
+    /// 单调高水位：会话行被回收后仍记住"到过的最高 seq"，用于识别滑出窗口的过期重放。
     high_water: BTreeMap<String, u64>,
     next_id: u64,
 }
@@ -131,19 +145,47 @@ impl SubmissionCache {
         id
     }
 
+    /// 去重判定：窗口命中 → 复用；否则若该提交要求去重且 `seq` 低于高水位 → 过期。
+    /// 返回 `None` 表示可以安全分配新身份。
+    ///
+    /// `dedup_required == false`（纯 Ephemeral 提交）不做过期判定：宪法 C3:56 规定
+    /// 瞬态消息"同一序号再次提交是一次新瞬态投递"，不能当成重放拒绝。
+    fn replay(&self, dedup_key: &str, seq: u64, dedup_required: bool) -> Option<Allocation> {
+        if seq == 0 {
+            return None;
+        }
+        if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
+            return Some(Allocation::Replay {
+                logical_id: existing.logical_id.clone(),
+                ids: existing.ids.clone(),
+            });
+        }
+        if dedup_required {
+            if let Some(&high_water) = self.high_water.get(dedup_key) {
+                if seq <= high_water {
+                    return Some(Allocation::Stale { high_water });
+                }
+            }
+        }
+        None
+    }
+
     /// 分配提交身份：去重命中窗口则复用原身份，否则分配新 id。
     /// `seq == 0` 表示调用方不提供序号去重，每次都分配新身份（旧 `try_allocate_submission` 语义）。
-    /// 返回 `(logical_id, ids, replayed)`。
-    pub fn allocate(&mut self, dedup_key: &str, seq: u64, count: usize) -> (String, Vec<String>, bool) {
-        if seq > 0 {
-            if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
-                return (existing.logical_id.clone(), existing.ids.clone(), true);
-            }
+    pub fn allocate(
+        &mut self,
+        dedup_key: &str,
+        seq: u64,
+        count: usize,
+        dedup_required: bool,
+    ) -> Allocation {
+        if let Some(settled) = self.replay(dedup_key, seq, dedup_required) {
+            return settled;
         }
         let logical_id = self.generate_id().replacen("msg_", "logical_", 1);
         let ids: Vec<String> = (0..count).map(|_| self.generate_id()).collect();
-        self.insert_submission(dedup_key, seq, logical_id.clone(), ids.clone());
-        (logical_id, ids, false)
+        self.insert_submission(dedup_key, seq, logical_id.clone(), ids.clone(), dedup_required);
+        Allocation::New { logical_id, ids }
     }
 
     /// 用调用方预生成的全局唯一 id 分配（facade 走这条路径，id 由 `KernelLedger::generate_message_id` 生成）。
@@ -153,26 +195,35 @@ impl SubmissionCache {
         seq: u64,
         logical_id: String,
         ids: Vec<String>,
-    ) -> (String, Vec<String>, bool) {
-        if seq > 0 {
-            if let Some(existing) = self.submissions.get(&(dedup_key.to_string(), seq)) {
-                return (existing.logical_id.clone(), existing.ids.clone(), true);
-            }
+        dedup_required: bool,
+    ) -> Allocation {
+        if let Some(settled) = self.replay(dedup_key, seq, dedup_required) {
+            return settled;
         }
-        self.insert_submission(dedup_key, seq, logical_id.clone(), ids.clone());
-        (logical_id, ids, false)
+        self.insert_submission(dedup_key, seq, logical_id.clone(), ids.clone(), dedup_required);
+        Allocation::New { logical_id, ids }
     }
 
-    fn insert_submission(&mut self, dedup_key: &str, seq: u64, logical_id: String, ids: Vec<String>) {
-        if seq > 0 {
-            let sub = Submission { logical_id, ids, replayed: false };
-            self.submissions.insert((dedup_key.to_string(), seq), sub);
+    fn insert_submission(
+        &mut self,
+        dedup_key: &str,
+        seq: u64,
+        logical_id: String,
+        ids: Vec<String>,
+        dedup_required: bool,
+    ) {
+        if seq == 0 {
+            return;
+        }
+        self.submissions
+            .insert((dedup_key.to_string(), seq), Submission { logical_id, ids, replayed: false });
+        if dedup_required {
             self.high_water
                 .entry(dedup_key.to_string())
                 .and_modify(|h| *h = (*h).max(seq))
                 .or_insert(seq);
-            self.trim_window(dedup_key);
         }
+        self.trim_window(dedup_key);
     }
 
     /// 某 logical 的全部子消息终态后，回收其提交身份。
@@ -312,8 +363,9 @@ impl Nucleus {
         dedup_key: &str,
         seq: u64,
         count: usize,
-    ) -> (String, Vec<String>, bool) {
-        self.cache.allocate(dedup_key, seq, count)
+        dedup_required: bool,
+    ) -> Allocation {
+        self.cache.allocate(dedup_key, seq, count, dedup_required)
     }
 
     /// 用调用方预生成的全局唯一 id 分配（facade 的 `try_allocate_submission` 走这里）。
@@ -323,8 +375,9 @@ impl Nucleus {
         seq: u64,
         logical_id: String,
         ids: Vec<String>,
-    ) -> (String, Vec<String>, bool) {
-        self.cache.allocate_with(dedup_key, seq, logical_id, ids)
+        dedup_required: bool,
+    ) -> Allocation {
+        self.cache.allocate_with(dedup_key, seq, logical_id, ids, dedup_required)
     }
 
     /// 由子消息 id 反查提交 logical_id。
@@ -361,6 +414,9 @@ impl Nucleus {
 
     /// 收进一个提交。`dedup_key` 是 source 的去重键（`{domain}#{generation}`），
     /// `source` 是纯域 id；二者显式分离，绝不混用。
+    ///
+    /// `Err(high_water)` 表示这是一次已滑出窗口的过期重放：调用方必须显式拒绝，
+    /// 不能把它当作新提交重新执行。
     pub fn admit(
         &mut self,
         dedup_key: &str,
@@ -370,11 +426,16 @@ impl Nucleus {
         message_type: &str,
         policy: DeliveryPolicy,
         data: Option<serde_json::Value>,
-    ) -> Submission {
-        let (logical_id, ids, replayed) = self.cache.allocate(dedup_key, seq, targets.len());
-        if replayed {
-            return Submission { logical_id, ids, replayed: true };
-        }
+    ) -> Result<Submission, u64> {
+        let dedup_required = policy != DeliveryPolicy::Ephemeral;
+        let (logical_id, ids) =
+            match self.cache.allocate(dedup_key, seq, targets.len(), dedup_required) {
+                Allocation::New { logical_id, ids } => (logical_id, ids),
+                Allocation::Replay { logical_id, ids } => {
+                    return Ok(Submission { logical_id, ids, replayed: true });
+                }
+                Allocation::Stale { high_water } => return Err(high_water),
+            };
         for (target, id) in targets.iter().zip(&ids) {
             self.put(
                 id.clone(),
@@ -397,7 +458,7 @@ impl Nucleus {
                 }
             }
         }
-        Submission { logical_id, ids, replayed: false }
+        Ok(Submission { logical_id, ids, replayed: false })
     }
 
     /// 单调推进一条消息；推进到终态即自动"转审计或清除 + 回收去重窗口"。
@@ -506,7 +567,7 @@ mod tests {
     #[test]
     fn i1_uniqueness_active_and_audit_never_coexist() {
         let mut n = Nucleus::new();
-        let sub = n.admit("d#1", "d", 1, &[target("w.run")], "Run", DeliveryPolicy::Durable, None);
+        let sub = n.admit("d#1", "d", 1, &[target("w.run")], "Run", DeliveryPolicy::Durable, None).unwrap();
         let id = &sub.ids[0];
         assert!(n.get(id).is_some());
         assert!(n.get_audit(id).is_none());
@@ -519,7 +580,7 @@ mod tests {
     #[test]
     fn i2_monotonic_terminal_once() {
         let mut n = Nucleus::new();
-        let sub = n.admit("d#1", "d", 1, &[target("w.run")], "Run", DeliveryPolicy::Durable, None);
+        let sub = n.admit("d#1", "d", 1, &[target("w.run")], "Run", DeliveryPolicy::Durable, None).unwrap();
         let id = &sub.ids[0];
         assert!(matches!(n.advance(id, ContractStatus::Received, None), Advance::Advanced { .. }));
         // 回退被吸收
@@ -535,7 +596,7 @@ mod tests {
     fn i3_bounded_active_and_dedup() {
         let mut n = Nucleus::new();
         for seq in 1..=10_000u64 {
-            let sub = n.admit("d#1", "d", seq, &[target("w.run")], "Run", DeliveryPolicy::Volatile, None);
+            let sub = n.admit("d#1", "d", seq, &[target("w.run")], "Run", DeliveryPolicy::Volatile, None).unwrap();
             let id = sub.ids[0].clone();
             n.advance(&id, ContractStatus::Completed, None);
         }
@@ -548,8 +609,8 @@ mod tests {
     #[test]
     fn replay_within_window_reuses_identity() {
         let mut n = Nucleus::new();
-        let first = n.admit("d#1", "d", 7, &[target("w.run")], "Run", DeliveryPolicy::Volatile, None);
-        let replay = n.admit("d#1", "d", 7, &[target("w.run")], "Run", DeliveryPolicy::Volatile, None);
+        let first = n.admit("d#1", "d", 7, &[target("w.run")], "Run", DeliveryPolicy::Volatile, None).unwrap();
+        let replay = n.admit("d#1", "d", 7, &[target("w.run")], "Run", DeliveryPolicy::Volatile, None).unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.logical_id, first.logical_id);
         assert_eq!(replay.ids, first.ids);

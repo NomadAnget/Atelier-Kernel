@@ -17,6 +17,11 @@ pub enum StorageError {
     InvalidLogQuery(String),
     #[error("kernel resource exhausted: {0}")]
     ResourceExhausted(String),
+    #[error(
+        "stale submission for '{key}': seq {seq} is below the high-water mark {high}; \
+         its dedup window has been reclaimed, so replaying it could execute twice"
+    )]
+    StaleSubmission { key: String, seq: u64, high: u64 },
     #[error("log persistence failure: {0}")]
     LogPersistence(String),
     #[error("I/O error: {0}")]

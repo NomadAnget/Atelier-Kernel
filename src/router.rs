@@ -941,33 +941,45 @@ impl KernelRouter {
                 .cloned()
                 .collect()
         };
-        let durable = targets.iter().all(|t| {
+        let policy_of = |target: &str| {
             outbound
                 .delivery
-                .unwrap_or_else(|| crate::core::protocol::DeliveryPolicy::resolve(t, &outbound.message_type))
-                == crate::core::protocol::DeliveryPolicy::Durable
-        });
+                .unwrap_or_else(|| crate::core::protocol::DeliveryPolicy::resolve(target, &outbound.message_type))
+        };
+        // 纯 Ephemeral 提交不做高水位过期判定（C3:56：同序号重放视为新的瞬态投递）。
+        let dedup_required = targets
+            .iter()
+            .any(|t| policy_of(t) != crate::core::protocol::DeliveryPolicy::Ephemeral);
         let (logical_id, ids, duplicate) = match self.ledger.try_allocate_submission(
             &format!("{authenticated_domain}#{instance_id}"),
             outbound.seq,
             targets.len(),
-            durable,
+            dedup_required,
         ) {
             Ok(value) => value,
             Err(error) => {
+                // 过期重放是来源域违反了提交契约（seq 已滑出去重窗口），不是基础设施失败。
+                let stale = matches!(
+                    &error,
+                    crate::services::storage::StorageError::StaleSubmission { .. }
+                );
+                let status = if stale {
+                    ContractStatus::ContractInvalid
+                } else {
+                    ContractStatus::ExecutionFailed
+                };
+                let code = if stale { "stale_submission" } else { "kernel_admission_failed" };
                 let logical = self.ledger.generate_message_id();
                 let ids: Vec<_> = targets
                     .iter()
                     .map(|_| self.ledger.generate_message_id())
                     .collect();
                 for (target, id) in targets.iter().zip(&ids) {
-                    let delivery = outbound.delivery.unwrap_or_else(|| {
-                        crate::core::protocol::DeliveryPolicy::resolve(target, &outbound.message_type)
-                    });
+                    let delivery = policy_of(target);
                     self.send_to_instance_inner(authenticated_domain,Some(instance_id),KernelToDomainFrame::Receipt(MessageReceipt {
                         logical_id:logical.clone(),message_id:id.clone(),seq:outbound.seq,target:target.clone(),message_type:outbound.message_type.clone(),
                         policy: delivery,
-                        status:ContractStatus::ExecutionFailed,data:Some(json!({"error":"kernel_admission_failed","reason":error.to_string(),"persisted":false})),timestamp:now_millis(),
+                        status,data:Some(json!({"error":code,"reason":error.to_string(),"persisted":false})),timestamp:now_millis(),
                     }), true);
                 }
                 return ids;

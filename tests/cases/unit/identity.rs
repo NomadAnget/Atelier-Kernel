@@ -200,3 +200,56 @@ fn malformed_submission_has_two_ids_and_replays_without_new_identity() {
         _ => panic!(),
     };
 }
+
+/// 高水位必须真的参与判定：seq 滑出 2048 去重窗口后重放，不能被当成新提交重新执行。
+#[test]
+fn stale_submission_beyond_the_dedup_window_is_rejected_instead_of_reexecuted() {
+    let k = AtelierKernel::new_in_memory().unwrap();
+    let sender = k.attach_domain("sender");
+    // 目标不存在 → 入口即终态，不产生投递压力；但提交身份照常占用去重窗口。
+    for seq in 1..=2_049u64 {
+        sender.send_with_seq(seq, vec!["missing.x".into()], "Volatile", json!({}), json!({}));
+        sender.drain_frames();
+    }
+    // seq=1 已被窗口淘汰，但仍低于高水位：这是过期重放，只能显式拒绝。
+    let ids = sender.send_with_seq(1, vec!["missing.x".into()], "Volatile", json!({}), json!({}));
+    assert_eq!(ids.len(), 1);
+    let frames = sender.drain_frames();
+    let rejected = frames.iter().any(|f| {
+        matches!(
+            f,
+            F::Receipt(r) if r.status == S::ContractInvalid
+                && r.data
+                    .as_ref()
+                    .and_then(|d| d.get("error"))
+                    .and_then(|e| e.as_str())
+                    == Some("stale_submission")
+        )
+    });
+    assert!(rejected, "stale submission must be rejected explicitly; got {frames:?}");
+}
+
+/// 纯 Ephemeral 例外：宪法 C3:56 规定瞬态消息同序号重放是一次新的瞬态投递。
+#[test]
+fn ephemeral_replay_outside_the_window_is_not_treated_as_stale() {
+    let k = AtelierKernel::new_in_memory().unwrap();
+    let sender = k.attach_domain("sender");
+    for seq in 1..=2_049u64 {
+        sender.send_with_seq(seq, vec!["missing.x".into()], "Ephemeral", json!({}), json!({}));
+        sender.drain_frames();
+    }
+    let ids = sender.send_with_seq(1, vec!["missing.x".into()], "Ephemeral", json!({}), json!({}));
+    assert_eq!(ids.len(), 1);
+    let frames = sender.drain_frames();
+    let stale = frames.iter().any(|f| {
+        matches!(
+            f,
+            F::Receipt(r) if r.data
+                .as_ref()
+                .and_then(|d| d.get("error"))
+                .and_then(|e| e.as_str())
+                == Some("stale_submission")
+        )
+    });
+    assert!(!stale, "ephemeral replay must stay a fresh delivery; got {frames:?}");
+}

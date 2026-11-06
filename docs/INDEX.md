@@ -42,7 +42,8 @@
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [releases/RELEASE_0.3.1.md](releases/RELEASE_0.3.1.md) | 当前版本：SDK 收缩为只做协议传输、去掉超时/窗口/TTL 策略、传输失败不再沉默 |
+| [releases/RELEASE_0.3.2.md](releases/RELEASE_0.3.2.md) | 当前版本：内核累计计数（真速率）与观察流丢弃计数，观察者限速不再掩盖投递量 |
+| [releases/RELEASE_0.3.1.md](releases/RELEASE_0.3.1.md) | 上一版：SDK 收缩为只做协议传输、去掉超时/窗口/TTL 策略、传输失败不再沉默 |
 | [releases/RELEASE_0.3.0.md](releases/RELEASE_0.3.0.md) | 上一版：分层落定、SDK 契约收敛、门禁补齐、破坏性变更与升级方式 |
 
 ## 归档

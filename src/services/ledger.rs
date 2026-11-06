@@ -165,6 +165,10 @@ pub struct KernelLedger {
     pub(crate) db_conn: Option<Arc<Mutex<Connection>>>,
     gates: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
     evicted: AtomicU64,
+    /// 累计提交的消息数（成功分配身份的目标数，不含过期重放）。
+    sent_total: AtomicU64,
+    /// 累计进入终态的消息数。
+    terminal_total: AtomicU64,
     _owner: Option<std::fs::File>,
 }
 
@@ -368,6 +372,8 @@ impl KernelLedger {
             db_conn: Some(Arc::new(Mutex::new(db))),
             gates: Mutex::new(HashMap::new()),
             evicted: AtomicU64::new(0),
+            sent_total: AtomicU64::new(0),
+            terminal_total: AtomicU64::new(0),
             _owner: prepared.map(|(_, owner)| owner),
         })
     }
@@ -392,6 +398,19 @@ impl KernelLedger {
         let gate = Arc::new(Mutex::new(()));
         gates.insert(id.into(), Arc::downgrade(&gate));
         gate
+    }
+
+    /// 不加锁的累计计数快照：可随每条观察事件附带，成本仅为原子读。
+    pub fn counters(&self) -> (u64, u64) {
+        (
+            self.sent_total.load(Ordering::Relaxed),
+            self.terminal_total.load(Ordering::Relaxed),
+        )
+    }
+
+    /// 内核本次启动的实例标识：累计计数在重启后归零，消费方据此重置基线。
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     pub fn generate_message_id(&self) -> String {
@@ -437,7 +456,12 @@ impl KernelLedger {
             ));
         }
         match n.allocate_submission_with_ids(source, seq, logical, ids, dedup_required) {
-            Allocation::New { logical_id, ids } => Ok((logical_id, ids, false)),
+            Allocation::New { logical_id, ids } => {
+                let sent = ids.len() as u64;
+                drop(n);
+                self.sent_total.fetch_add(sent, Ordering::Relaxed);
+                Ok((logical_id, ids, false))
+            }
             Allocation::Replay { logical_id, ids } => Ok((logical_id, ids, true)),
             // 滑出窗口的过期重放：显式拒绝，绝不重新分发身份。
             Allocation::Stale { high_water } => Err(StorageError::StaleSubmission {
@@ -533,6 +557,8 @@ impl KernelLedger {
         }
         let child_links = self.bindings.lock().len();
         json!({
+            "sent_total": self.sent_total.load(Ordering::Relaxed),
+            "terminal_total": self.terminal_total.load(Ordering::Relaxed),
             "resident_records": active,
             "record_capacity": active,
             "durable_records": durable,
@@ -776,6 +802,7 @@ impl KernelLedger {
             .advance(id, status, r.data.clone());
         if status.is_terminal() {
             // 终态已提交：写入时就地打标记，代际退役时零回查（历史在盘上，不该为清理去翻它）。
+            self.terminal_total.fetch_add(1, Ordering::Relaxed);
             self.mark_binding_terminal(id);
             // 独立账本使用（无路由器 origin 绑定）时，终态即回收活行身份。
             self.maybe_retire_binding(id);

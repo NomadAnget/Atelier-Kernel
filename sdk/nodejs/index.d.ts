@@ -25,6 +25,7 @@ export interface Message {
 export type Handler = (msg: Message) => unknown | Promise<unknown>;
 
 /** SDK 不提供任何策略开关：超时与结果寿命由调用方显式决定。 */
+
 export interface TransportStats {
   pending: number;
   results: number;

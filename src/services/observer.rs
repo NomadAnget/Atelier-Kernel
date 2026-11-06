@@ -19,6 +19,10 @@ struct History {
 pub struct KernelObserver {
     state: Mutex<History>,
     max_history: usize,
+    /// 订阅者通道满时被丢弃的事件总数：观察流有损，这个计数让它可见而不是静默。
+    dropped_total: std::sync::atomic::AtomicU64,
+    /// 自启动以来产生的观察事件总数（含随后被丢弃的）。
+    emitted_total: std::sync::atomic::AtomicU64,
 }
 impl Default for KernelObserver {
     fn default() -> Self {
@@ -39,7 +43,19 @@ impl KernelObserver {
                 subscribers: Vec::new(),
             }),
             max_history: max_history.max(64),
+            dropped_total: std::sync::atomic::AtomicU64::new(0),
+            emitted_total: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 观察流自启动以来丢弃的订阅事件数（订阅者消费不及时导致）。
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 观察流自启动以来产生的观察事件数（含被丢弃的）。
+    pub fn emitted_total(&self) -> u64 {
+        self.emitted_total.load(std::sync::atomic::Ordering::Relaxed)
     }
     /// Coalesced change notification: one wakeup always represents the latest full state.
     pub(crate) fn subscribe_domain_states(&self) -> Receiver<()> {
@@ -134,6 +150,8 @@ impl KernelObserver {
             details,
         };
         state.next_id = state.next_id.saturating_add(1);
+        self.emitted_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Count without materializing another potentially huge serialized business result.
         struct Counter(usize);
         impl std::io::Write for Counter {
@@ -161,12 +179,20 @@ impl KernelObserver {
         }
         state.bytes += size.0;
         state.events.push_back((event.clone(), size.0));
-        state
-            .subscribers
-            .retain(|tx| match tx.try_send(event.clone()) {
-                Ok(()) | Err(TrySendError::Full(_)) => true,
-                Err(TrySendError::Disconnected(_)) => false,
-            });
+        let mut dropped_here = 0u64;
+        state.subscribers.retain(|tx| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                dropped_here += 1;
+                true
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+        if dropped_here > 0 {
+            drop(state);
+            self.dropped_total
+                .fetch_add(dropped_here, std::sync::atomic::Ordering::Relaxed);
+        }
         event
     }
     pub fn snapshot(&self) -> Vec<ObservationEvent> {

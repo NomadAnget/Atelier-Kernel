@@ -33,10 +33,11 @@ payload through; there is no required application error schema.
 
 ## Event Stream Delivery Contract
 
-System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationEvent`) delivered from kernel pipes to registered listeners use `DeliveryPolicy::Ephemeral`:
+System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationEvent`, `KernelStats`) delivered from kernel pipes to registered listeners use `DeliveryPolicy::Ephemeral`:
 - Zero receipt frames: Domains never report receipt acknowledgements (`received`, `started`, `completed`) for system push events.
 - Explicit subscription: `on_log` / `onLog` and the other callbacks only register a **local** handler; they do not subscribe. A domain receives events only after it calls `subscribe_logs` / `subscribe_telemetry` / `subscribe_notify` / `subscribe_observer` (camelCase in Node), and should call the matching `unsubscribe_*` when done. There is no automatic subscription at `run` / `run_async` startup.
 - Automatic teardown: When a subscriber domain terminates or faults, the kernel automatically unregisters its subscriptions to prevent stale subscriptions or memory leaks.
+- 每条 `ObservationEvent` 的 `data.stats` 携带累计计数：`kernel_instance`、`sent_total`、`terminal_total`、`emitted_total`、`dropped_total`。**全部是自启动以来累计值，不是每秒增量**；消费方用相邻事件的差值算真速率，因事件有损而漏掉几条时，下一条携带的累计值会自动校正。没有额外的定时统计帧，也不需要轮询 `QueryRuntime`。`kernel_instance` 变化代表内核重启（累计值归零，须重置基线）。
 
 ## Local Transport Safeguards
 

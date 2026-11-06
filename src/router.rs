@@ -269,6 +269,7 @@ impl KernelRouter {
         let obs_rx = observer.subscribe();
         let state_rx = observer.subscribe_domain_states();
         let state_observer = observer.clone();
+        let counters_worker = Arc::clone(&ledger);
         let obs_subs_worker = Arc::clone(&observer_subscribers);
         let obs_domains_worker = Arc::clone(&domains);
         let obs_stop_flag = Arc::clone(&stop_log_pump);
@@ -276,6 +277,7 @@ impl KernelRouter {
         let observer_pump_handle = thread::Builder::new()
             .name("kernel-observer-fanout".to_string())
             .spawn(move || {
+                let mut last_stats = std::time::Instant::now();
                 while !obs_stop_flag.load(Ordering::Relaxed) {
                     if state_rx.try_recv().is_ok() {
                         let event = state_observer.domain_state_snapshot();
@@ -304,10 +306,25 @@ impl KernelRouter {
                             if subs.is_empty() {
                                 continue;
                             }
-                            let data = match serde_json::to_value(&event) {
+                            let mut data = match serde_json::to_value(&event) {
                                 Ok(v) => v,
                                 Err(_) => continue,
                             };
+                            // 累计计数随事件携带：消费方用相邻事件的差值算真速率，
+                            // 即使部分事件被丢弃也能自我校正，不需要任何定时帧。
+                            let (sent_total, terminal_total) = counters_worker.counters();
+                            if let Some(object) = data.as_object_mut() {
+                                object.insert(
+                                    "stats".into(),
+                                    json!({
+                                        "kernel_instance": counters_worker.instance_id(),
+                                        "sent_total": sent_total,
+                                        "terminal_total": terminal_total,
+                                        "emitted_total": state_observer.emitted_total(),
+                                        "dropped_total": state_observer.dropped_total(),
+                                    }),
+                                );
+                            }
                             for domain_id in subs {
                                 if let Some(tx) = generation_pipe(&obs_domains_worker, &domain_id) {
                                     let msg = KernelMessage {
@@ -2042,6 +2059,7 @@ impl KernelRouter {
             "domains": domain_list,
             "domain": single_domain,
             "ledger": self.ledger.retention_counts(),
+            "observations": {"dropped_total": self.observer.dropped_total()},
             "logging": {"persistence_error":self.logger.persistence_error()},
         });
 

@@ -242,6 +242,15 @@ domain.run();
     verifier.send(vec!["v2node.log".into()], "Log", json!({}), json!({}));
     let logged = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(logged.status, atelier_kernel::ContractStatus::Completed, "{:?}", logged.data);
+    // 日志必须真的到达内核日志枢纽（走错帧类型不会报错，只会静默丢日志）。
+    let logs = k.logger().recent_logs();
+    assert!(
+        logs.iter().any(|r| {
+            r.source_domain.as_deref() == Some("v2node") && r.message.contains("e2e log line")
+        }),
+        "domain log did not reach the kernel log hub; recent={}",
+        logs.len()
+    );
 
     verifier.send(vec!["v2node.subscribe".into()], "Subscribe", json!({}), json!({}));
     let subscribed = terminal(&verifier, Duration::from_secs(10));

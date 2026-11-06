@@ -51,15 +51,17 @@ my-product-variant/
    ```
 
 2. **编写业务域代码（例如 `domains/billing_domain.py`）**：
-   只需导入 `AtelierDomain`，用 `@domain.handler(...)` 注册处理器，无需关心底层专用匿名管道与四阶段回执细节：
+   只需导入 `AtelierDomain`，用 `@domain.handler(...)` 注册处理器，无需关心底层专用端点与四阶段回执细节：
    ```python
    #!/usr/bin/env python3
+   import asyncio
+
    from atelier_sdk import AtelierDomain, DomainExecutionFailed
 
-   domain = AtelierDomain()
+   domain = AtelierDomain("billing")          # 必须等于 kernel_boot.json 里的 domain_id
 
    @domain.handler("charge")
-   def on_charge(msg):
+   async def on_charge(msg):
        order_id = msg.data.get("order_id", "ORD-001")
        amount = msg.data.get("amount", 0)
        if amount <= 0:
@@ -67,17 +69,17 @@ my-product-variant/
            raise DomainExecutionFailed({"error": "invalid_amount", "amount": amount})
 
        # 1. 存储即消息：写入本域专属表 store_billing（写操作严格物理隔离）
-       domain.storage_insert(
+       await domain.storage_insert(
            record_id=order_id,
            category="invoice",
            data={"order_id": order_id, "amount": amount, "from": msg.source_domain},
        )
 
        # 2. 跨域读取：读取其他域（如 order 域）的表数据（只读共享）
-       domain.storage_query(domain="order", record_id=order_id)
+       await domain.storage_query(domain="order", record_id=order_id)
 
        # 3. 跨域消息发送：调用其他域的处理器
-       domain.send(
+       await domain.send(
            targets=["web_ui.push_alert"],
            message_type="BillingSuccess",
            params={"severity": "info"},
@@ -88,7 +90,7 @@ my-product-variant/
        return {"ok": True, "order_id": order_id, "charged": amount}
 
    if __name__ == "__main__":
-       domain.run()
+       asyncio.run(domain.run_async())
    ```
 
 ---
@@ -231,46 +233,52 @@ JSON 的 `env` 必须是字符串到字符串映射，不能用 null、数组或
 
 ### 2. 多状态日志形态（Multi-State Log Patterns）
 
-| 日志形态 | API | 去向 | 特性与用途 |
+日志只有四个方法：`logger.debug` / `info` / `warn` / `error`。多状态是通过**关键字参数**表达的——它们都是 `LogRecord` 字段，直接透传给内核。
+
+| 日志形态 | 用法 | 去向 | 特性与用途 |
 | :--- | :--- | :--- | :--- |
-| **分级日志** | `domain.logger.info(msg, layer=..., component=...)` | 控制台 + SSE + `hub_logs` | 记录事实与业务状态，支持 `DEBUG`、`INFO`、`WARNING`、`ERROR`、`CRITICAL`。 |
-| **生命周期起止配对** | `domain.logger.phase(level, "start" \| "finish", msg)` | 控制台 + SSE + `hub_logs` | 结构化字段 `phase` 原生配对同一操作起止，无需靠正则表达式猜测文本前缀。 |
-| **临时实时进度** | `domain.logger.progress(msg, key=..., frac=..., waiting=..., done=...)` | **仅 SSE 实时流** | 前端按 `key` 原地更新进度条，`frac`∈[0,1] 渲确定进度条，`waiting=True` 渲等待脉冲，`done=True` 清除。**不落 `hub_logs` 磁盘库**，防止高频刷屏膨胀数据库！ |
-| **控制台刷屏过滤** | `domain.logger.debug(msg, console_only=True)` | **仅终端控制台** | 引擎心跳与高频调试，既不入库也不进 SSE。 |
-| **子进程裸输出兜底** | 域内第三方库裸 `print` 或未捕获 tracebacks | 控制台 + SSE + `hub_logs` | 内核 supervisor 异步文本泵自动截获 `stderr`，自动标记为 `layer: "SUBPROC"` 并统一接管。 |
+| **分级日志** | `logger.info(msg, layer=..., component=...)` | 控制台 + SSE + `hub_logs` | 记录事实与业务状态。 |
+| **生命周期起止配对** | `logger.info(msg, phase="start")` / `phase="finish"` | 控制台 + SSE + `hub_logs` | 结构化字段 `phase` 原生配对同一操作起止，无需靠正则猜文本前缀。 |
+| **临时实时进度** | `logger.info(msg, ephemeral=True, key=..., frac=..., waiting=..., done=...)` | **仅 SSE 实时流** | 前端按 `key` 原地更新进度条，`frac`∈[0,1]，`waiting=True` 渲等待脉冲，`done=True` 清除。**不落 `hub_logs`**，防止高频刷屏膨胀数据库。 |
+| **显式进度终态** | 同上再加 `state="completed" \| "failed" \| "cancelled"` | **仅 SSE 实时流** | 显式状态优先于 `done`；终态会把该 `key` 从活动进度表移除。见 [进度状态](capabilities/progress.md)。 |
+| **控制台刷屏过滤** | `logger.debug(msg, console_only=True)` | **仅终端控制台** | 引擎心跳与高频调试，既不入库也不进 SSE。 |
+| **子进程裸输出兜底** | 域内第三方库裸 `print` 或未捕获 tracebacks | 控制台 + SSE + `hub_logs` | 内核 supervisor 异步文本泵自动截获 `stderr`，标记为 `layer: "SUBPROC"` 并统一接管。 |
 
 ### 3. 多语言使用示例
 
 #### Python 域示例：
 ```python
 # 1. 结构化起止配对
-domain.logger.phase("INFO", "start", f"正在生成订单 {order_id}")
+domain.logger.info(f"开始生成订单 {order_id}", phase="start")
 
 # 2. 事实日志
-domain.logger.info("订单 %s 数据已落库", order_id)
+domain.logger.info("订单数据已落库", order_id=order_id)
 
 # 3. 临时进度条（高频更新，只走 Web SSE 原地刷新，不污染 hub_logs）
-domain.logger.progress("正在下载模型分片 1/2", key=f"dl_{order_id}", frac=0.50)
-domain.logger.progress("分片下载完成", key=f"dl_{order_id}", frac=1.00, done=True)
+domain.logger.info("正在下载模型分片 1/2", ephemeral=True, key=f"dl_{order_id}", frac=0.50)
+domain.logger.info("分片下载完成", ephemeral=True, key=f"dl_{order_id}", frac=1.00, done=True)
 
-# 4. 起止完成配对
-domain.logger.phase("INFO", "finish", f"订单 {order_id} 处理完成")
+# 4. 显式失败终态（让 UI 区分"没跑完"和"失败了"）
+domain.logger.info("模型加载失败", ephemeral=True, key=f"dl_{order_id}", state="failed")
+
+# 5. 起止完成配对
+domain.logger.info(f"订单 {order_id} 处理完成", phase="finish")
 ```
 
 #### Node.js 域示例：
 ```javascript
 // 1. 结构化起止配对
-domain.logger.phase("INFO", "start", `正在扣减库存 ${sku}`);
+domain.logger.info(`开始扣减库存 ${sku}`, { phase: "start" });
 
 // 2. 事实日志
 domain.logger.info(`扣减成功，剩余库存: ${remaining}`);
 
 // 3. 临时进度条
-domain.logger.progress("任务计算中", { key: `calc_${sku}`, frac: 0.75 });
-domain.logger.progress("计算完毕", { key: `calc_${sku}`, frac: 1.0, done: true });
+domain.logger.info("任务计算中", { ephemeral: true, key: `calc_${sku}`, frac: 0.75 });
+domain.logger.info("计算完毕", { ephemeral: true, key: `calc_${sku}`, frac: 1.0, done: true });
 
 // 4. 起止完成配对
-domain.logger.phase("INFO", "finish", `库存 ${sku} 扣减完毕`);
+domain.logger.info(`库存 ${sku} 扣减完毕`, { phase: "finish" });
 ```
 
 ---

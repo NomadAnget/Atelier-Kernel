@@ -563,7 +563,13 @@ class Logger {
     this._domain = domain;
   }
   _log(level, message, fields = {}) {
-    this._domain._write({ frame_type: "send", seq: this._domain._seq++, targets: ["kernel.logger"], message_type: "Log", params: { level, component: this._domain.domain }, data: { message, ...fields } });
+    // 日志走**专用 log 帧**，不是 `send`：它不分配消息身份、不产生四阶段回执，
+    // 由内核直接注入 hub_logs / 活动进度表 / 订阅流。
+    const { layer = "DOMAIN", component = this._domain.domain, ...rest } = fields;
+    this._domain._write({
+      frame_type: "log",
+      record: { level, layer, component, message, ...rest },
+    });
   }
   debug(message, fields) { this._log("debug", message, fields); }
   info(message, fields) { this._log("info", message, fields); }

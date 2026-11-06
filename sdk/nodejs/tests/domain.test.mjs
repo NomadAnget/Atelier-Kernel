@@ -203,12 +203,17 @@ test("bindings defaults to an empty object", () => {
   assert.deepEqual(makeDomain().bindings, {});
 });
 
-test("logger writes to kernel.logger", () => {
+test("logger writes a dedicated log frame", () => {
   const domain = makeDomain();
-  domain.logger.info("hello");
+  domain.logger.info("hello", { phase: "start", tag: "x" });
   const frame = domain.frames[domain.frames.length - 1];
-  assert.equal(frame.targets[0], "kernel.logger");
-  assert.equal(frame.message_type, "Log");
-  assert.equal(frame.data.message, "hello");
-  assert.equal(frame.params.level, "info");
+  // 日志走专用 log 帧：不分配消息身份，也不产生四阶段回执。
+  assert.equal(frame.frame_type, "log");
+  assert.equal(frame.targets, undefined);
+  assert.equal(frame.record.level, "info");
+  assert.equal(frame.record.message, "hello");
+  assert.equal(frame.record.component, "test");
+  assert.equal(frame.record.layer, "DOMAIN");
+  assert.equal(frame.record.phase, "start");
+  assert.equal(frame.record.tag, "x");
 });

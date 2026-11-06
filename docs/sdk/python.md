@@ -46,7 +46,7 @@ asyncio.run(domain.run_async())
 | 11 | 订阅 | `subscribe_logs` / `subscribe_telemetry` / `subscribe_notify` / `subscribe_observer`（+ `unsubscribe_*`） |
 | 12 | 通知 | `notify(level, message, title, details)` |
 | 13 | C4 文件对象 | `enable_file_interception` / `put_object` / `get_object` / `delete_object` / `file_object_id` / `refresh_file_index` |
-| 14 | 日志 | `logger.debug/info/warn/error` |
+| 14 | 日志 | `logger.debug/info/warn/error`；多状态用关键字参数：`phase=` / `ephemeral=` / `key=` / `frac=` / `waiting=` / `done=` / `state=` / `console_only=` |
 | 15 | 端口 | `bindings`（`ATELIER_PORT_BINDINGS` 的解析结果） |
 
 ## 传输

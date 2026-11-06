@@ -18,15 +18,18 @@ payload through; there is no required application error schema.
 
 ## Native Infrastructure Facilities
 
-The SDK exposes 8 native infrastructure clients and listeners directly on the domain instance:
-1. `domain.registry`: Handler discovery (`query_handlers` / `get_description`). The kernel strictly excludes all `kernel.*` internal targets from discovery results to prevent domain-to-domain pub-sub anti-patterns.
-2. `domain.storage`: Scoped persistence (`insert`, `query`, `update`, `delete`). Write operations are strictly scoped to the domain's own table; queries can read other tables via `domain`.
-3. `domain.logger`: Isolated structured logging via dedicated pipe (`debug`, `info`, `warn`, `error`, `phase`, `progress`). Listen via `@domain.on_log` / `domain.onLog`.
-4. `domain.telemetry`: High-frequency metric emission (`domain.telemetry.emit`). Listen via `@domain.on_telemetry` / `domain.onTelemetry`.
-5. `domain.notify`: Alert dispatching (`domain.notify`). Listen via `@domain.on_notify` / `domain.onNotify`.
-6. `domain.runtime`: Runtime topology and process inspection (`list_domains`, `get_domain`, `query`).
-7. `domain.observer`: Lifecycle snapshot queries (`query`) and global event stream listening via `@domain.on_observation` / `domain.onObservation`.
-8. `domain.supervisor`: Process lifecycle control (`start`, `stop`, `restart`) and smooth rolling update with isolated candidate registration/startup handshake and failure rollback (`update`).
+8 个内核内置目标（`kernel.*`）全部由**单层 `AtelierDomain` 上的方法**提供，没有 `domain.registry` / `domain.storage` / `domain.supervisor` 之类的门面子对象（见本节末尾的"已移除"清单）。
+
+| 内核目标 | 能力 | Python | Node.js |
+| :--- | :--- | :--- | :--- |
+| `kernel.registry` | 处理器发现（结果严格排除 `kernel.*`） | `query_handlers()` | `queryHandlers()` |
+| `kernel.storage` | 按域持久化（写严格限本域） | `storage_insert` / `storage_update` / `storage_delete` / `storage_query` | `storageInsert` / `storageUpdate` / `storageDelete` / `storageQuery` |
+| `kernel.logger` | 结构化日志、进度、查询与订阅 | `logger.debug/info/warn/error`、`query_logs`、`query_progress`、`subscribe_logs` / `unsubscribe_logs` | `logger.debug/info/warn/error`、`queryLogs`、`queryProgress`、`subscribeLogs` / `unsubscribeLogs` |
+| `kernel.telemetry` | 高频遥测（仅订阅，内核侧发出） | `subscribe_telemetry` / `unsubscribe_telemetry`、`on_telemetry` | `subscribeTelemetry` / `unsubscribeTelemetry`、`onTelemetry` |
+| `kernel.notify` | 告警广播 | `notify(level, message, title, details)`、`subscribe_notify` / `unsubscribe_notify` | `notify(...)`、`subscribeNotify` / `unsubscribeNotify` |
+| `kernel.runtime` | 运行态拓扑查询 | `query_runtime()` | `queryRuntime()` |
+| `kernel.observer` | 生命周期快照与事件流 | `query_observer()`、`subscribe_observer` / `unsubscribe_observer`、`on_observation` | `queryObserver()`、`subscribeObserver` / `unsubscribeObserver`、`onObservation` |
+| `kernel.supervisor` | 域进程管控与滚动更新 | `supervisor_start` / `supervisor_stop` / `supervisor_restart` / `supervisor_update` | `supervisorStart` / `supervisorStop` / `supervisorRestart` / `supervisorUpdate` |
 
 ## Event Stream Delivery Contract
 

@@ -46,7 +46,7 @@ domain.run();
 | 11 | 订阅 | `subscribeLogs` / `subscribeTelemetry` / `subscribeNotify` / `subscribeObserver`（+ `unsubscribe*`） |
 | 12 | 通知 | `notify(level, message, title, details)` |
 | 13 | C4 文件对象 | `enableFileInterception` / `putObject` / `getObject` / `deleteObject` / `fileObjectId` / `refreshFileIndex` |
-| 14 | 日志 | `logger.debug/info/warn/error` |
+| 14 | 日志 | `logger.debug/info/warn/error`；多状态用 options：`{ phase, ephemeral, key, frac, waiting, done, state, console_only }`（字段名即 `LogRecord` 字段，snake_case） |
 | 15 | 端口 | `bindings` |
 
 ## 传输

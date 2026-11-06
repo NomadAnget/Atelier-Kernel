@@ -608,16 +608,18 @@ class _Logger:
         self._domain = domain
 
     def _log(self, level, message, **fields):
-        self._domain._write(
-            {
-                "frame_type": "send",
-                "seq": self._domain._next_seq(),
-                "targets": ["kernel.logger"],
-                "message_type": "Log",
-                "params": {"level": level, "component": self._domain.domain},
-                "data": {"message": message, **fields},
-            }
-        )
+        # 日志走**专用 log 帧**，不是 `send`：它不分配消息身份、不产生四阶段回执，
+        # 由内核直接注入 hub_logs / 活动进度表 / 订阅流。
+        # `phase`、`ephemeral`、`key`、`frac`、`waiting`、`done`、`state`、`console_only`
+        # 都是 LogRecord 字段，直接作为关键字参数传进来即可。
+        record = {
+            "level": level,
+            "layer": fields.pop("layer", "DOMAIN"),
+            "component": fields.pop("component", self._domain.domain),
+            "message": message,
+            **fields,
+        }
+        self._domain._write({"frame_type": "log", "record": record})
 
     def debug(self, message, **fields):
         self._log("debug", message, **fields)

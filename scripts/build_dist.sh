@@ -15,30 +15,27 @@ else
   exit 1
 fi
 
-echo "==> [1/4] Cleaning and preparing dist/ directories..."
+echo "==> [1/5] Cleaning and preparing dist/ directories..."
 rm -rf "${DIST_DIR}"
 mkdir -p "${SDK_OUT}" "${RUNTIME_OUT}"
 
-echo "==> [2/4] Building Python Domain SDK Wheel (.whl)..."
+echo "==> [2/5] Building Python Domain SDK Wheel (.whl)..."
 python3 "${ROOT_DIR}/sdk/python/build_wheel.py" "${SDK_OUT}"
 
-echo "==> [3/4] Building Node.js Domain SDK Package (.tgz)..."
+echo "==> [3/5] Building Node.js Domain SDK Package (.tgz)..."
 (
   cd "${ROOT_DIR}/sdk/nodejs"
   npm pack --pack-destination "${SDK_OUT}" >/dev/null
 )
 echo "Built Node.js npm package: $(ls "${SDK_OUT}"/*.tgz)"
 
-echo "==> [4/4] Building Precompiled Rust Kernel Release Binary & Runtime Bundle..."
+echo "==> [4/5] Building Precompiled Rust Kernel Release Binary & Runtime Bundle..."
 "${CARGO_BIN}" build --release --offline --manifest-path "${ROOT_DIR}/Cargo.toml"
 
 cp "${ROOT_DIR}/target/release/atelier-kernel" "${RUNTIME_OUT}/atelier-kernel"
 chmod +x "${RUNTIME_OUT}/atelier-kernel"
 cp "${ROOT_DIR}/kernel_boot.json" "${RUNTIME_OUT}/kernel_boot.template.json"
-cp "${ROOT_DIR}/VARIANT_GUIDE.md" "${RUNTIME_OUT}/VARIANT_GUIDE.md"
-for doc in README.md CONSTITUTION.md ARCHITECTURE.md SDK_CONTRACT.md MESSAGE_IDENTITY.md ADVERSARIAL_AUDIT.md RELEASE_NOTES_v0.1.8.md; do
-  cp "${ROOT_DIR}/${doc}" "${RUNTIME_OUT}/"
-done
+# 根目录只有 README（下面会重写为 bundle 说明）；契约、能力、SDK 文档与图标全部随 docs/ 打包。
 cp -R "${ROOT_DIR}/docs" "${RUNTIME_OUT}/docs"
 mkdir -p "${RUNTIME_OUT}/sdk/python" "${RUNTIME_OUT}/sdk/nodejs"
 cp "${ROOT_DIR}/sdk/python/README.md" "${RUNTIME_OUT}/sdk/python/README.md"
@@ -52,6 +49,7 @@ cat > "${RUNTIME_OUT}/README.md" <<EOF
 ## Contents
 - \`atelier-kernel\`: Precompiled Rust microkernel executable (zero external runtime dependencies)
 - \`kernel_boot.template.json\`: Default multi-domain startup configuration template
+- \`docs/\`: Constitution, architecture, capabilities and SDK docs — start at \`docs/INDEX.md\`
 
 ## Quick Start for a New Product Variant
 

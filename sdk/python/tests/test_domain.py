@@ -173,12 +173,18 @@ class C4AndObservabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.domain.bindings, {})
 
     def test_logger_writes_to_kernel_logger(self):
-        self.domain.logger.info("hello")
+        self.domain.logger.info("hello", phase="start", tag="x")
         frame = self.domain.frames[-1]
-        self.assertEqual(frame["targets"], ["kernel.logger"])
-        self.assertEqual(frame["message_type"], "Log")
-        self.assertEqual(frame["data"]["message"], "hello")
-        self.assertEqual(frame["params"]["level"], "info")
+        # 日志走专用 log 帧：不分配消息身份，也不产生四阶段回执。
+        self.assertEqual(frame["frame_type"], "log")
+        self.assertNotIn("targets", frame)
+        record = frame["record"]
+        self.assertEqual(record["level"], "info")
+        self.assertEqual(record["message"], "hello")
+        self.assertEqual(record["component"], "test")
+        self.assertEqual(record["layer"], "DOMAIN")
+        self.assertEqual(record["phase"], "start")
+        self.assertEqual(record["tag"], "x")
 
 
 if __name__ == "__main__":

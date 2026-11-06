@@ -10,9 +10,10 @@ use atelier_kernel::core::protocol::ContractStatus;
 use serde_json::{Value, json};
 
 fn deliver(ledger: &KernelLedger, seq: u64, kind: &str, data: Option<Value>) {
-    let (_, ids, _) = ledger.allocate_submission("sender", seq, 1);
+    let (logical, ids, _) = ledger.allocate_submission("sender", seq, 1);
     ledger.record_initial_target_state(
         &ids[0],
+        &logical,
         seq,
         "sender",
         "worker.run",
@@ -43,9 +44,10 @@ fn eviction_reclaims_identity_rows() {
     let ledger = KernelLedger::new();
     let payload = json!({"blob": "x".repeat(96 * 1024)});
     for seq in 1..=800u64 {
-        let (_, ids, _) = ledger.allocate_submission("sender", seq, 1);
+        let (logical, ids, _) = ledger.allocate_submission("sender", seq, 1);
         ledger.record_initial_target_state(
             &ids[0],
+            &logical,
             seq,
             "sender",
             "kernel.telemetry",
@@ -76,9 +78,10 @@ fn eviction_reclaims_identity_rows() {
 fn terminal_at_ingress_volatile_does_not_leak() {
     let ledger = KernelLedger::new();
     for seq in 1..=1_000u64 {
-        let (_, ids, _) = ledger.allocate_submission("sender", seq, 1);
+        let (logical, ids, _) = ledger.allocate_submission("sender", seq, 1);
         ledger.record_initial_target_state(
             &ids[0],
+            &logical,
             seq,
             "sender",
             "worker.missing",
@@ -99,6 +102,7 @@ fn ephemeral_completion_does_not_wipe_volatile_replay_window() {
     let (logical, ids, _) = ledger.allocate_submission("sender", 5, 1);
     ledger.record_initial_target_state(
         &ids[0],
+        &logical,
         5,
         "sender",
         "worker.run",
@@ -119,9 +123,10 @@ fn ephemeral_completion_does_not_wipe_volatile_replay_window() {
     );
 
     // 另一个来源完成一次 Ephemeral 查询（内核基础设施查询）
-    let (_, qids, _) = ledger.allocate_submission("querier", 1, 1);
+    let (qlogical, qids, _) = ledger.allocate_submission("querier", 1, 1);
     ledger.record_initial_target_state(
         &qids[0],
+        &qlogical,
         1,
         "querier",
         "kernel.runtime",
@@ -215,9 +220,10 @@ fn mixed_policies_do_not_block_durable() {
         "replay window must stay bounded: {counts}"
     );
     // 混合压力之后，Durable 仍然可以正常投递
-    let (_, ids, _) = ledger.allocate_submission("sender", 999_999, 1);
+    let (logical, ids, _) = ledger.allocate_submission("sender", 999_999, 1);
     ledger.record_initial_target_state(
         &ids[0],
+        &logical,
         999_999,
         "sender",
         "worker.run",

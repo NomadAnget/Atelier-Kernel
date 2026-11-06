@@ -1064,6 +1064,7 @@ impl KernelRouter {
                 );
                 let (record, _) = self.ledger.record_initial_target_state_locked(
                     message_id,
+                    &kernel_msg.logical_id,
                     outbound.seq,
                     authenticated_domain,
                     target,
@@ -2408,6 +2409,7 @@ impl KernelRouter {
         let _publication = gate.lock();
         let (sent_rec, created) = self.ledger.record_initial_target_state_locked(
             &msg.message_id,
+            &msg.logical_id,
             seq,
             source_domain,
             &msg.target,
@@ -2553,6 +2555,7 @@ impl KernelRouter {
             }));
             let (rec, created) = self.ledger.record_initial_target_state_locked(
                 &msg.message_id,
+                &msg.logical_id,
                 seq,
                 source_domain,
                 &target,
@@ -2586,6 +2589,7 @@ impl KernelRouter {
             Err(error) => {
                 let (mut failed, _) = self.ledger.record_initial_target_state_locked(
                     &msg.message_id,
+                    &msg.logical_id,
                     seq,
                     source_domain,
                     &target,

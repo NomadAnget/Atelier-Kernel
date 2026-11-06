@@ -14,6 +14,7 @@ fn durable_ingress_must_not_claim_success_after_sqlite_write_failure() {
     let started = Instant::now();
     let (record, created) = ledger.record_initial_target_state(
         "audit-durable",
+        "audit-durable",
         1,
         "sender",
         "worker.run",
@@ -115,6 +116,7 @@ fn corrupt_durable_rows_must_not_be_silently_reinterpreted_on_restore() {
         let path = root.join(format!("corrupt-{}.db", uuid::Uuid::new_v4()));
         let ledger = KernelLedger::open_with_db(Some(&path)).unwrap();
         ledger.record_initial_target_state(
+            "audit-corrupt",
             "audit-corrupt",
             1,
             "sender",

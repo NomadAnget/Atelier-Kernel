@@ -67,7 +67,9 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS messages(
   CREATE TABLE IF NOT EXISTS audit(
     id INTEGER PRIMARY KEY AUTOINCREMENT,message_id TEXT NOT NULL,logical_id TEXT NOT NULL,seq INTEGER NOT NULL,
     source_domain TEXT NOT NULL,target TEXT NOT NULL,message_type TEXT NOT NULL,policy TEXT NOT NULL,
-    status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL);";
+    status TEXT NOT NULL,data TEXT,created_at INTEGER NOT NULL);
+  CREATE INDEX IF NOT EXISTS idx_audit_message ON audit(message_id);
+  CREATE INDEX IF NOT EXISTS idx_audit_logical ON audit(logical_id);";
 
 fn policy_str(p: DeliveryPolicy) -> &'static str {
     match p {
@@ -482,13 +484,6 @@ impl KernelLedger {
         }
     }
 
-    pub fn logical_id_for_message(&self, id: &str) -> String {
-        self.record_for_message(id)
-            .map(|r| r.logical_id)
-            .or_else(|| self.nucleus.lock().logical_id_for(id))
-            .unwrap_or_else(|| id.into())
-    }
-
     pub(crate) fn bind_origin(&self, ids: &[String], instance: u64) {
         let mut b = self.bindings.lock();
         for id in ids {
@@ -594,6 +589,7 @@ impl KernelLedger {
     pub fn record_initial_target_state(
         &self,
         id: &str,
+        logical_id: &str,
         seq: u64,
         source: &str,
         target: &str,
@@ -604,12 +600,15 @@ impl KernelLedger {
         let gate = self.message_gate(id);
         let _mutation = gate.lock();
         let policy = DeliveryPolicy::resolve(target, kind);
-        self.record_initial_target_state_locked(id, seq, source, target, kind, policy, status, data)
+        self.record_initial_target_state_locked(
+            id, logical_id, seq, source, target, kind, policy, status, data,
+        )
     }
 
     pub(crate) fn record_initial_target_state_locked(
         &self,
         id: &str,
+        logical_id: &str,
         seq: u64,
         source: &str,
         target: &str,
@@ -618,13 +617,15 @@ impl KernelLedger {
         status: ContractStatus,
         data: Option<Value>,
     ) -> (DeliveryRecord, bool) {
-        if let Some(existing) = self.record_for_message(id) {
-            return (existing, false);
+        // 同 `record_delivery`：新建态只可能是新 id，因此用 O(1) 的 active 守卫，
+        // 不扫描审计历史（这条路径上 kernel.registry/kernel.storage/kernel.logger
+        // 等内核内部目标每个消息都会走到，扫历史会直接拖垮日志与存储吞吐）。
+        if let Some(existing) = self.nucleus.lock().get(id).cloned() {
+            return (record_from_message(&existing), false);
         }
         let now = now_millis();
-        let logical_id = self.logical_id_for_message(id);
         let r = DeliveryRecord {
-            logical_id,
+            logical_id: logical_id.to_string(),
             message_id: id.into(),
             seq,
             source_domain: source.into(),
@@ -701,8 +702,11 @@ impl KernelLedger {
             binding.channel = Some(channel.to_string());
             binding.logical_id = msg.logical_id.clone();
         }
-        if let Some(existing) = self.record_for_message(&msg.message_id) {
-            return (existing, false);
+        // 每个 message_id 只会被 accept 一次：id 由提交分配当场生成、fanout 目标已去重、
+        // outbox 重放走自己的表不经过 accept。所以这里只需要 O(1) 的 active 守卫，
+        // 不再扫描审计历史——真正的重复写入由 messages 主键冲突显式失败。
+        if let Some(existing) = self.nucleus.lock().get(&msg.message_id).cloned() {
+            return (record_from_message(&existing), false);
         }
         self.nucleus.lock().put(
             msg.message_id.clone(),
@@ -1097,10 +1101,12 @@ fn to_sql_json_error(e: serde_json::Error) -> rusqlite::Error {
 }
 
 fn write_messages_tx(db: &Connection, r: &DeliveryRecord) -> Result<(), StorageError> {
+    // 只用于**首次**落盘。同一 message_id 重复写入必须显式失败（主键冲突），
+    // 不允许用 upsert 静默覆盖一条已经存在的账本行：那会掩盖重复投递。
+    // 后续状态推进走 `persist_advance` 的 UPDATE。
     db.execute(
         "INSERT INTO messages(message_id,logical_id,seq,source_domain,target,message_type,policy,status,data,created_at,updated_at) \
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) \
-         ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,data=excluded.data,updated_at=excluded.updated_at",
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         params![
             r.message_id,
             r.logical_id,
@@ -1150,6 +1156,7 @@ mod tests {
         ledger.bind_origin(&ids, 1);
         let (rec, created) = ledger.record_initial_target_state_locked(
             &ids[0],
+            &logical,
             1,
             "sender",
             "worker.missing",
@@ -1177,7 +1184,7 @@ mod tests {
             ledger.bind_origin(&ids, 1);
             for id in &ids {
                 ledger.record_initial_target_state_locked(
-                    id, seq, "sender", "worker.run", "Ephemeral",
+                    id, &logical, seq, "sender", "worker.run", "Ephemeral",
                     DeliveryPolicy::Ephemeral, ContractStatus::Sent, None,
                 );
             }
@@ -1200,7 +1207,7 @@ mod tests {
         let (logical, ids, _) = ledger.allocate_submission("sender#1", 1, 1);
         ledger.bind_origin(&ids, 1);
         ledger.record_initial_target_state_locked(
-            &ids[0], 1, "sender", "worker.run", "Run",
+            &ids[0], &logical, 1, "sender", "worker.run", "Run",
             DeliveryPolicy::Durable, ContractStatus::Sent, None,
         );
         ledger.advance_status("worker", &ids[0], "worker.run", ContractStatus::Completed, Some(json!({"kept": true})));
@@ -1215,9 +1222,9 @@ mod tests {
     #[test]
     fn domain_receipt_cannot_claim_internal_delivery_without_channel() {
         let ledger = KernelLedger::new();
-        let (_, ids, _) = ledger.allocate_submission("sender#1", 1, 1);
+        let (logical, ids, _) = ledger.allocate_submission("sender#1", 1, 1);
         ledger.record_initial_target_state(
-            &ids[0], 1, "sender", "kernel.supervisor", "RestartDomain",
+            &ids[0], &logical, 1, "sender", "kernel.supervisor", "RestartDomain",
             ContractStatus::Sent, None,
         );
         assert!(!ledger.accepts_channel(&ids[0], "unrelated-domain-pipe"));

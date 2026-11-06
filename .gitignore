@@ -10,3 +10,5 @@ __pycache__/
 *.db-wal
 
 /sdk/python/build/
+/sdk/python/dist/
+/sdk/nodejs/*.tgz

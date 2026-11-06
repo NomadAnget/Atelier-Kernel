@@ -120,14 +120,22 @@ domain.run();
 ### 3.4 域之间怎么协作
 
 ```python
-# 只发不收：拿到子消息 id
-ids = domain.send(["billing.charge"], "Charge", {"amount": 10}, {"order_id": "o-1"})
+# 只发不收：拿到子消息 id 列表（send 也是 async）
+ids = await domain.send(["billing.charge"], "Charge", {"amount": 10}, {"order_id": "o-1"})
 
-# 要结果：等终态回执，非 completed 会抛异常
+# 要结果：等终态回执，返回的是那条回执的 data；非 completed 抛 DomainRequestError
 data = await domain.request(["billing.charge"], "Charge", {"amount": 10}, {"order_id": "o-1"})
 ```
 
 `send` / `request` 的目标是 `"<domain>.<handler>"`。**不要**为了让两个域"更快地"协作而共享文件或直接调用——那会同时破坏 M4 和可观测性。
+
+**订阅必须显式调用。** `on_log` / `onLog` 之类只是登记一个本地回调，**不会**向内核订阅；不调 `subscribe_logs()` 就永远收不到事件：
+
+```python
+domain.on_notify(lambda payload: print(payload))   # 只是登记回调
+await domain.subscribe_notify()                    # 真正向内核订阅
+# ... 用完要 await domain.unsubscribe_notify()
+```
 
 ### 3.5 C4 文件对象
 
@@ -183,6 +191,13 @@ cargo build --release
 | 只加业务域 | `--check` + `--smoke-test` |
 | 改 `src/` | 上面四条全跑；`cargo test` 必须 0 failed、0 warning |
 | 改契约 / SDK | 再加：两语言 SDK 单测（`sdk/python/tests`、`sdk/nodejs/tests`）与 `tests/sdk_e2e.rs` |
+
+**`--smoke-test` 的适用条件**（不满足会超时失败，不是内核 bug）：
+
+- 必须配 `--config`，且 `domains` 非空；
+- **每个已配置域都必须在 5 秒内启动并注册至少一个 handler**（否则报 `Timed out waiting for domains to register handlers`）；
+- 它会额外挂一个 `smoke_verifier` 探针域，向每个域的第一个路由发 `VariantSmokeProbe`，要求拿到 Completed 终态，然后核对 `hub_logs`；
+- 需要域侧能连上端点（`PYTHONPATH` / `node_modules` 里要有对应 SDK）。
 
 Linux/macOS 的行为由 CI 覆盖（`cargo check --tests --target x86_64-unknown-linux-gnu` 在本机需要交叉 `cc`，通常只在 CI 跑）。
 

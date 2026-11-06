@@ -35,7 +35,7 @@ payload through; there is no required application error schema.
 
 System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationEvent`) delivered from kernel pipes to registered listeners use `DeliveryPolicy::Ephemeral`:
 - Zero receipt frames: Domains never report receipt acknowledgements (`received`, `started`, `completed`) for system push events.
-- Automatic subscription negotiation: Listeners registered before `run` / `run_async` automatically send subscription messages during startup.
+- Explicit subscription: `on_log` / `onLog` and the other callbacks only register a **local** handler; they do not subscribe. A domain receives events only after it calls `subscribe_logs` / `subscribe_telemetry` / `subscribe_notify` / `subscribe_observer` (camelCase in Node), and should call the matching `unsubscribe_*` when done. There is no automatic subscription at `run` / `run_async` startup.
 - Automatic teardown: When a subscriber domain terminates or faults, the kernel automatically unregisters its subscriptions to prevent stale pipes or memory leaks.
 
 ## Local Transport Safeguards

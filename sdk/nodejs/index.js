@@ -6,53 +6,9 @@ const fs = require("fs");
 const net = require("net");
 const os = require("os");
 const path = require("path");
-const { spawn } = require("child_process");
 
 const TERMINAL = new Set(["completed", "execution_failed", "target_invalid", "contract_invalid"]);
 const SYSTEM_EVENTS = { LogEvent: "log", NotifyEvent: "notify", ObservationEvent: "observation", TelemetryEvent: "telemetry" };
-
-// Windows 上内核传的是 HANDLE，Node 不能直接用；桥接进程把 HANDLE 转成管道。
-const BRIDGE_PY = [
-  "import ctypes,msvcrt,os,sys,threading",
-  "k32=ctypes.windll.kernel32",
-  "r_h,w_h,ppid=int(sys.argv[1]),int(sys.argv[2]),int(sys.argv[3])",
-  "k32.SetHandleInformation(ctypes.c_void_p(r_h),1,0)",
-  "k32.SetHandleInformation(ctypes.c_void_p(w_h),1,0)",
-  "h_p=k32.OpenProcess(0x0040,False,ppid)",
-  "if h_p:",
-  " d=ctypes.c_void_p()",
-  " k32.DuplicateHandle(h_p,ctypes.c_void_p(r_h),0,ctypes.byref(d),0,False,1)",
-  " k32.DuplicateHandle(h_p,ctypes.c_void_p(w_h),0,ctypes.byref(d),0,False,1)",
-  " k32.CloseHandle(h_p)",
-  "msvcrt.setmode(0,os.O_BINARY);msvcrt.setmode(1,os.O_BINARY)",
-  "r_fd=msvcrt.open_osfhandle(r_h,os.O_RDONLY|os.O_BINARY)",
-  "w_fd=msvcrt.open_osfhandle(w_h,os.O_WRONLY|os.O_BINARY)",
-  "def p_in():",
-  " try:",
-  "  while True:",
-  "   b=os.read(r_fd,65536)",
-  "   if not b:break",
-  "   mv=memoryview(b)",
-  "   while mv:mv=mv[os.write(1,mv):]",
-  " except Exception:pass",
-  " finally:",
-  "  try:os.close(1)",
-  "  except Exception:pass",
-  "def p_out():",
-  " try:",
-  "  while True:",
-  "   b=os.read(0,65536)",
-  "   if not b:break",
-  "   mv=memoryview(b)",
-  "   while mv:mv=mv[os.write(w_fd,mv):]",
-  " except Exception:pass",
-  " finally:",
-  "  try:os.close(w_fd)",
-  "  except Exception:pass",
-  "  os._exit(0)",
-  "t1=threading.Thread(target=p_in,daemon=True);t2=threading.Thread(target=p_out,daemon=True)",
-  "t1.start();t2.start();t2.join()",
-].join("\n");
 
 class DomainRequestError extends Error {
   constructor(status, data = null, messageId = null) {

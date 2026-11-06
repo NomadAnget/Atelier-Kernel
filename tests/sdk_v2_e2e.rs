@@ -24,14 +24,9 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 }
 
 const DOMAIN: &str = r#"
-import sys
-_trace = open(r"G:\Atelier\atelier-solo\tmp\v2_e2e_trace.log", "w", buffering=1)
-_trace.write("script start\n")
 from atelier_sdk import AtelierDomain
-_trace.write("imported\n")
 
 domain = AtelierDomain("v2test")
-_trace.write("constructed\n")
 
 @domain.handler("echo")
 async def echo(msg):
@@ -127,7 +122,6 @@ async def stress_handler(msg):
             return {"failed_at": i, "got": result["data"]}
     return {"ok": True, "pending": len(domain._pending), "results": len(domain._results)}
 
-_trace.write("before run\n")
 import asyncio
 asyncio.run(domain.run_async())
 "#;
@@ -166,9 +160,10 @@ fn sdk_v2_round_trip() {
             break;
         }
         if Instant::now() >= deadline {
-            let trace = std::fs::read_to_string(r"G:\Atelier\atelier-solo\tmp\v2_e2e_trace.log")
-                .unwrap_or_else(|_| "<no trace>".into());
-            panic!("v2 domain did not register; trace:\n{trace}");
+            panic!(
+                "v2 domain did not register; active routes: {:?}",
+                k.router().active_routes()
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -107,10 +107,6 @@ domain.run();
 
     let mut spec = DomainProcessSpec::new("v2node", "node", vec!["-e".into(), script]);
     spec.env.insert("PYTHONIOENCODING".into(), "utf-8".into());
-    spec.env.insert(
-        "PYTHON".into(),
-        "G:/Atelier/atelier-solo/.venv/Scripts/python.exe".into(),
-    );
     spec.auto_restart = false;
     let cfg = KernelBootConfig {
         source_path: None,

@@ -226,7 +226,7 @@ fn actual_host_restart_preserves_failure_record_without_replaying_old_generation
     std::fs::create_dir_all(&root).unwrap();
     let path = root.join(format!("restart-{}.db", uuid::Uuid::new_v4()));
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "abrupt_exit_fixture", "--ignored", "--nocapture"])
+        .args(["--exact", "outbox::abrupt_exit_fixture", "--ignored", "--nocapture"])
         .env("ATELIER_OUTBOX_CRASH_FIXTURE", &path)
         .status()
         .unwrap();

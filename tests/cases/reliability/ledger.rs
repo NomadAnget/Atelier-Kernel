@@ -75,7 +75,7 @@ fn process_recovery_closes_every_old_nonterminal_and_clears_old_terminal_rows() 
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "crash_after_physical_write_fixture",
+            "ledger::crash_after_physical_write_fixture",
             "--ignored",
             "--nocapture",
         ])

@@ -119,7 +119,7 @@ fn actual_process_exit_between_commit_and_cleanup_replays_without_duplicates() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "committed_before_cleanup_exit_fixture",
+            "backlog::committed_before_cleanup_exit_fixture",
             "--ignored",
             "--nocapture",
         ])

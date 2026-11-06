@@ -57,7 +57,7 @@ fn exclusive_database_owner_releases_after_exit_and_clears_old_terminal_rows() {
     w.drain_frames();
     s.drain_frames();
     let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "owner_process_fixture", "--ignored"])
+        .args(["--exact", "regressions::owner_process_fixture", "--ignored"])
         .env("ATELIER_OWNER_DB", &path)
         .status()
         .unwrap();
@@ -84,7 +84,7 @@ fn exclusive_database_owner_releases_after_exit_and_clears_old_terminal_rows() {
     );
     drop(reopened);
     let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "owner_process_fixture", "--ignored"])
+        .args(["--exact", "regressions::owner_process_fixture", "--ignored"])
         .env("ATELIER_OWNER_DB", &path)
         .env("ATELIER_OWNER_CRASH", "1")
         .status()

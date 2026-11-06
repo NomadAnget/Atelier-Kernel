@@ -59,6 +59,18 @@ jobs:
       - name: Build Kernel for Native SDK Regression
         run: cargo build --locked
 
+      # 日常门禁：--init 生成变体骨架 → 真实配置文件启动 → 全部域注册 → 探针消息
+      # 走完四阶段 → hub_logs 真正落库。发版构建里也有一条同样语义的步骤（用安装包），
+      # 这里用源码树提前拦住回归，不必等到打 tag 才发现。
+      - name: Boot Smoke Test (--init + --smoke-test)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          PYTHONPATH="$(pwd)/sdk/python" ./target/debug/atelier-kernel --init ./ci-smoke
+          PYTHONPATH="$(pwd)/sdk/python" ./target/debug/atelier-kernel \
+            --config ./ci-smoke/kernel_boot.json --smoke-test
+          rm -rf ./ci-smoke
+
       - name: Run SDK Unit Test Suites
         shell: bash
         run: |

@@ -29,7 +29,7 @@ await domain.unsubscribe_notify()
 | 取消订阅 | `await unsubscribe_observer()` | `await unsubscribeObserver()` |
 | 查询近期记录 | `await query_observer(**filters)` | `await queryObserver(filters)` |
 
-过滤参数：`message_id`、`target`、`source_domain`、`limit`（默认 100，上限 1000）；Node 同时接受 `messageId` / `sourceDomain`。
+过滤参数（**必须用内核字段名，snake_case**）：`message_id`、`target`、`source_domain`、`limit`（默认 100，上限 1000）。两个 SDK 都把 params 原样转给内核，**不做 camelCase 转换**——Node 传 `messageId` / `sourceDomain` 会被当成未知字段静默忽略，等于没有过滤。
 
 事件字段：`event_id`、`timestamp`（Unix 毫秒）、`logical_id`、`message_id`、`source_domain`、`target`、`seq`、`message_type`、`status`、`details`。
 

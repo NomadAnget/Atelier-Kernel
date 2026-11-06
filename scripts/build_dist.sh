@@ -40,6 +40,8 @@ cp -R "${ROOT_DIR}/docs" "${RUNTIME_OUT}/docs"
 mkdir -p "${RUNTIME_OUT}/sdk/python" "${RUNTIME_OUT}/sdk/nodejs"
 cp "${ROOT_DIR}/sdk/python/README.md" "${RUNTIME_OUT}/sdk/python/README.md"
 cp "${ROOT_DIR}/sdk/nodejs/README.md" "${RUNTIME_OUT}/sdk/nodejs/README.md"
+# 与 CI 的发布包保持同一结构：安装包同时放进运行时包内，并单独保留一份在 dist/sdk 供分发。
+cp "${SDK_OUT}"/*.whl "${SDK_OUT}"/*.tgz "${RUNTIME_OUT}/sdk/"
 
 VERSION="$(grep -m1 '^version = ' "${ROOT_DIR}/Cargo.toml" | cut -d '"' -f2)"
 
@@ -50,6 +52,7 @@ cat > "${RUNTIME_OUT}/README.md" <<EOF
 - \`atelier-kernel\`: Precompiled Rust microkernel executable (zero external runtime dependencies)
 - \`kernel_boot.template.json\`: Default multi-domain startup configuration template
 - \`docs/\`: Constitution, architecture, capabilities and SDK docs — start at \`docs/INDEX.md\`
+- \`sdk/\`: Python wheel and Node.js package for domain development
 
 ## Quick Start for a New Product Variant
 
@@ -59,23 +62,23 @@ cat > "${RUNTIME_OUT}/README.md" <<EOF
    \`\`\`
 2. Install the Domain SDKs for your domain languages:
    \`\`\`bash
-   pip install ../sdk/atelier_sdk-${VERSION}-py3-none-any.whl
-   npm install ../sdk/atelier-sdk-${VERSION}.tgz
+   pip install ./sdk/atelier_sdk-${VERSION}-py3-none-any.whl
+   npm install ./sdk/atelier-sdk-${VERSION}.tgz
    \`\`\`
-3. Boot your variant with Web Observer UI:
+3. Boot your variant (headless by default — no HTTP listener):
    \`\`\`bash
    ./atelier-kernel --config ./my-variant/kernel_boot.json
    \`\`\`
-   Or boot in headless production mode:
+   Add the observer UI explicitly (listens on \`web_ui_bind\`, default \`0.0.0.0:8787\`):
    \`\`\`bash
-   ./atelier-kernel --config ./my-variant/kernel_boot.json --headless
+   ./atelier-kernel --config ./my-variant/kernel_boot.json --web-ui
    \`\`\`
 EOF
 
 ARCH="$(uname -m)"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCHIVE_NAME="atelier-kernel-runtime-${OS}-${ARCH}.tar.gz"
-tar -C "${DIST_DIR}" -czf "${DIST_DIR}/${ARCHIVE_NAME}" kernel-runtime sdk
+tar -C "${DIST_DIR}" -czf "${DIST_DIR}/${ARCHIVE_NAME}" kernel-runtime
 
 echo "==> [5/5] Running End-to-End Variant Smoke Test (--init + --smoke-test)..."
 SMOKE_DIR="${DIST_DIR}/_smoke_variant"

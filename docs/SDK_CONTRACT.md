@@ -28,7 +28,6 @@ payload through; there is no required application error schema.
 | `kernel.telemetry` | 高频遥测（仅订阅，内核侧发出） | `subscribe_telemetry` / `unsubscribe_telemetry`、`on_telemetry` | `subscribeTelemetry` / `unsubscribeTelemetry`、`onTelemetry` |
 | `kernel.notify` | 告警广播 | `notify(level, message, title, details)`、`subscribe_notify` / `unsubscribe_notify` | `notify(...)`、`subscribeNotify` / `unsubscribeNotify` |
 | `kernel.runtime` | 运行态拓扑查询 | `query_runtime()` | `queryRuntime()` |
-| `kernel.runtime` | **域存在性/运行态探测** | `domain_info(id)` | `domainInfo(id)` |
 | `kernel.observer` | 生命周期快照与事件流 | `query_observer()`、`subscribe_observer` / `unsubscribe_observer`、`on_observation` | `queryObserver()`、`subscribeObserver` / `unsubscribeObserver`、`onObservation` |
 | `kernel.supervisor` | 域进程管控与滚动更新 | `supervisor_start` / `supervisor_stop` / `supervisor_restart` / `supervisor_update` | `supervisorStart` / `supervisorStop` / `supervisorRestart` / `supervisorUpdate` |
 
@@ -39,12 +38,6 @@ System event streams (`LogEvent`, `TelemetryEvent`, `NotifyEvent`, `ObservationE
 - Explicit subscription: `on_log` / `onLog` and the other callbacks only register a **local** handler; they do not subscribe. A domain receives events only after it calls `subscribe_logs` / `subscribe_telemetry` / `subscribe_notify` / `subscribe_observer` (camelCase in Node), and should call the matching `unsubscribe_*` when done. There is no automatic subscription at `run` / `run_async` startup.
 - Automatic teardown: When a subscriber domain terminates or faults, the kernel automatically unregisters its subscriptions to prevent stale subscriptions or memory leaks.
 - 每条 `ObservationEvent` 的 `data.stats` 携带累计计数：`kernel_instance`、`sent_total`、`terminal_total`、`emitted_total`、`dropped_total`。**全部是自启动以来累计值，不是每秒增量**；消费方用相邻事件的差值算真速率，因事件有损而漏掉几条时，下一条携带的累计值会自动校正。没有额外的定时统计帧，也不需要轮询 `QueryRuntime`。`kernel_instance` 变化代表内核重启（累计值归零，须重置基线）。
-
-### 探测域是否存在只能用内核元数据
-
-`domainInfo(id)` / `domain_info(id)` 返回内核运行态条目（`domain_id`、`status`、`instance_id`、`routes`、`process`），域不存在时为 `null`。它是 `QueryRuntime` 的定向封装，**不发送任何业务消息、不产生回执**。
-
-禁止用业务消息（例如 `pipelines.ping`、`engines.ping`）来探测目标域是否存在：域没运行时这类调用会收到 `target_invalid`，把"基础设施不存在"伪装成"业务调用失败"，还会污染回执账本与观察流。业务 ping 只用于查询对方**已存在**时的就绪状态。
 
 ## Local Transport Safeguards
 

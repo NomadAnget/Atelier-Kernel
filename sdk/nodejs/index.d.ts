@@ -106,8 +106,6 @@ export declare class AtelierDomain {
   queryLogs(params?: Json): Promise<Json>;
   queryHandlers(params?: Json): Promise<Json>;
   queryRuntime(params?: Json): Promise<Json>;
-  /** 域存在性/运行态探测（内核元数据，不产生业务消息）。不存在返回 null。 */
-  domainInfo(domainId: string): Promise<Json | null>;
   queryObserver(params?: Json): Promise<Json>;
   queryProgress(): Promise<Json>;
 

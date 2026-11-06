@@ -254,17 +254,6 @@ class AtelierDomain {
   async queryRuntime(params = {}) {
     return this._query("kernel.runtime", "QueryRuntime", params);
   }
-
-  /**
-   * 域存在性与运行态探测：读内核元数据，不发送任何业务消息、不产生 target_invalid。
-   * 返回内核运行态条目（domain_id/status/instance_id/routes/process），不存在则 null。
-   */
-  async domainInfo(domainId) {
-    const runtime = await this.queryRuntime({ domain: String(domainId) });
-    const single = runtime?.domain;
-    if (single && typeof single === "object") return single;
-    return (runtime?.domains || []).find((item) => item?.domain_id === domainId) || null;
-  }
   async queryObserver(params = {}) {
     return this._query("kernel.observer", "QueryObserver", params);
   }

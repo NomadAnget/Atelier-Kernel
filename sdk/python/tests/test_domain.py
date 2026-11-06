@@ -30,6 +30,20 @@ class FakeDomain(AtelierDomain):
         )
 
 
+class ConstructorSurfaceTest(unittest.TestCase):
+    """构造参数必须与 docs/SDK_CONTRACT.md 里写的一致，不允许再长出无效旋钮。"""
+
+    def test_constructor_accepts_only_documented_options(self):
+        import inspect
+
+        params = [
+            name
+            for name in inspect.signature(AtelierDomain.__init__).parameters
+            if name not in ("self", "domain")
+        ]
+        self.assertEqual(params, ["max_pending", "result_ttl"])
+
+
 class MessagePathTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.domain = FakeDomain()

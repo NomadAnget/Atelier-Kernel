@@ -47,10 +47,9 @@ class DomainExecutionFailed(Exception):
 class AtelierDomain:
     """单层公开面。全异步，snake_case，无 `_async` 后缀。"""
 
-    def __init__(self, domain, *, max_pending=1024, max_results=4096, result_ttl=30.0):
+    def __init__(self, domain, *, max_pending=1024, result_ttl=30.0):
         self.domain = domain
         self._max_pending = max_pending
-        self._max_results = max_results
         self._result_ttl = result_ttl
 
         self._handlers = {}

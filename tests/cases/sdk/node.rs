@@ -89,7 +89,13 @@ domain.handler("api", async (msg) => {{
 domain.handler("query", async () => {{
   const handlers = await domain.queryHandlers();
   const runtime = await domain.queryRuntime();
-  return {{ routes: handlers.routes || [], runtime_ok: !!runtime && typeof runtime === "object" }};
+  // 能力 9：日志游标分页也要真能走通（参数名必须是内核字段 snake_case）
+  const page = await domain.queryLogs({{ limit: 1 }});
+  return {{
+    routes: handlers.routes || [],
+    runtime_ok: !!runtime && typeof runtime === "object",
+    page_ok: !!page && Array.isArray(page.logs) && "has_more" in page && "next_before_id" in page,
+  }};
 }});
 domain.handler("notify", async () => {{
   const result = await domain.notify("info", "hello from v2 node");
@@ -107,7 +113,15 @@ domain.handler("wait", async () => {{
   const mid = await domain.send("v2node.echo", "Echo", {{}}, {{ value: 7 }});
   const receipt = await domain.waitResult(mid);
   domain.forgetResult(mid);
-  return {{ echo: receipt.data.echo }};
+  // 能力 5：批量等待（waitResults 只消费已存在的 id，不重新发送）
+  const batchIds = await domain.send(["v2node.echo", "v2node.query"], "Echo", {{}}, {{ value: 3 }});
+  const batch = await domain.waitResults(batchIds);
+  for (const one of batchIds) domain.forgetResult(one);
+  return {{
+    echo: receipt.data.echo,
+    batch: batch.length,
+    batch_ok: batch.every((one) => one.status === "completed"),
+  }};
 }});
 domain.handler("log", async () => {{
   domain.logger.info("e2e log line", {{ tag: "v2node" }});
@@ -218,6 +232,7 @@ domain.run();
     let routes = queried_data["routes"].as_array().expect("routes");
     assert!(routes.iter().any(|r| r == "v2node.echo"), "{queried_data}");
     assert_eq!(queried_data["runtime_ok"], true, "{queried_data}");
+    assert_eq!(queried_data["page_ok"], true, "queryLogs 分页响应不完整: {queried_data}");
 
     verifier.send(vec!["v2node.notify".into()], "Notify", json!({}), json!({}));
     let notified = terminal(&verifier, Duration::from_secs(10));
@@ -237,7 +252,10 @@ domain.run();
     verifier.send(vec!["v2node.wait".into()], "Wait", json!({}), json!({}));
     let waited = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(waited.status, atelier_kernel::ContractStatus::Completed, "{:?}", waited.data);
-    assert_eq!(waited.data.unwrap()["echo"], 7);
+    let waited_data = waited.data.unwrap();
+    assert_eq!(waited_data["echo"], 7);
+    assert_eq!(waited_data["batch"], 2, "waitResults 应返回两条回执: {waited_data}");
+    assert_eq!(waited_data["batch_ok"], true, "{waited_data}");
 
     verifier.send(vec!["v2node.log".into()], "Log", json!({}), json!({}));
     let logged = terminal(&verifier, Duration::from_secs(10));

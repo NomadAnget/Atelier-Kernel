@@ -74,6 +74,8 @@ export declare class AtelierDomain {
   reportReceipt(messageId: string, target: string, status: string, data?: Json): void;
 
   // 7. events
+  /** 通用事件登记；`onLog` / `onNotify` / `onObservation` / `onTelemetry` 都是它的特化。 */
+  on(kind: "log" | "notify" | "observation" | "telemetry" | "receipt", fn: (payload: Json) => void): this;
   onReceipt(fn: (frame: MessageReceipt) => void): this;
   onLog(fn: (payload: Json) => void): this;
   onNotify(fn: (payload: Json) => void): this;

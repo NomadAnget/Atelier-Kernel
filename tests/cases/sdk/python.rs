@@ -105,7 +105,16 @@ async def storage_handler(msg):
 async def query_handler(msg):
     handlers = await domain.query_handlers()
     runtime = await domain.query_runtime()
-    return {"routes": handlers.get("routes") or [], "runtime_ok": isinstance(runtime, dict)}
+    # 能力 9：日志游标分页也要真能走通（参数名必须是内核字段 snake_case）
+    page = await domain.query_logs(limit=1)
+    return {
+        "routes": handlers.get("routes") or [],
+        "runtime_ok": isinstance(runtime, dict),
+        "page_ok": isinstance(page, dict)
+        and isinstance(page.get("logs"), list)
+        and "has_more" in page
+        and "next_before_id" in page,
+    }
 
 @domain.handler("notify")
 async def notify_handler(msg):
@@ -139,7 +148,16 @@ async def wait_handler(msg):
     mid = await domain.send("v2test.echo", "Echo", {}, {"value": 7})
     receipt = await domain.wait_result(mid)
     domain.forget_result(mid)
-    return {"echo": receipt["data"]["echo"]}
+    # 能力 5：批量等待（wait_results 只消费已存在的 id，不重新发送）
+    batch_ids = await domain.send(["v2test.echo", "v2test.query"], "Echo", {}, {"value": 3})
+    batch = await domain.wait_results(batch_ids)
+    for one in batch_ids:
+        domain.forget_result(one)
+    return {
+        "echo": receipt["data"]["echo"],
+        "batch": len(batch),
+        "batch_ok": all(one.get("status") == "completed" for one in batch),
+    }
 
 @domain.handler("log")
 async def log_handler(msg):
@@ -272,6 +290,7 @@ fn sdk_v2_round_trip() {
     let routes = queried_data["routes"].as_array().expect("routes");
     assert!(routes.iter().any(|r| r == "v2test.echo"), "{queried_data}");
     assert_eq!(queried_data["runtime_ok"], true, "{queried_data}");
+    assert_eq!(queried_data["page_ok"], true, "query_logs 分页响应不完整: {queried_data}");
 
     verifier.send(vec!["v2test.notify".into()], "Notify", json!({}), json!({}));
     let notified = terminal(&verifier, Duration::from_secs(10));
@@ -291,7 +310,10 @@ fn sdk_v2_round_trip() {
     verifier.send(vec!["v2test.wait".into()], "Wait", json!({}), json!({}));
     let waited = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(waited.status, atelier_kernel::ContractStatus::Completed, "{:?}", waited.data);
-    assert_eq!(waited.data.unwrap()["echo"], 7);
+    let waited_data = waited.data.unwrap();
+    assert_eq!(waited_data["echo"], 7);
+    assert_eq!(waited_data["batch"], 2, "wait_results 应返回两条回执: {waited_data}");
+    assert_eq!(waited_data["batch_ok"], true, "{waited_data}");
 
     verifier.send(vec!["v2test.log".into()], "Log", json!({}), json!({}));
     let logged = terminal(&verifier, Duration::from_secs(10));

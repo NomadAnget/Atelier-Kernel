@@ -263,6 +263,16 @@ impl ManagedProcess {
     fn terminate(&mut self) {
         // Observe natural exit before any administrative kill; cleanup is not the cause.
         self.observe_exit();
+        // 端点断开与进程退出不同步：域关闭端点后立刻 exit 时，上面这一次 `try_wait`
+        // 可能扑空，紧接着的 kill 就会把原始退出码顶成"被清理"。端点已断开（drain）
+        // 时给一个很短的窗口让子进程公布自己的退出码，避免诊断丢失真实死因。
+        if self.exit_status.is_none() && self.drain.load(Ordering::Acquire) {
+            let deadline = Instant::now() + std::time::Duration::from_millis(50);
+            while self.exit_status.is_none() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                self.observe_exit();
+            }
+        }
         self.stop.store(true, Ordering::Release);
         self.output.close();
         #[cfg(windows)]

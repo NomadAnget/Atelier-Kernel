@@ -2,7 +2,9 @@
 
 Atelier Kernel 的官方 Node.js 域 SDK：**单层 `AtelierDomain`**、全异步、15 项能力，无门面类、无遗留别名。
 
-> 完整能力表、传输模型与 C4 用法见仓库 [`docs/sdk/nodejs.md`](../../docs/sdk/nodejs.md)。
+> 完整能力表、传输模型与 C4 用法见 [docs/sdk/nodejs.md](https://github.com/NomadAnget/Atelier-Kernel/blob/main/docs/sdk/nodejs.md)。
+
+15 项能力：生命周期 · 注册处理器 · 发消息 · 请求-响应 · 等待/遗忘 · 上报回执 · 事件回调 · 本域存储 · 查询 · 监督 · 订阅 · 通知 · C4 文件对象 · 日志 · 端口。
 
 ## 安装
 

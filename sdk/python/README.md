@@ -2,7 +2,9 @@
 
 Atelier Kernel 的官方 Python 域 SDK：**单层 `AtelierDomain`**、全异步、15 项能力，无门面类、无 `_async` 别名、无同步版。
 
-> 完整能力表、传输模型与 C4 用法见仓库 [`docs/sdk/python.md`](../../docs/sdk/python.md)。
+> 完整能力表、传输模型与 C4 用法见 [docs/sdk/python.md](https://github.com/NomadAnget/Atelier-Kernel/blob/main/docs/sdk/python.md)。
+
+15 项能力：生命周期 · 注册处理器 · 发消息 · 请求-响应 · 等待/遗忘 · 上报回执 · 事件回调 · 本域存储 · 查询 · 监督 · 订阅 · 通知 · C4 文件对象 · 日志 · 端口。
 
 ## 安装
 

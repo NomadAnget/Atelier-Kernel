@@ -24,9 +24,18 @@ export interface Message {
 
 export type Handler = (msg: Message) => unknown | Promise<unknown>;
 
-export interface DomainOptions {
-  maxPending?: number;
-  resultTtlMs?: number;
+/** SDK 不提供任何策略开关：超时与结果寿命由调用方显式决定。 */
+export interface TransportStats {
+  pending: number;
+  results: number;
+  orphans: number;
+  dropped_orphan_receipts: number;
+  local_backpressure: number;
+  unmatched_receipts: number;
+  malformed_frames: number;
+  unknown_statuses: number;
+  dropped_frames: number;
+  transport_closed: boolean;
 }
 
 export declare class DomainRequestError extends Error {
@@ -57,7 +66,7 @@ export interface Logger {
 }
 
 export declare class AtelierDomain {
-  constructor(domain: string, options?: DomainOptions);
+  constructor(domain: string);
   domain: string;
 
   // 2. handlers
@@ -71,6 +80,8 @@ export declare class AtelierDomain {
   waitResult(messageId: string, options?: { timeout?: number }): Promise<MessageReceipt>;
   waitResults(messageIds: string[], options?: { timeout?: number }): Promise<MessageReceipt[]>;
   forgetResult(messageId: string): boolean;
+  /** 本地传输计数；不代表内核状态。 */
+  stats(): TransportStats;
 
   // 6. receipts
   reportReceipt(messageId: string, target: string, status: string, data?: Json): void;

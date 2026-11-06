@@ -167,6 +167,22 @@ impl LogStore {
             conn_writer.execute_batch("ALTER TABLE hub_logs ADD COLUMN source_domain TEXT;")?;
         }
 
+        // 历史数据规范化：level 统一为大写。早期业务域日志按 SDK 原样写入小写（info/warn/error），
+        // 而查询与内核自身日志都以大写为规范形式；不统一会导致按级别筛选漏掉全部域日志。
+        let needs_level_migration: bool = conn_writer
+            .query_row(
+                "SELECT 1 FROM hub_logs WHERE level <> upper(level) LIMIT 1",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if needs_level_migration {
+            conn_writer.execute(
+                "UPDATE hub_logs SET level = upper(level) WHERE level <> upper(level)",
+                [],
+            )?;
+        }
+
         let spool = crate::services::logs::log_spool::LogSpool::open(db_path, &conn_writer)?;
         let (tx, rx) = mpsc::sync_channel::<()>(1); // Wakeups only; never stores log payloads.
         let stop = Arc::new(AtomicBool::new(false));
@@ -313,8 +329,24 @@ impl LogStore {
 
         if let Some(lvl) = level {
             if !lvl.is_empty() {
-                sql.push_str(" AND level = ?");
-                params_vec.push(Box::new(lvl.to_uppercase()));
+                // 写入侧保留原始大小写（SDK 通常写 info/warn/error），筛选必须大小写无关；
+                // 同时把 WARN 与 WARNING 视为同一级，与内核的级别权重表保持一致。
+                let normalized = lvl.trim().to_lowercase();
+                let aliases: Vec<String> = match normalized.as_str() {
+                    "warning" | "warn" => vec!["warn".into(), "warning".into()],
+                    other => vec![other.to_string()],
+                };
+                sql.push_str(" AND lower(level) IN (");
+                for index in 0..aliases.len() {
+                    if index > 0 {
+                        sql.push(',');
+                    }
+                    sql.push('?');
+                }
+                sql.push(')');
+                for alias in aliases {
+                    params_vec.push(Box::new(alias));
+                }
             }
         }
         if let Some(lyr) = layer {
@@ -441,6 +473,16 @@ pub struct KernelLogHub {
     console_enabled: AtomicBool,
 }
 
+/// 级别以大写为规范形式：写入侧统一；查询侧仍保持大小写无关以兼容历史行。
+fn normalize_level(level: &str) -> String {
+    let trimmed = level.trim();
+    if trimmed.is_empty() {
+        "INFO".to_string()
+    } else {
+        trimmed.to_uppercase()
+    }
+}
+
 impl KernelLogHub {
     pub fn new(db_path: Option<&Path>) -> Result<Self, StorageError> {
         let store = Arc::new(LogStore::new(db_path)?);
@@ -471,6 +513,8 @@ impl KernelLogHub {
     /// Core relay entry point: reinjects a structured log record from remote child domains or internal kernel subsystems.
     /// Preserves complete field fidelity (level, layer, component, phase, key, frac, waiting, done).
     pub fn reinject(&self, mut record: LogRecord) {
+        // level 的规范形式是大写（与内核自身日志、查询筛选、控制台着色一致）。
+        record.level = normalize_level(&record.level);
         if record.source_domain.is_none() {
             record.source_domain = Some("kernel".to_string());
         }

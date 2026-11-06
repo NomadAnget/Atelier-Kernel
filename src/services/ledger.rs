@@ -153,6 +153,8 @@ struct Binding {
     origin: u64,
     channel: Option<String>,
     persistence_failed: bool,
+    /// 该 id 已提交终态。写入时标记，代际退役据此清理，不需要回查历史。
+    terminal: bool,
 }
 
 pub struct KernelLedger {
@@ -518,10 +520,8 @@ impl KernelLedger {
         };
         let mut to_remove = HashSet::new();
         for (id, bind) in snapshot {
-            let terminal = self
-                .record_for_message(&id)
-                .is_some_and(|r| r.status.is_terminal());
-            if bind.persistence_failed || terminal {
+            // 终态标记在提交时写好，退役时零回查。
+            if bind.persistence_failed || bind.terminal {
                 to_remove.insert(id);
             }
         }
@@ -615,11 +615,13 @@ impl KernelLedger {
             created_at: now,
             updated_at: now,
         };
-        self.bindings
-            .lock()
-            .entry(id.to_string())
-            .or_default()
-            .logical_id = r.logical_id.clone();
+        {
+            let mut b = self.bindings.lock();
+            let binding = b.entry(id.to_string()).or_default();
+            binding.logical_id = r.logical_id.clone();
+            // 入口即终态时在这里就打上标记，退役清理不必回查。
+            binding.terminal = r.status.is_terminal();
+        }
 
         if r.status.is_terminal() {
             // 入口即终态（TargetInvalid / ContractInvalid）：不建活跃行，只在盘上留历史。
@@ -783,10 +785,18 @@ impl KernelLedger {
             .lock()
             .advance(id, status, r.data.clone());
         if status.is_terminal() {
+            // 终态已提交：写入时就地打标记，代际退役时零回查（历史在盘上，不该为清理去翻它）。
+            self.mark_binding_terminal(id);
             // 独立账本使用（无路由器 origin 绑定）时，终态即回收活行身份。
             self.maybe_retire_binding(id);
         }
         r
+    }
+
+    fn mark_binding_terminal(&self, id: &str) {
+        if let Some(b) = self.bindings.lock().get_mut(id) {
+            b.terminal = true;
+        }
     }
 
     fn maybe_retire_binding(&self, id: &str) {

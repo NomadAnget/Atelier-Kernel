@@ -70,6 +70,15 @@ jobs:
           PYTHONPATH=sdk/python $PY_BIN sdk/python/tests/test_domain.py
           node --test sdk/nodejs/tests/domain.test.mjs
 
+      # 类型门禁：把 index.d.ts 当真实包用一遍，能抓到文本比对发现不了的
+      # 缺失声明、错误重载（例如 send 对字符串/数组的返回类型）。
+      - name: Check Node SDK Types
+        if: runner.os == 'Linux'
+        run: |
+          npm install --no-save --no-audit --no-fund typescript@5
+          npx tsc --noEmit --strict --target es2020 --module commonjs \
+            --moduleResolution node --skipLibCheck sdk/nodejs/tests/types.consumer.ts
+
   build-sdk-packages:
     needs: [ci-test]
     name: Build Domain SDKs (Python Wheel & Node.js NPM)

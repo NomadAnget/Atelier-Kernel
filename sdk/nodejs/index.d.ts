@@ -64,7 +64,9 @@ export declare class AtelierDomain {
   handler(name: string, fn: Handler, description?: string): this;
 
   // 3/4/5. messages
-  send(targets: string | string[], messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<string | string[]>;
+  /** 字符串目标返回单个 id，数组目标返回有序 id 列表。 */
+  send(target: string, messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<string>;
+  send(targets: string[], messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<string[]>;
   request(target: string, messageType: string, params?: Json, data?: Json, options?: { timeout?: number }): Promise<MessageReceipt>;
   waitResult(messageId: string, options?: { timeout?: number }): Promise<MessageReceipt>;
   waitResults(messageIds: string[], options?: { timeout?: number }): Promise<MessageReceipt[]>;

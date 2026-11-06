@@ -12,3 +12,4 @@ __pycache__/
 /sdk/python/build/
 /sdk/python/dist/
 /sdk/nodejs/*.tgz
+node_modules/

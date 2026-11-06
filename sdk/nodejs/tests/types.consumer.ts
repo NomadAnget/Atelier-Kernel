@@ -3,7 +3,13 @@
 import { AtelierDomain, DomainRequestError } from "../index";
 
 async function main(): Promise<void> {
-  const domain = new AtelierDomain("order", { maxPending: 512, resultTtlMs: 10_000 });
+  // SDK 没有策略开关：构造只接收域名。
+  const domain = new AtelierDomain("order");
+  const transport = domain.stats();
+  const pending: number = transport.pending;
+  const closed: boolean = transport.transport_closed;
+  void pending;
+  void closed;
 
   // 2. 注册处理器
   domain.handler("create", async (msg) => ({ ok: true, got: msg.data }), "创建订单");

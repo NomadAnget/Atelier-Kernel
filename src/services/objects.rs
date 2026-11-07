@@ -85,7 +85,6 @@ pub enum DeleteOutcome {
 pub struct ObjectHub {
     objects: BTreeMap<String, Object>,
     by_path: BTreeMap<(String, String), String>,
-    next_id: u64,
     root: PathBuf,
     staging_root: PathBuf,
     db: Option<Arc<Mutex<Connection>>>,
@@ -156,7 +155,6 @@ impl ObjectHub {
         ObjectHub {
             objects: BTreeMap::new(),
             by_path: BTreeMap::new(),
-            next_id: 1,
             root: project_root,
             staging_root,
             db: None,
@@ -197,7 +195,6 @@ impl ObjectHub {
         let mut hub = ObjectHub {
             objects: BTreeMap::new(),
             by_path: BTreeMap::new(),
-            next_id: 1,
             root: project_root,
             staging_root,
             db: Some(db.clone()),
@@ -223,9 +220,6 @@ impl ObjectHub {
             .collect::<Result<Vec<_>, _>>()?
         };
         for obj in rows {
-            if let Some(n) = obj.object_id.strip_prefix("obj_").and_then(|s| s.parse::<u64>().ok()) {
-                hub.next_id = hub.next_id.max(n + 1);
-            }
             hub.by_path.insert(
                 (obj.owner.clone(), obj.virtual_path.clone()),
                 obj.object_id.clone(),
@@ -235,10 +229,9 @@ impl ObjectHub {
         Ok(hub)
     }
 
+    /// 物理文件名 = 内核分配的唯一 id（UUID 简单形式，32 位十六进制）。
     fn alloc_id(&mut self) -> String {
-        let object_id = format!("obj_{}", self.next_id);
-        self.next_id += 1;
-        object_id
+        uuid::Uuid::new_v4().simple().to_string()
     }
 
     fn physical_for(&self, owner: &str, object_id: &str) -> PathBuf {

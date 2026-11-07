@@ -115,8 +115,11 @@ fn logical_path_is_the_only_address_and_ids_stay_inside_the_kernel() {
         "physical file lives flat under the owner root: {physical}"
     );
     assert!(
-        physical_path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("obj_")),
-        "physical file is named by the internal id: {physical}"
+        physical_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.len() == 32 && n.chars().all(|c| c.is_ascii_hexdigit())),
+        "physical file is named by the uuid object id: {physical}"
     );
 
     // 跨域按逻辑路径读取（带 owner）

@@ -150,24 +150,35 @@ class C4AndObservabilityTest(unittest.IsolatedAsyncioTestCase):
         return frame
 
     async def test_put_object_routes(self):
+        self.domain._staging_files["evidence/x"] = "/tmp/staging/evidence/x.part"
         frame = await self._capture(self.domain.put_object("evidence/x"))
         self.assertEqual(frame["targets"], ["kernel.storage"])
         self.assertEqual(frame["message_type"], "StorageObjectPut")
-        self.assertEqual(frame["params"], {"virtual_path": "evidence/x"})
+        self.assertEqual(frame["params"]["virtual_path"], "evidence/x")
+        self.assertEqual(frame["params"]["staging_path"], "/tmp/staging/evidence/x.part")
 
     async def test_get_object_routes(self):
         frame = await self._capture(self.domain.get_object("abc"))
         self.assertEqual(frame["message_type"], "StorageObjectGet")
-        self.assertEqual(frame["params"], {"object_id": "abc"})
+        self.assertEqual(frame["params"], {"virtual_path": "abc"})
+
+    async def test_get_object_cross_domain_routes(self):
+        frame = await self._capture(self.domain.get_object("abc", "other"))
+        self.assertEqual(frame["params"], {"virtual_path": "abc", "owner": "other"})
 
     async def test_delete_object_routes(self):
         frame = await self._capture(self.domain.delete_object("abc"))
         self.assertEqual(frame["message_type"], "StorageObjectDelete")
-        self.assertEqual(frame["params"], {"object_id": "abc"})
+        self.assertEqual(frame["params"], {"virtual_path": "abc"})
 
-    async def test_refresh_file_index_routes(self):
-        frame = await self._capture(self.domain.refresh_file_index())
+    async def test_list_objects_routes(self):
+        frame = await self._capture(self.domain.list_objects())
         self.assertEqual(frame["message_type"], "StorageObjectList")
+        self.assertEqual(frame["params"], {})
+
+    async def test_list_objects_cross_domain_routes(self):
+        frame = await self._capture(self.domain.list_objects("other"))
+        self.assertEqual(frame["params"], {"owner": "other"})
 
     def test_events_are_dispatched_to_callbacks(self):
         seen = []

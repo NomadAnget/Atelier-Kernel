@@ -140,18 +140,20 @@ test("notify routes to kernel.notify", async () => {
 });
 
 // ── 编解码 ────────────────────────────────────────────────────────────
-test("_encodeFiles turns a tracked handle into an object reference", () => {
+test("_encodeFiles turns a tracked handle into a logical-path reference", () => {
   const domain = makeDomain();
-  const handle = { read() {}, path: "" };
-  domain._handles.set(handle, "obj-1");
-  assert.deepEqual(domain._encodeFiles({ f: handle }), { f: { __atelier_file__: "obj-1" } });
+  const handle = { read() {}, virtual_path: "a/b.bin", owner: "v2node" };
+  assert.deepEqual(domain._encodeFiles({ f: handle }), {
+    f: { __atelier_file__: { owner: "v2node", virtual_path: "a/b.bin" } },
+  });
 });
 
 test("_encodeFiles recurses into arrays and objects", () => {
   const domain = makeDomain();
-  const handle = { read() {}, path: "" };
-  domain._handles.set(handle, "obj-2");
-  assert.deepEqual(domain._encodeFiles({ a: [handle] }), { a: [{ __atelier_file__: "obj-2" }] });
+  const handle = { read() {}, virtual_path: "a/c.bin", owner: "v2node" };
+  assert.deepEqual(domain._encodeFiles({ a: [handle] }), {
+    a: [{ __atelier_file__: { owner: "v2node", virtual_path: "a/c.bin" } }],
+  });
 });
 
 test("_decodeFiles leaves non-references untouched", async () => {
@@ -160,26 +162,47 @@ test("_decodeFiles leaves non-references untouched", async () => {
 });
 
 // ── C4 CRUD / 事件 / 日志 / 端口 ──────────────────────────────────────
-test("putObject routes to kernel.storage", async () => {
+test("putObject adopts the staged file", async () => {
   const domain = makeDomain();
+  domain._stagingFiles.set("evidence/x", "/tmp/staging/evidence/x.part");
   const frame = await capture(domain, domain.putObject("evidence/x"));
   assert.equal(frame.targets[0], "kernel.storage");
   assert.equal(frame.message_type, "StorageObjectPut");
-  assert.deepEqual(frame.params, { virtual_path: "evidence/x" });
+  assert.equal(frame.params.virtual_path, "evidence/x");
+  assert.equal(frame.params.staging_path, "/tmp/staging/evidence/x.part");
 });
 
-test("getObject routes to kernel.storage", async () => {
+test("getObject routes by logical path", async () => {
   const domain = makeDomain();
   const frame = await capture(domain, domain.getObject("abc"));
   assert.equal(frame.message_type, "StorageObjectGet");
-  assert.deepEqual(frame.params, { object_id: "abc" });
+  assert.deepEqual(frame.params, { virtual_path: "abc" });
 });
 
-test("deleteObject routes to kernel.storage", async () => {
+test("getObject cross-domain passes owner", async () => {
+  const domain = makeDomain();
+  const frame = await capture(domain, domain.getObject("abc", "other"));
+  assert.deepEqual(frame.params, { virtual_path: "abc", owner: "other" });
+});
+
+test("deleteObject routes by logical path", async () => {
   const domain = makeDomain();
   const frame = await capture(domain, domain.deleteObject("abc"));
   assert.equal(frame.message_type, "StorageObjectDelete");
-  assert.deepEqual(frame.params, { object_id: "abc" });
+  assert.deepEqual(frame.params, { virtual_path: "abc" });
+});
+
+test("listObjects routes to kernel.storage", async () => {
+  const domain = makeDomain();
+  const frame = await capture(domain, domain.listObjects());
+  assert.equal(frame.message_type, "StorageObjectList");
+  assert.deepEqual(frame.params, {});
+});
+
+test("listObjects cross-domain passes owner", async () => {
+  const domain = makeDomain();
+  const frame = await capture(domain, domain.listObjects("other"));
+  assert.deepEqual(frame.params, { owner: "other" });
 });
 
 test("events dispatch to callbacks", () => {

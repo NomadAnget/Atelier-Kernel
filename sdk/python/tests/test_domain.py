@@ -283,3 +283,52 @@ class TransportFailureTest(unittest.IsolatedAsyncioTestCase):
         domain = make_fake()
         domain._receive_result({"message_id": "m-x", "target": "t.h", "status": "completed", "seq": 999})
         self.assertEqual(domain.stats()["unmatched_receipts"], 1)
+
+
+class FileHandleLogicalPathTest(unittest.TestCase):
+    """C4：解码出来的原生文件句柄必须同时携带 object_id 与逻辑路径（物理名无扩展名）。"""
+
+    def test_decoded_handle_carries_object_id_and_virtual_path(self):
+        import os
+        import tempfile
+
+        descriptor, path = tempfile.mkstemp(suffix=".bin")
+        os.close(descriptor)
+        domain = FakeDomain()
+
+        async def fake_get(object_id):
+            return {
+                "object_id": object_id,
+                "physical_path": path,
+                "virtual_path": "vfs://jobs/j/final.mp4",
+                "size": os.path.getsize(path),
+            }
+
+        domain.get_object = fake_get
+        handle = asyncio.run(domain._decode_files({"__atelier_file__": "obj_1"}))
+        try:
+            self.assertEqual(handle.object_id, "obj_1")
+            self.assertEqual(handle.virtual_path, "vfs://jobs/j/final.mp4")
+            self.assertEqual(handle.name, path)
+        finally:
+            handle.close()
+            os.unlink(path)
+
+    def test_handle_without_virtual_path_stays_readable(self):
+        import os
+        import tempfile
+
+        descriptor, path = tempfile.mkstemp(suffix=".bin")
+        os.close(descriptor)
+        domain = FakeDomain()
+
+        async def fake_get(object_id):
+            return {"object_id": object_id, "physical_path": path}
+
+        domain.get_object = fake_get
+        handle = asyncio.run(domain._decode_files({"__atelier_file__": "obj_2"}))
+        try:
+            self.assertIsNone(handle.virtual_path)
+        finally:
+            handle.close()
+            os.unlink(path)

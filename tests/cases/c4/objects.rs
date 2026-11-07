@@ -1,7 +1,7 @@
 //! C4 存储枢纽虚拟文件索引的端到端验证（宪法 C4）。
 //!
 //! 域按自己的虚拟路径操作；内核把它映射成唯一 id + 平铺物理文件。消息里只带唯一 id。
-//! 跨域只读；删除权随域；物理文件不存在时使用前自愈清理失效索引。
+//! 跨域可读、可写、可查询、可删除；创建只发生在归属域自己的命名空间；删除对象 = 删索引 + 删物理文件。
 
 use atelier_kernel::{
     AtelierKernel, ContractStatus as S, DomainPipeClient, KernelToDomainFrame as F,
@@ -79,27 +79,19 @@ fn virtual_path_maps_to_flat_unique_id_and_cross_domain_reads() {
     assert_eq!(d["size"].as_u64().unwrap(), bytes.len() as u64);
     assert_eq!(d["physical_path"].as_str().unwrap(), physical);
 
-    // 4. 非归属域不能删（M3 写权随域）
+    // 4. 跨域删除允许，且删除对象 = 删除物理文件
     rogue.send(
         vec!["kernel.storage".into()],
         MSG_STORAGE_OBJECT_DELETE,
         json!({"object_id": object_id}),
         json!({}),
     );
-    let forbidden = terminal(rogue.drain_frames());
-    assert_eq!(forbidden.status, S::ExecutionFailed);
-    assert_eq!(forbidden.data.unwrap()["error"], "cross_domain_delete_forbidden");
+    let deleted = terminal(rogue.drain_frames());
+    assert_eq!(deleted.status, S::Completed, "cross delete failed: {:?}", deleted.data);
+    assert_eq!(deleted.data.unwrap()["deleted"], true);
+    assert!(!std::path::Path::new(&physical).exists(), "physical file must be removed");
 
-    // 5. 归属域删索引
-    producer.send(
-        vec!["kernel.storage".into()],
-        MSG_STORAGE_OBJECT_DELETE,
-        json!({"object_id": object_id}),
-        json!({}),
-    );
-    assert_eq!(terminal(producer.drain_frames()).status, S::Completed);
-
-    // 6. 删后按 id 解析 → not_found
+    // 5. 删后按 id 解析 → not_found
     consumer.send(
         vec!["kernel.storage".into()],
         MSG_STORAGE_OBJECT_GET,
@@ -109,6 +101,17 @@ fn virtual_path_maps_to_flat_unique_id_and_cross_domain_reads() {
     let gone = terminal(consumer.drain_frames());
     assert_eq!(gone.status, S::ExecutionFailed);
     assert_eq!(gone.data.unwrap()["error"], "object_not_found");
+
+    // 6. 再删一次幂等：Completed + deleted=false
+    producer.send(
+        vec!["kernel.storage".into()],
+        MSG_STORAGE_OBJECT_DELETE,
+        json!({"object_id": object_id}),
+        json!({}),
+    );
+    let again = terminal(producer.drain_frames());
+    assert_eq!(again.status, S::Completed);
+    assert_eq!(again.data.unwrap()["deleted"], false);
 }
 
 #[test]

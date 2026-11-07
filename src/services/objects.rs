@@ -5,11 +5,12 @@
 //!   - 物理落盘：**平铺的唯一 id 文件** `<project_root>/<domain>/<object_id>`，无子目录。
 //!   - 业务域的目录结构（如 `users/avatars/a.png`）是**虚拟**的，只存在于本索引：
 //!     `(owner, virtual_path) → object_id → physical_path`。
-//!   - 内核不复制、不移动、不读取文件内容；`size` 由调用方在 `commit` 时给出。
-//!   - 使用前自愈：物理文件不存在时清掉失效索引行。
+//!   - **创建**只发生在归属域自己的命名空间；读取、写入（更新已有对象）、查询、删除都可跨域。
+//!   - **删除对象 = 删除索引行 + 删除物理文件**（幂等；文件已不存在也算删除成功）。
+//!   - `size` 由调用方在创建/更新时给出；内核不读文件、不做隐式自愈。
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -32,7 +33,6 @@ pub struct Object {
     /// 平铺的唯一 id 物理文件绝对路径。
     pub physical_path: String,
     pub size: u64,
-    pub ref_count: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +46,9 @@ pub struct ObjectRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteOutcome {
     Deleted,
-    Forbidden,  // 非归属域
-    Referenced, // 引用未清零
     Unknown,
+    /// 索引还在、物理文件删不掉（权限/句柄占用）；索引保留，调用方可重试。
+    UnlinkFailed(String),
 }
 
 pub struct ObjectHub {
@@ -83,7 +83,7 @@ impl ObjectHub {
         let rows = {
             let guard = db.lock();
             let mut stmt = guard.prepare(
-                "SELECT object_id,owner,virtual_path,physical_path,size,ref_count FROM objects ORDER BY rowid",
+                "SELECT object_id,owner,virtual_path,physical_path,size FROM objects ORDER BY rowid",
             )?;
             stmt.query_map([], |r| {
                 Ok((
@@ -92,12 +92,11 @@ impl ObjectHub {
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, i64>(4)? as u64,
-                    r.get::<_, i64>(5)? as u64,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?
         };
-        for (object_id, owner, virtual_path, physical_path, size, ref_count) in rows {
+        for (object_id, owner, virtual_path, physical_path, size) in rows {
             if let Some(n) = object_id.strip_prefix("obj_").and_then(|s| s.parse::<u64>().ok()) {
                 hub.next_id = hub.next_id.max(n + 1);
             }
@@ -105,7 +104,7 @@ impl ObjectHub {
                 .insert((owner.clone(), virtual_path.clone()), object_id.clone());
             hub.objects.insert(
                 object_id.clone(),
-                Object { object_id, owner, virtual_path, physical_path, size, ref_count },
+                Object { object_id, owner, virtual_path, physical_path, size },
             );
         }
         Ok(hub)
@@ -121,9 +120,9 @@ impl ObjectHub {
         self.root.join(owner).join(object_id)
     }
 
-    /// 为一个虚拟路径分配唯一 id（幂等：同一 owner+virtual_path 复用原 id）。
+    /// 在**归属域自己的命名空间**创建对象（幂等：同一 owner+virtual_path 复用原 id）。
     /// 不创建文件本身，只创建域目录；返回物理路径供调用方写入。
-    pub fn allocate(&mut self, owner: &str, virtual_path: &str) -> Result<ObjectRef, String> {
+    pub fn create(&mut self, owner: &str, virtual_path: &str) -> Result<ObjectRef, String> {
         if let Some(id) = self
             .by_path
             .get(&(owner.to_string(), virtual_path.to_string()))
@@ -149,7 +148,6 @@ impl ObjectHub {
             virtual_path: virtual_path.to_string(),
             physical_path: physical.to_string_lossy().to_string(),
             size: 0,
-            ref_count: 0,
         };
         self.objects.insert(object_id.clone(), obj.clone());
         self.by_path
@@ -157,24 +155,26 @@ impl ObjectHub {
         if let Some(db) = &self.db {
             db.lock()
                 .execute(
-                    "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,0,?6)",
                     params![
                         obj.object_id, obj.owner, obj.virtual_path, obj.physical_path,
-                        obj.size as i64, obj.ref_count as i64, crate::core::protocol::now_millis()
+                        obj.size as i64, crate::core::protocol::now_millis()
                     ],
                 )
                 .map_err(|e| e.to_string())?;
         }
         Ok(ObjectRef {
             object_id,
-            virtual_path: virtual_path.to_string(),
+            virtual_path: obj.virtual_path,
             physical_path: obj.physical_path,
             size: 0,
         })
     }
 
-    /// 方案 A：SDK 已写入平铺文件、自带全局唯一 object_id，这里只登记映射。
-    /// 同一 virtual_path 已存在时复用原 id（覆盖语义，更新 size）。
+    /// 登记调用方已经写好的平铺文件（SDK 生成唯一 id）。
+    ///
+    /// 同一 `(owner, virtual_path)` 再次登记：**替换**为本次的 object_id 与物理文件，
+    /// 旧物理文件删除。这样域重启后重写同一虚拟路径不会留下指向旧文件的索引。
     pub fn register_external(
         &mut self,
         owner: &str,
@@ -187,21 +187,28 @@ impl ObjectHub {
             .get(&(owner.to_string(), virtual_path.to_string()))
             .cloned()
         {
-            if let Some(obj) = self.objects.get_mut(&existing) {
-                obj.size = size;
-                if let Some(db) = &self.db {
-                    let _ = db.lock().execute(
-                        "UPDATE objects SET size=?1 WHERE object_id=?2",
-                        params![size as i64, existing],
-                    );
+            if existing == object_id {
+                if let Some(obj) = self.objects.get_mut(object_id) {
+                    obj.size = size;
+                    if let Some(db) = &self.db {
+                        let _ = db.lock().execute(
+                            "UPDATE objects SET size=?1 WHERE object_id=?2",
+                            params![size as i64, object_id],
+                        );
+                    }
+                    return Ok(ObjectRef {
+                        object_id: obj.object_id.clone(),
+                        virtual_path: obj.virtual_path.clone(),
+                        physical_path: obj.physical_path.clone(),
+                        size,
+                    });
                 }
-                return Ok(ObjectRef {
-                    object_id: obj.object_id.clone(),
-                    virtual_path: obj.virtual_path.clone(),
-                    physical_path: obj.physical_path.clone(),
-                    size,
-                });
             }
+            // 覆盖写：旧文件与旧索引一起换掉。
+            if let Some(old) = self.objects.get(&existing) {
+                let _ = std::fs::remove_file(&old.physical_path);
+            }
+            self.remove(&existing);
         }
         let physical = self.physical_for(owner, object_id);
         if let Some(parent) = physical.parent() {
@@ -213,7 +220,6 @@ impl ObjectHub {
             virtual_path: virtual_path.to_string(),
             physical_path: physical.to_string_lossy().to_string(),
             size,
-            ref_count: 0,
         };
         self.objects.insert(object_id.to_string(), obj.clone());
         self.by_path
@@ -221,10 +227,10 @@ impl ObjectHub {
         if let Some(db) = &self.db {
             db.lock()
                 .execute(
-                    "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                    "INSERT INTO objects(object_id,owner,virtual_path,physical_path,size,ref_count,created_at) VALUES(?1,?2,?3,?4,?5,0,?6)",
                     params![
                         obj.object_id, obj.owner, obj.virtual_path, obj.physical_path,
-                        obj.size as i64, obj.ref_count as i64, crate::core::protocol::now_millis()
+                        obj.size as i64, crate::core::protocol::now_millis()
                     ],
                 )
                 .map_err(|e| e.to_string())?;
@@ -237,7 +243,7 @@ impl ObjectHub {
         })
     }
 
-    /// 列出某域的全部对象（SDK 启动时拉一次做本地缓存）。
+    /// 列出某个域的全部对象（跨域查询允许）。
     pub fn list_owner(&self, owner: &str) -> Vec<Object> {
         self.objects
             .values()
@@ -246,7 +252,7 @@ impl ObjectHub {
             .collect()
     }
 
-    /// 写入完成后登记实际大小。
+    /// 更新已有对象的大小（跨域写入允许；对象必须存在）。
     pub fn commit(&mut self, object_id: &str, size: u64) -> Result<(), String> {
         let Some(obj) = self.objects.get_mut(object_id) else {
             return Err(format!("unknown object '{object_id}'"));
@@ -263,7 +269,7 @@ impl ObjectHub {
         Ok(())
     }
 
-    /// 按归属域 + 虚拟路径解析（域自己的读路径）。
+    /// 按归属域 + 虚拟路径解析。
     pub fn resolve_path(&mut self, owner: &str, virtual_path: &str) -> Option<Object> {
         let id = self
             .by_path
@@ -272,72 +278,45 @@ impl ObjectHub {
         self.resolve(&id)
     }
 
-    /// 按唯一 id 解析（跨域只读）。
-    /// 使用前自愈 + 由内核按 `metadata` 取 size（内核拥有物理文件）。
+    /// 按唯一 id 解析（跨域读取允许）。
+    ///
+    /// 文件存在时用 metadata 刷新 size（只读元数据，不读内容）；文件缺失时返回 `None`，
+    /// **不删除索引行**——清理必须走显式 `delete`。
     pub fn resolve(&mut self, object_id: &str) -> Option<Object> {
-        let path = Path::new(&self.objects.get(object_id)?.physical_path).to_path_buf();
-        if !path.exists() {
-            self.remove(object_id);
-            return None;
-        }
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if let Some(obj) = self.objects.get_mut(object_id) {
-                obj.size = meta.len();
+        let obj = self.objects.get(object_id)?.clone();
+        if let Ok(meta) = std::fs::metadata(&obj.physical_path) {
+            if meta.len() != obj.size {
+                if let Some(current) = self.objects.get_mut(object_id) {
+                    current.size = meta.len();
+                }
+                if let Some(db) = &self.db {
+                    let _ = db.lock().execute(
+                        "UPDATE objects SET size=?1 WHERE object_id=?2",
+                        params![meta.len() as i64, object_id],
+                    );
+                }
             }
+            return self.objects.get(object_id).cloned();
         }
-        self.objects.get(object_id).cloned()
+        None
     }
 
-    /// 取引用：ref_count +1。
-    pub fn acquire(&mut self, object_id: &str) -> bool {
-        let ok = match self.objects.get_mut(object_id) {
-            Some(o) => {
-                o.ref_count += 1;
-                true
-            }
-            None => false,
+    /// 删除对象：删物理文件 + 删索引行；跨域允许，幂等。
+    pub fn delete(&mut self, object_id: &str) -> DeleteOutcome {
+        let Some(obj) = self.objects.get(object_id).cloned() else {
+            return DeleteOutcome::Unknown;
         };
-        if ok && self.db.is_some() {
-            let _ = self.db.as_ref().unwrap().lock().execute(
-                "UPDATE objects SET ref_count=ref_count+1 WHERE object_id=?1",
-                [object_id],
-            );
+        let physical = std::path::Path::new(&obj.physical_path);
+        match std::fs::remove_file(physical) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return DeleteOutcome::UnlinkFailed(e.to_string()),
         }
-        ok
+        self.remove(object_id);
+        DeleteOutcome::Deleted
     }
 
-    /// 放引用：ref_count -1（不减到负）。
-    pub fn release(&mut self, object_id: &str) -> bool {
-        let ok = match self.objects.get_mut(object_id) {
-            Some(o) if o.ref_count > 0 => {
-                o.ref_count -= 1;
-                true
-            }
-            _ => false,
-        };
-        if ok && self.db.is_some() {
-            let _ = self.db.as_ref().unwrap().lock().execute(
-                "UPDATE objects SET ref_count=max(0,ref_count-1) WHERE object_id=?1",
-                [object_id],
-            );
-        }
-        ok
-    }
-
-    /// 显式删除：只有归属域能删；引用未清零不得删。只移除索引行。
-    pub fn delete(&mut self, object_id: &str, by_domain: &str) -> DeleteOutcome {
-        match self.objects.get(object_id) {
-            None => DeleteOutcome::Unknown,
-            Some(o) if o.owner != by_domain => DeleteOutcome::Forbidden,
-            Some(o) if o.ref_count > 0 => DeleteOutcome::Referenced,
-            Some(_) => {
-                self.remove(object_id);
-                DeleteOutcome::Deleted
-            }
-        }
-    }
-
-    /// 按虚拟路径删除（归属域）。
+    /// 按虚拟路径删除（需给出归属域；默认调用域由 router 决定）。
     pub fn delete_path(&mut self, owner: &str, virtual_path: &str) -> DeleteOutcome {
         let Some(id) = self
             .by_path
@@ -346,7 +325,7 @@ impl ObjectHub {
         else {
             return DeleteOutcome::Unknown;
         };
-        self.delete(&id, owner)
+        self.delete(&id)
     }
 
     fn remove(&mut self, object_id: &str) {
@@ -374,19 +353,17 @@ mod tests {
     }
 
     #[test]
-    fn allocate_maps_virtual_path_to_flat_unique_file() {
-        let root = temp_root("alloc");
+    fn create_maps_virtual_path_to_flat_unique_file() {
+        let root = temp_root("create");
         let mut hub = ObjectHub::new(root.clone());
-        let r = hub.allocate("engines", "users/avatars/a.png").unwrap();
+        let r = hub.create("engines", "users/avatars/a.png").unwrap();
         assert!(r.object_id.starts_with("obj_"));
-        // 物理路径平铺在域根下，文件名就是唯一 id，没有子目录
         assert_eq!(
-            Path::new(&r.physical_path),
+            std::path::Path::new(&r.physical_path),
             root.join("engines").join(&r.object_id)
         );
         assert_eq!(r.virtual_path, "users/avatars/a.png");
-        // 幂等：同一虚拟路径复用同一 id
-        let again = hub.allocate("engines", "users/avatars/a.png").unwrap();
+        let again = hub.create("engines", "users/avatars/a.png").unwrap();
         assert_eq!(again.object_id, r.object_id);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -395,45 +372,57 @@ mod tests {
     fn resolve_path_and_cross_domain_resolve() {
         let root = temp_root("resolve");
         let mut hub = ObjectHub::new(root.clone());
-        let r = hub.allocate("engines", "out/video.bin").unwrap();
-        // 域自己写入物理文件
+        let r = hub.create("engines", "out/video.bin").unwrap();
         std::fs::write(&r.physical_path, b"binary").unwrap();
         hub.commit(&r.object_id, 6).unwrap();
 
         let by_path = hub.resolve_path("engines", "out/video.bin").unwrap();
         assert_eq!(by_path.object_id, r.object_id);
         assert_eq!(by_path.size, 6);
-        // 跨域按 id 只读解析
         let cross = hub.resolve(&r.object_id).unwrap();
         assert_eq!(cross.owner, "engines");
-        // 其他域的虚拟路径查不到（命名空间隔离）
         assert!(hub.resolve_path("other", "out/video.bin").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn resolve_self_heals_rows_whose_file_is_gone() {
-        let root = temp_root("stale");
+    fn delete_removes_the_physical_file_and_allows_cross_domain() {
+        let root = temp_root("delete");
         let mut hub = ObjectHub::new(root.clone());
-        let r = hub.allocate("engines", "a.bin").unwrap();
+        let r = hub.create("engines", "a.bin").unwrap();
         std::fs::write(&r.physical_path, b"x").unwrap();
-        assert!(hub.resolve(&r.object_id).is_some());
-        std::fs::remove_file(&r.physical_path).unwrap();
-        assert!(hub.resolve(&r.object_id).is_none(), "stale row cleaned");
-        assert!(hub.resolve_path("engines", "a.bin").is_none());
+        assert_eq!(hub.delete(&r.object_id), DeleteOutcome::Deleted);
+        assert!(!std::path::Path::new(&r.physical_path).exists(), "physical file must be removed");
+        assert!(hub.resolve(&r.object_id).is_none());
+        // 幂等：再删一次是 Unknown，不报错
+        assert_eq!(hub.delete(&r.object_id), DeleteOutcome::Unknown);
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
-    fn delete_is_index_only_and_write_isolated() {
-        let root = temp_root("delete");
+    fn registering_the_same_path_replaces_the_old_file() {
+        let root = temp_root("replace");
         let mut hub = ObjectHub::new(root.clone());
-        let r = hub.allocate("engines", "a.bin").unwrap();
-        std::fs::write(&r.physical_path, b"x").unwrap();
-        assert_eq!(hub.delete(&r.object_id, "publishers"), DeleteOutcome::Forbidden);
-        assert_eq!(hub.delete(&r.object_id, "engines"), DeleteOutcome::Deleted);
-        // 物理文件仍在（内核不删域文件）
-        assert!(Path::new(&r.physical_path).exists());
+        let first = hub.register_external("engines", "a.bin", "u1", 1).unwrap();
+        std::fs::write(&first.physical_path, b"old").unwrap();
+        let second = hub.register_external("engines", "a.bin", "u2", 3).unwrap();
+        assert_eq!(second.object_id, "u2");
+        assert_ne!(second.physical_path, first.physical_path);
+        assert!(!std::path::Path::new(&first.physical_path).exists(), "stale file must be removed");
+        std::fs::write(&second.physical_path, b"new").unwrap();
+        let resolved = hub.resolve_path("engines", "a.bin").unwrap();
+        assert_eq!(resolved.object_id, "u2");
+        assert_eq!(resolved.size, 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deleting_a_missing_file_still_drops_the_index() {
+        let root = temp_root("gone");
+        let mut hub = ObjectHub::new(root.clone());
+        let r = hub.create("engines", "a.bin").unwrap();
+        assert_eq!(hub.delete(&r.object_id), DeleteOutcome::Deleted);
+        assert!(hub.resolve_path("engines", "a.bin").is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -444,7 +433,7 @@ mod tests {
         let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
         let (object_id, physical) = {
             let mut hub = ObjectHub::with_db(root.clone(), db.clone()).unwrap();
-            let r = hub.allocate("engines", "a/b.bin").unwrap();
+            let r = hub.create("engines", "a/b.bin").unwrap();
             std::fs::write(&r.physical_path, b"data").unwrap();
             hub.commit(&r.object_id, 4).unwrap();
             (r.object_id, r.physical_path)

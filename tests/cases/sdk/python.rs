@@ -24,6 +24,7 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 }
 
 const DOMAIN: &str = r#"
+import os
 from atelier_sdk import AtelierDomain
 
 domain = AtelierDomain("v2test")
@@ -133,6 +134,8 @@ async def c4_handler(msg):
         got = await domain.get_object(put["object_id"])
         stage = "delete"
         deleted = await domain.delete_object(put["object_id"])
+        stage = "verify"
+        removed = not os.path.exists(put["physical_path"])
     except Exception as error:  # noqa: BLE001
         return {"failed_stage": stage, "error": str(error), "detail": getattr(error, "data", None)}
     return {
@@ -140,7 +143,8 @@ async def c4_handler(msg):
         "physical_path": put["physical_path"],
         "got_matches": got.get("physical_path") == put["physical_path"],
         "size": got.get("size"),
-        "deleted": isinstance(deleted, dict),
+        "deleted": bool(isinstance(deleted, dict) and deleted.get("deleted")),
+        "physical_removed": removed,
     }
 
 @domain.handler("wait")
@@ -306,6 +310,7 @@ fn sdk_v2_round_trip() {
     assert_eq!(c4_data["got_matches"], true, "{c4_data}");
     assert_eq!(c4_data["size"], 10, "{c4_data}");
     assert_eq!(c4_data["deleted"], true, "{c4_data}");
+    assert_eq!(c4_data["physical_removed"], true, "delete must unlink the physical file: {c4_data}");
 
     verifier.send(vec!["v2test.wait".into()], "Wait", json!({}), json!({}));
     let waited = terminal(&verifier, Duration::from_secs(10));

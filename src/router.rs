@@ -1489,7 +1489,7 @@ impl KernelRouter {
                     let mut hub = self.object_hub.lock();
                     match external_id {
                         Some(id) => hub.register_external(source_domain, virtual_path, id, size),
-                        None => hub.allocate(source_domain, virtual_path),
+                        None => hub.create(source_domain, virtual_path),
                     }
                 };
                 match result {
@@ -1540,13 +1540,19 @@ impl KernelRouter {
             }
             MSG_STORAGE_OBJECT_GET => {
                 // 支持按 object_id（跨域只读）或 virtual_path（本域）解析。
+                // 按 object_id 跨域读取；按 virtual_path 读取时可用 owner 指定归属域（默认调用域）。
                 let object_id = msg.params.get("object_id").and_then(Value::as_str);
                 let virtual_path = msg.params.get("virtual_path").and_then(Value::as_str);
+                let owner = msg
+                    .params
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .unwrap_or(source_domain);
                 let resolved = {
                     let mut hub = self.object_hub.lock();
                     match (object_id, virtual_path) {
                         (Some(id), _) => hub.resolve(id),
-                        (None, Some(vp)) => hub.resolve_path(source_domain, vp),
+                        (None, Some(vp)) => hub.resolve_path(owner, vp),
                         (None, None) => None,
                     }
                 };
@@ -1572,13 +1578,19 @@ impl KernelRouter {
                 }
             }
             MSG_STORAGE_OBJECT_DELETE => {
+                // 跨域删除允许；删除对象 = 删除物理文件 + 索引行，幂等。
                 let object_id = msg.params.get("object_id").and_then(Value::as_str);
                 let virtual_path = msg.params.get("virtual_path").and_then(Value::as_str);
+                let owner = msg
+                    .params
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .unwrap_or(source_domain);
                 let outcome = {
                     let mut hub = self.object_hub.lock();
                     match (object_id, virtual_path) {
-                        (Some(id), _) => hub.delete(id, source_domain),
-                        (None, Some(vp)) => hub.delete_path(source_domain, vp),
+                        (Some(id), _) => hub.delete(id),
+                        (None, Some(vp)) => hub.delete_path(owner, vp),
                         (None, None) => DeleteOutcome::Unknown,
                     }
                 };
@@ -1592,28 +1604,27 @@ impl KernelRouter {
                     DeleteOutcome::Unknown => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
-                        ContractStatus::ExecutionFailed,
-                        Some(json!({"error": "object_not_found"})),
+                        ContractStatus::Completed,
+                        Some(json!({"deleted": false, "reason": "object_not_found"})),
                     ),
-                    DeleteOutcome::Forbidden => self.complete_kernel_internal_target(
+                    DeleteOutcome::UnlinkFailed(reason) => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
                         ContractStatus::ExecutionFailed,
-                        Some(json!({"error": "cross_domain_delete_forbidden"})),
-                    ),
-                    DeleteOutcome::Referenced => self.complete_kernel_internal_target(
-                        source_domain,
-                        msg,
-                        ContractStatus::ExecutionFailed,
-                        Some(json!({"error": "object_referenced"})),
+                        Some(json!({"error": "object_unlink_failed", "reason": reason})),
                     ),
                 }
             }
             MSG_STORAGE_OBJECT_LIST => {
+                let owner = msg
+                    .params
+                    .get("owner")
+                    .and_then(Value::as_str)
+                    .unwrap_or(source_domain);
                 let objects: Vec<_> = self
                     .object_hub
                     .lock()
-                    .list_owner(source_domain)
+                    .list_owner(owner)
                     .into_iter()
                     .map(|o| {
                         json!({

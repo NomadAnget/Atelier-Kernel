@@ -110,11 +110,14 @@ Python/Node 的现有调用保持不变。SDK **没有独立的入站并发配�
 
 The kernel storage hub indexes `(domain, virtual_path) → object_id → physical_path`. Physical files are flat unique-id files under `<project_root>/<domain>/<object_id>`; the domain's directory tree is virtual and lives in the kernel index.
 
+**Creation is owner-scoped; read, write (update), query and delete are allowed cross-domain.** Deleting an object removes the index row **and** the physical file (idempotent). There is no reference counting and no implicit self-healing.
+
 SDK file interception is **scoped to an explicit `vfs://` prefix** — nothing else is intercepted, so dependency libraries keep native file semantics:
 
 ```python
 domain.enable_file_interception()        # Python; root defaults to ATELIER_FILES_ROOT
-await domain.refresh_file_index()        # pull this domain's index into the local read cache
+await domain.list_objects()              # own index; list_objects("other") queries跨域
+await domain.commit_object(object_id, size)  # 更新已有对象（跨域允许）
 with open("vfs://users/a.png", "wb") as f:
     f.write(payload)
 object_id = domain.file_object_id("vfs://users/a.png")
@@ -167,7 +170,7 @@ Naming rules:
 | supervisor | `supervisor_start/stop/restart/update` | `supervisorStart/Stop/Restart/Update` |
 | subscribe | `subscribe_*` / `unsubscribe_*` | `subscribe*` / `unsubscribe*` |
 | notify | `notify` | `notify` |
-| C4 objects | `enable_file_interception` / `put_object` / `get_object` / `delete_object` / `file_object_id` / `refresh_file_index` | `enableFileInterception` / `putObject` / `getObject` / `deleteObject` / `fileObjectId` / `refreshFileIndex` |
+| C4 objects | `enable_file_interception` / `put_object` / `get_object` / `commit_object` / `delete_object` / `list_objects` / `file_object_id` / `refresh_file_index` | `enableFileInterception` / `putObject` / `getObject` / `commitObject` / `deleteObject` / `listObjects` / `fileObjectId` / `refreshFileIndex` |
 | ports | `bindings` | `bindings` |
 | logger | `logger` | `logger` |
 

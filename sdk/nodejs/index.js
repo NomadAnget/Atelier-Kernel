@@ -377,14 +377,23 @@ class AtelierDomain {
   async getObject(objectId) {
     return (await this.request("kernel.storage", "StorageObjectGet", { object_id: objectId })).data;
   }
+  async commitObject(objectId, size) {
+    return (await this.request("kernel.storage", "StorageObjectCommit", { object_id: objectId, size: Number(size) })).data;
+  }
+
   async deleteObject(objectId) {
+    // 删除对象 = 删物理文件 + 索引行；跨域允许、幂等。
     return (await this.request("kernel.storage", "StorageObjectDelete", { object_id: objectId })).data;
+  }
+
+  async listObjects(owner) {
+    return (await this.request("kernel.storage", "StorageObjectList", owner ? { owner } : {})).data;
   }
   fileObjectId(virtualPath) {
     return this._namespace ? this._namespace.objectId(virtualPath) : null;
   }
   async refreshFileIndex() {
-    return (await this.request("kernel.storage", "StorageObjectList", {})).data;
+    return this.listObjects();
   }
 
   // 能力 13 配套：消息里的文件句柄编解码（实例级，无全局状态）

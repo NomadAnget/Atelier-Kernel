@@ -4,7 +4,7 @@
 本模块只负责协议与能力，不关心 Windows 命名管道 / Unix domain socket 的差异。
 """
 
-__version__ = "0.3.4"
+__version__ = "0.4.0"
 
 import asyncio
 import json
@@ -420,15 +420,25 @@ class AtelierDomain:
     async def get_object(self, object_id):
         return (await self.request("kernel.storage", "StorageObjectGet", {"object_id": object_id}))["data"]
 
+    async def commit_object(self, object_id, size):
+        """更新已有对象的大小（跨域写入允许；对象必须存在）。"""
+        return (await self.request("kernel.storage", "StorageObjectCommit",
+                                   {"object_id": object_id, "size": int(size)}))["data"]
+
     async def delete_object(self, object_id):
+        """删除对象：删物理文件 + 索引行；跨域允许、幂等。"""
         return (await self.request("kernel.storage", "StorageObjectDelete", {"object_id": object_id}))["data"]
+
+    async def list_objects(self, owner=None):
+        """列出对象；owner 缺省为本域，给定时可跨域查询。"""
+        params = {"owner": owner} if owner else {}
+        return (await self.request("kernel.storage", "StorageObjectList", params))["data"]
 
     def file_object_id(self, path):
         return self._namespace.object_id(path) if self._namespace is not None else None
 
     async def refresh_file_index(self):
-        data = (await self.request("kernel.storage", "StorageObjectList", {}))["data"]
-        return data
+        return await self.list_objects()
 
     # ── 能力 13 配套：消息里的文件对象编解码（实例级，无全局状态）──────────
     def _encode_files(self, value):

@@ -106,37 +106,36 @@ Python/Node 的现有调用保持不变。SDK **没有独立的入站并发配�
 
 `on_observation` / `onObservation` also receives DomainStatusChanged and DomainStateSnapshot (after `subscribe_observer` / `subscribeObserver`). The former is best-effort; the latter carries the latest current-state image and coalesces slow delivery. **The SDK keeps no state cache** — there is no `domain.observer` sub-object and no `domain_states` / `domainStates`; a caller that needs the latest image must retain it from the events it receives. No polling, persistent replay, or subscriber queue settings. See [域状态观察](capabilities/domain-state-observation.md). The snapshot does not make ordinary lifecycle observations lossless.
 
-## C4 virtual file namespace (`vfs://`)
+## C4 file objects (`vfs://`)
 
-The kernel storage hub indexes `(domain, virtual_path) → object_id → physical_path`. Physical files are flat unique-id files under `<project_root>/<domain>/<object_id>`; the domain's directory tree is virtual and lives in the kernel index.
-
-**Creation is owner-scoped; read, write (update), query and delete are allowed cross-domain.** Deleting an object removes the index row **and** the physical file (idempotent). There is no reference counting and no implicit self-healing.
-
-SDK file interception is **scoped to an explicit `vfs://` prefix** — nothing else is intercepted, so dependency libraries keep native file semantics:
+The kernel storage hub indexes `(domain, virtual_path) → object_id → physical_path`. Physical files are flat unique-id files under `<project_root>/<domain>/<object_id>`; the domain directory tree is virtual and lives in the kernel index. Business domains only see the file object (`owner/virtual_path/size/file_type/physical_path/timestamps`) and the logical path — never `object_id`.
 
 ```python
-domain.enable_file_interception()        # Python; root defaults to ATELIER_FILES_ROOT
-await domain.list_objects()              # own index; list_objects("other") queries跨域
-await domain.commit_object(object_id, size)  # 更新已有对象（跨域允许）
-with open("vfs://users/a.png", "wb") as f:
-    f.write(payload)
-object_id = domain.file_object_id("vfs://users/a.png")
+domain.enable_file_interception()
+with open("vfs://users/a.png", "wb") as f:   # write mode -> native subclass, staged on disk
+    f.write(payload)                          # close() automatically adopts it into the kernel
+meta = await domain.get_object("users/a.png")          # file object
+other = await domain.get_object("out/x.mp4", "other")  # cross-domain read
+await domain.delete_object("users/a.png")              # deletes file + index row (idempotent)
+await domain.list_objects()                             # own; list_objects("other") cross-domain
 ```
 
 ```js
-domain.enableFileInterception();          // Node
-await domain.refreshFileIndex();
-fs.writeFileSync("vfs://users/a.png", payload);
+domain.enableFileInterception();
+await fs.promises.writeFile("vfs://users/a.png", payload);  // adopted on completion
+const meta = await domain.getObject("users/a.png");
+await domain.deleteObject("users/a.png");
 ```
 
 Rules:
 
-- Only `vfs://` paths are resolved; `open()`/`fs.*` on any other path is untouched.
-- Writes generate a globally-unique `object_id`, write the flat file, and fire-and-forget register `virtual_path → object_id`; reads resolve from the local index cache.
-- The SDK keeps the native handle's lifecycle (no wrapper, no close hook). `size` and file existence are taken by the kernel on `resolve` (metadata + self-heal).
-- Cross-domain consumers pass the `object_id` in message `data` and resolve it via `ObjectGet`; the returned `physical_path` is opened natively.
-- `atelier-kernel --check` statically fails any domain source file whose file operations use a string-literal path without the `vfs://` prefix. Third-party libraries are not scanned and not prefix-matched.
-- No OS sandbox: C extensions / native addons / subprocesses bypass language-level wrapping, so centralization is a convention, not a hard boundary.
+- Only `vfs://` paths are intercepted; every other path is untouched, so third-party libraries keep native semantics.
+- Write mode returns a native file-object subclass (`io.BufferedWriter` / `io.TextIOWrapper` in Python; `FileHandle`/stream in Node) and adopts on close/completion. Business code never calls a non-native operation.
+- Staging lives in `<project_root>/.staging/<domain>/` (outside the domain root); the kernel renames it into the flat object path on `put`.
+- `put` is index-first: a file never appears in the domain root without an index row. Overwrites reuse the same `object_id` / `physical_path`.
+- `get` refreshes `size/file_mtime` with one `stat`; no content reads, no hashes, no implicit index cleanup.
+- Creation is owner-scoped; `get`/`list`/`delete` accept an `owner` argument for cross-domain access. Deleting an object removes the physical file.
+- `atelier-kernel --check` statically fails file operations whose string-literal path lacks `vfs://`; third-party libraries are not scanned.
 
 ## API semantics and naming (both SDKs)
 
@@ -170,7 +169,7 @@ Naming rules:
 | supervisor | `supervisor_start/stop/restart/update` | `supervisorStart/Stop/Restart/Update` |
 | subscribe | `subscribe_*` / `unsubscribe_*` | `subscribe*` / `unsubscribe*` |
 | notify | `notify` | `notify` |
-| C4 objects | `enable_file_interception` / `put_object` / `get_object` / `commit_object` / `delete_object` / `list_objects` / `file_object_id` / `refresh_file_index` | `enableFileInterception` / `putObject` / `getObject` / `commitObject` / `deleteObject` / `listObjects` / `fileObjectId` / `refreshFileIndex` |
+| C4 files | `enable_file_interception` / `put_object` / `get_object` / `delete_object` / `list_objects` | `enableFileInterception` / `putObject` / `getObject` / `deleteObject` / `listObjects` |
 | ports | `bindings` | `bindings` |
 | logger | `logger` | `logger` |
 

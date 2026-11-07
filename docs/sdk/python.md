@@ -45,7 +45,7 @@ asyncio.run(domain.run_async())
 | 10 | 监督 | `supervisor_start` / `supervisor_stop` / `supervisor_restart` / `supervisor_update` |
 | 11 | 订阅 | `subscribe_logs` / `subscribe_telemetry` / `subscribe_notify` / `subscribe_observer`（+ `unsubscribe_*`） |
 | 12 | 通知 | `notify(level, message, title, details)` |
-| 13 | C4 文件对象 | `enable_file_interception` / `put_object` / `get_object` / `commit_object` / `delete_object` / `list_objects` / `file_object_id` / `refresh_file_index` |
+| 13 | C4 文件对象 | `enable_file_interception` / `put_object` / `get_object` / `delete_object` / `list_objects` |
 | 14 | 日志 | `logger.debug/info/warn/error`；多状态用关键字参数：`phase=` / `ephemeral=` / `key=` / `frac=` / `waiting=` / `done=` / `state=` / `console_only=` |
 | 15 | 端口 | `bindings`（`ATELIER_PORT_BINDINGS` 的解析结果） |
 
@@ -68,10 +68,10 @@ Windows 用命名管道（文件 API），Unix 必须 `socket.connect()`。细�
 domain.enable_file_interception()          # 把 vfs:// 映射到平铺 object_id 文件
 with open("vfs://out/clip.mp4", "wb") as f:
     f.write(payload)
-object_id = domain.file_object_id("vfs://out/clip.mp4")
+meta = await domain.get_object("out/clip.mp4")   # 文件对象：size / file_type / physical_path
 ```
 
-消息里放文件对象时，SDK 自动编码为 `{"__atelier_file__": "<object_id>"}`，接收方解码回可读句柄。
+消息里放文件对象时，SDK 自动编码为 `{"__atelier_file__": {"owner", "virtual_path"}}`，接收方按逻辑路径解析回可读句柄。
 
 ## 版本
 

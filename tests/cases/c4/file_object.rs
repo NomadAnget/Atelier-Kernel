@@ -30,7 +30,6 @@ domain = AtelierDomain("c4")
 @domain.handler("write")
 async def write(msg):
     domain.enable_file_interception()
-    await domain.refresh_file_index()
     with open("vfs://out/payload.bin", "wb") as f:
         f.write(b"hello-file-object")
     with open("vfs://out/payload.bin", "rb") as f:

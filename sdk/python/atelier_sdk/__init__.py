@@ -4,9 +4,10 @@
 本模块只负责协议与能力，不关心 Windows 命名管道 / Unix domain socket 的差异。
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 import asyncio
+import io
 import json
 import os
 import socket
@@ -46,6 +47,58 @@ class DomainExecutionFailed(Exception):
         self.payload = payload
 
 
+class _VfsBinaryWriter(io.BufferedWriter):
+    """vfs:// 写模式的原生二进制句柄：close 时自动归档到存储枢纽。"""
+
+    def __init__(self, raw, sdk, virtual_path, staging):
+        super().__init__(raw)
+        self._sdk = sdk
+        self.virtual_path = virtual_path
+        self.owner = sdk.domain
+        self._staging = staging
+        self._adopted = False
+
+    def _adopt_once(self):
+        if self._adopted:
+            return
+        self._adopted = True
+        self._sdk._adopt(self.virtual_path, self._staging)
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            super().close()
+        finally:
+            self._adopt_once()
+
+
+class _VfsTextWriter(io.TextIOWrapper):
+    """vfs:// 写模式的原生文本句柄：close 时自动归档到存储枢纽。"""
+
+    def __init__(self, buffer, sdk, virtual_path, staging, **kwargs):
+        super().__init__(buffer, **kwargs)
+        self._sdk = sdk
+        self.virtual_path = virtual_path
+        self.owner = sdk.domain
+        self._staging = staging
+        self._adopted = False
+
+    def _adopt_once(self):
+        if self._adopted:
+            return
+        self._adopted = True
+        self._sdk._adopt(self.virtual_path, self._staging)
+
+    def close(self):
+        if self.closed:
+            return
+        try:
+            super().close()
+        finally:
+            self._adopt_once()
+
+
 class AtelierDomain:
     """单层公开面。全异步，snake_case，无 `_async` 后缀。"""
 
@@ -71,6 +124,10 @@ class AtelierDomain:
         self._events = {kind: [] for kind in ("receipt", "log", "notify", "observation", "telemetry")}
         self._logger = _Logger(self)
         self._namespace = None
+        self._vfs_files = {}       # virtual_path -> file object metadata
+        self._staging_files = {}   # virtual_path -> staging path (not yet adopted)
+        self._sync_pending = {}    # seq -> {"event", "message_id", "frame"}
+        self._sync_waiters = {}    # message_id -> {"event", "message_id", "frame"}
         self._seq = 1
         self._lock = threading.Lock()
 
@@ -385,72 +442,180 @@ class AtelierDomain:
             return {}
 
     # ── 能力 13：C4 对象（唯一命名空间实例 `_namespace`）────────────────
-    def enable_file_interception(self, root=None):
-        import builtins
-
-        base = root or os.environ.get("ATELIER_FILES_ROOT") or "."
-        self._namespace = _FileNamespace(base, self._register_object)
-        original = builtins.open
-        namespace = self._namespace
-
-        def patched(path, mode="r", *args, **kwargs):
-            if isinstance(path, int) or not namespace.matches(path):
-                return original(path, mode, *args, **kwargs)
-            physical = namespace.resolve(path, any(ch in mode for ch in "wax+"))
-            return original(physical, mode, *args, **kwargs)
-
-        builtins.open = patched
-        return self._namespace
-
-    def _register_object(self, virtual, object_id):
+    # ── C4 同步桥（close/open 这类同步路径需要等内核回执） ─────────────────────
+    def _sync_request(self, target, message_type, params=None, data=None, timeout=15):
+        if self._closed or self._transport_closed:
+            raise DomainRequestError("local_backpressure", {"reason": "sdk closed"})
+        params = self._encode_files(params or {})
+        data = self._encode_files(data or {})
+        with self._lock:
+            seq = self._seq
+            self._seq += 1
+        waiter = {"event": threading.Event(), "message_id": None, "frame": None}
+        self._sync_pending[seq] = waiter
         self._write(
             {
                 "frame_type": "send",
-                "seq": self._next_seq(),
-                "targets": ["kernel.storage"],
-                "message_type": "StorageObjectPut",
-                "params": {"virtual_path": virtual, "object_id": object_id},
-                "data": {},
+                "seq": seq,
+                "targets": [target],
+                "message_type": message_type,
+                "params": params or {},
+                "data": data or {},
             }
         )
+        if not waiter["event"].wait(timeout):
+            self._sync_pending.pop(seq, None)
+            raise DomainRequestError("sync_timeout", {"target": target})
+        frame = waiter["frame"] or {}
+        if frame.get("status") != "completed":
+            raise DomainRequestError(frame.get("status"), frame.get("data"))
+        return frame.get("data") or {}
+
+    def _staging_dir(self):
+        files_root = os.environ.get("ATELIER_FILES_ROOT")
+        if not files_root:
+            raise RuntimeError("C4: ATELIER_FILES_ROOT 未设置，无法定位暂存目录")
+        files_root = os.path.abspath(files_root)
+        project_root = os.path.dirname(files_root)
+        owner = os.path.basename(files_root)  # 内核域 id 以文件根目录名为准
+        staging = os.path.join(project_root, ".staging", owner)
+        os.makedirs(staging, exist_ok=True)
+        return staging
+
+    def _new_staging(self):
+        return os.path.join(self._staging_dir(), f"{uuid.uuid4().hex}.part")
+
+    def _adopt(self, virtual_path, staging, *, raise_on_error=True):
+        try:
+            meta = self._sync_request(
+                "kernel.storage",
+                "StorageObjectPut",
+                {"virtual_path": virtual_path, "staging_path": staging},
+            )
+        except Exception:
+            self._staging_files[virtual_path] = staging
+            if raise_on_error:
+                raise
+            return None
+        self._staging_files.pop(virtual_path, None)
+        self._vfs_files[virtual_path] = meta
+        return meta
+
+    def _resolve_read(self, virtual_path):
+        meta = self._vfs_files.get(virtual_path)
+        if meta is None:
+            meta = self._sync_request(
+                "kernel.storage", "StorageObjectGet", {"virtual_path": virtual_path}
+            )
+            self._vfs_files[virtual_path] = meta
+        return meta
+
+    def enable_file_interception(self, root=None):
+        """vfs:// 写模式落到暂存区并在 close 时自动归档；读模式解析后返回原生句柄。
+
+        只拦截 `vfs://` 前缀：非 vfs 路径原样放行，第三方库完全不受影响。
+        写模式返回的是 io 原生类的子类（isinstance 兼容），业务无需调用任何非原生操作。
+        """
+        import builtins
+
+        self._staging_dir()
+        original = builtins.open
+        sdk = self
+        prefix = "vfs://"
+
+        def patched(path, mode="r", *args, **kwargs):
+            if isinstance(path, int) or not isinstance(path, str) or not path.startswith(prefix):
+                return original(path, mode, *args, **kwargs)
+            virtual_path = path[len(prefix):].lstrip("/")
+            if any(ch in mode for ch in "wax+"):
+                if "+" in mode:
+                    raise ValueError(f"vfs 写模式不支持读写混合: {mode}")
+                return sdk._open_vfs_write(virtual_path, mode, kwargs)
+            meta = sdk._resolve_read(virtual_path)
+            handle = original(meta["physical_path"], mode, *args, **kwargs)
+            return sdk._attach(handle, meta)
+
+        builtins.open = patched
+        try:
+            io.open = patched
+        except Exception:  # noqa: BLE001
+            pass
+        return self
+
+    def _open_vfs_write(self, virtual_path, mode, kwargs):
+        staging = self._new_staging()
+        binary = "b" in mode
+        file_mode = "wb" if ("w" in mode or "x" in mode) else "ab"
+        raw = io.FileIO(staging, file_mode)
+        if binary:
+            return _VfsBinaryWriter(raw, self, virtual_path, staging)
+        text_kwargs = {k: kwargs[k] for k in ("encoding", "errors", "newline") if k in kwargs}
+        return _VfsTextWriter(io.BufferedWriter(raw), self, virtual_path, staging, **text_kwargs)
+
+    @staticmethod
+    def _attach(handle, meta):
+        try:
+            handle.virtual_path = meta.get("virtual_path")
+            handle.owner = meta.get("owner")
+            handle.file_meta = meta
+        except Exception:  # noqa: BLE001 - 某些句柄不允许挂属性
+            pass
+        return handle
 
     async def put_object(self, virtual_path):
-        return (await self.request("kernel.storage", "StorageObjectPut", {"virtual_path": virtual_path}))["data"]
+        """显式归档：把该路径的暂存文件立即交给内核（close 钩子已自动调用）。"""
+        staging = self._staging_files.pop(virtual_path, None)
+        if staging is None:
+            return await self.get_object(virtual_path)
+        meta = (
+            await self.request(
+                "kernel.storage",
+                "StorageObjectPut",
+                {"virtual_path": virtual_path, "staging_path": staging},
+            )
+        )["data"]
+        self._vfs_files[virtual_path] = meta
+        return meta
 
-    async def get_object(self, object_id):
-        return (await self.request("kernel.storage", "StorageObjectGet", {"object_id": object_id}))["data"]
+    async def get_object(self, virtual_path, owner=None):
+        params = {"virtual_path": virtual_path}
+        if owner:
+            params["owner"] = owner
+        meta = (await self.request("kernel.storage", "StorageObjectGet", params))["data"]
+        if not owner:
+            self._vfs_files[virtual_path] = meta
+        return meta
 
-    async def commit_object(self, object_id, size):
-        """更新已有对象的大小（跨域写入允许；对象必须存在）。"""
-        return (await self.request("kernel.storage", "StorageObjectCommit",
-                                   {"object_id": object_id, "size": int(size)}))["data"]
-
-    async def delete_object(self, object_id):
-        """删除对象：删物理文件 + 索引行；跨域允许、幂等。"""
-        return (await self.request("kernel.storage", "StorageObjectDelete", {"object_id": object_id}))["data"]
+    async def delete_object(self, virtual_path, owner=None):
+        params = {"virtual_path": virtual_path}
+        if owner:
+            params["owner"] = owner
+        result = (await self.request("kernel.storage", "StorageObjectDelete", params))["data"]
+        self._vfs_files.pop(virtual_path, None)
+        staging = self._staging_files.pop(virtual_path, None)
+        if staging:
+            try:
+                os.remove(staging)
+            except OSError:
+                pass
+        return result
 
     async def list_objects(self, owner=None):
-        """列出对象；owner 缺省为本域，给定时可跨域查询。"""
         params = {"owner": owner} if owner else {}
-        return (await self.request("kernel.storage", "StorageObjectList", params))["data"]
+        data = (await self.request("kernel.storage", "StorageObjectList", params))["data"]
+        if not owner:
+            for item in data.get("objects") or []:
+                path = item.get("virtual_path")
+                if path:
+                    self._vfs_files[path] = item
+        return data
 
-    def file_object_id(self, path):
-        return self._namespace.object_id(path) if self._namespace is not None else None
-
-    async def refresh_file_index(self):
-        return await self.list_objects()
-
-    # ── 能力 13 配套：消息里的文件对象编解码（实例级，无全局状态）──────────
+    # ── 能力 13 配套：消息里的文件句柄编解码（实例级，无全局状态） ─────────────
     def _encode_files(self, value):
-        namespace = self._namespace
-        if (
-            namespace is not None
-            and hasattr(value, "read")
-            and isinstance(getattr(value, "name", None), str)
-        ):
-            object_id = namespace.object_id_for_physical(value.name)
-            if object_id:
-                return {"__atelier_file__": object_id}
+        virtual_path = getattr(value, "virtual_path", None)
+        owner = getattr(value, "owner", None)
+        if isinstance(virtual_path, str) and isinstance(owner, str):
+            return {"__atelier_file__": {"owner": owner, "virtual_path": virtual_path}}
         if isinstance(value, dict):
             return {key: self._encode_files(item) for key, item in value.items()}
         if isinstance(value, (list, tuple)):
@@ -459,15 +624,11 @@ class AtelierDomain:
 
     async def _decode_files(self, value):
         if isinstance(value, dict):
-            if len(value) == 1 and isinstance(value.get("__atelier_file__"), str):
-                object_id = value["__atelier_file__"]
-                ref = await self.get_object(object_id)
-                handle = open(ref["physical_path"], "rb+")
-                # C4：物理文件是平铺 id（无扩展名），逻辑路径（含目录与后缀）在索引里。
-                # 句柄同时带上两者，业务侧/引擎据此选格式，不必猜物理名。
-                handle.object_id = object_id
-                handle.virtual_path = ref.get("virtual_path")
-                return handle
+            ref = value.get("__atelier_file__")
+            if len(value) == 1 and isinstance(ref, dict):
+                meta = await self.get_object(ref["virtual_path"], ref.get("owner"))
+                handle = open(meta["physical_path"], "rb+")
+                return self._attach(handle, meta)
             return {key: await self._decode_files(item) for key, item in value.items()}
         if isinstance(value, list):
             return [await self._decode_files(item) for item in value]
@@ -529,6 +690,31 @@ class AtelierDomain:
         with self._lock:
             self._write_pipe.write(line.encode("utf-8"))
 
+    def _deliver_sync_receipt(self, frame):
+        """同步桥回执在 reader 线程直接交付，避免 close/open 阻塞事件循环。"""
+        message_id = frame.get("message_id")
+        seq = frame.get("seq")
+        status = frame.get("status")
+        if not isinstance(message_id, str) or status not in {"sent", "received", "started", *TERMINAL}:
+            return False
+        if seq in self._sync_pending:
+            waiter = self._sync_pending.pop(seq)
+            waiter["message_id"] = message_id
+            if status in TERMINAL:
+                waiter["frame"] = frame
+                waiter["event"].set()
+            else:
+                self._sync_waiters[message_id] = waiter
+            return True
+        waiter = self._sync_waiters.get(message_id)
+        if waiter is not None:
+            if status in TERMINAL:
+                self._sync_waiters.pop(message_id, None)
+                waiter["frame"] = frame
+                waiter["event"].set()
+            return True
+        return False
+
     def _read_loop(self):
         buffer = b""
         reason = "read loop ended"
@@ -551,6 +737,8 @@ class AtelierDomain:
                     frame = json.loads(raw.decode("utf-8"))
                 except Exception:  # noqa: BLE001
                     self._stats["malformed_frames"] += 1
+                    continue
+                if frame.get("frame_type") == "receipt" and self._deliver_sync_receipt(frame):
                     continue
                 if self._loop is not None:
                     # 不阻塞读线程：处理器里可能再发 request，需要读线程继续处理回执。
@@ -602,6 +790,23 @@ class AtelierDomain:
             self._stats["unknown_statuses"] += 1
             return
         seq = frame.get("seq")
+        # 同步桥（close/open 路径）：不经过 asyncio future，直接唤醒等待线程。
+        if seq in self._sync_pending:
+            waiter = self._sync_pending.pop(seq)
+            waiter["message_id"] = message_id
+            if status in TERMINAL:
+                waiter["frame"] = frame
+                waiter["event"].set()
+            else:
+                self._sync_waiters[message_id] = waiter
+            return
+        waiter = self._sync_waiters.get(message_id)
+        if waiter is not None:
+            if status in TERMINAL:
+                self._sync_waiters.pop(message_id, None)
+                waiter["frame"] = frame
+                waiter["event"].set()
+            return
         # 本地已停止等待的提交同样要认出归属：内核已经发出的回执不能被丢弃。
         entry = self._pending.get(seq) or self._orphans.get(seq)
         claimed = False

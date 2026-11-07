@@ -29,17 +29,29 @@ const domain = new AtelierDomain("v2node");
 domain.handler("echo", async (msg) => ({{ echo: msg.data.value }}));
 domain.handler("add", async (msg) => ({{ sum: Number(msg.data.a) + Number(msg.data.b) }}));
 domain.handler("file", async () => {{
-  domain.enableFileInterception();
-  const listed = await domain.refreshFileIndex();
-  const fsp = require("fs/promises");
-  await fsp.writeFile("vfs://out/payload.bin", "v2-file-object");
-  const tracked = domain.fileObjectId("vfs://out/payload.bin");
-  const handle = await fsp.open("vfs://out/payload.bin", "r+");
-  const encoded = domain._encodeFiles({{ f: handle }});
-  const decoded = await domain._decodeFiles(encoded);
-  const buffer = Buffer.alloc(64);
-  const {{ bytesRead }} = await decoded.f.read(buffer, 0, 64, 0);
-  return {{ content: buffer.subarray(0, bytesRead).toString(), encoded: !!encoded.f.__atelier_file__, handle_path: String(handle.path || ""), ns_count: domain._namespace.byPhysical.size, tracked: typeof tracked === "string" && tracked.length === 32, listed: !!listed && typeof listed === "object" }};
+  let stage = "enable";
+  try {{
+    domain.enableFileInterception();
+    stage = "list";
+    const listed = await domain.listObjects();
+    stage = "write";
+    const fsp = require("fs/promises");
+    await fsp.writeFile("vfs://out/payload.bin", "v2-file-object");
+    stage = "get";
+    const meta = await domain.getObject("out/payload.bin");
+    stage = "open";
+    const handle = await fsp.open("vfs://out/payload.bin", "r+");
+    stage = "encode";
+    const encoded = domain._encodeFiles({{ f: handle }});
+    stage = "decode";
+    const decoded = await domain._decodeFiles(encoded);
+    const buffer = Buffer.alloc(64);
+    const {{ bytesRead }} = await decoded.f.read(buffer, 0, 64, 0);
+    await handle.close();
+    return {{ content: buffer.subarray(0, bytesRead).toString(), encoded: !!encoded.f.__atelier_file__, handle_path: meta.physical_path, tracked: typeof meta.physical_path === "string", listed: !!listed && typeof listed === "object" }};
+  }} catch (error) {{
+    return {{ failed_stage: stage, error: String(error), detail: error && error.data ? error.data : null }};
+  }}
 }});
 domain.handler("storage", async (msg) => {{
   const recordId = "e2e-" + msg.message_id;
@@ -103,11 +115,11 @@ domain.handler("notify", async () => {{
 }});
 domain.handler("c4", async () => {{
   const fs = require("fs");
-  const put = await domain.putObject("e2e/obj-1");
-  fs.writeFileSync(put.physical_path, "c4-payload");
-  const got = await domain.getObject(put.object_id);
-  const deleted = await domain.deleteObject(put.object_id);
-  return {{ object_id: put.object_id, physical_path: put.physical_path, got_matches: got.physical_path === put.physical_path, size: got.size, deleted: !!deleted && typeof deleted === "object" }};
+  domain.enableFileInterception();
+  await fs.promises.writeFile("vfs://e2e/obj-1.bin", "c4-payload");
+  const got = await domain.getObject("e2e/obj-1.bin");
+  const deleted = await domain.deleteObject("e2e/obj-1.bin");
+  return {{ size: got.size, deleted: !!deleted.deleted, physical_removed: !fs.existsSync(got.physical_path) }};
 }});
 domain.handler("wait", async () => {{
   const mid = await domain.send("v2node.echo", "Echo", {{}}, {{ value: 7 }});
@@ -203,8 +215,8 @@ domain.run();
     let file_data = file_result.data.unwrap();
     assert_eq!(file_data["content"], "v2-file-object", "{file_data}");
     assert_eq!(file_data["encoded"], true, "{file_data}");
-    assert_eq!(file_data["tracked"], true, "fileObjectId: {file_data}");
-    assert_eq!(file_data["listed"], true, "refreshFileIndex: {file_data}");
+    assert_eq!(file_data["tracked"], true, "file metadata: {file_data}");
+    assert_eq!(file_data["listed"], true, "listObjects: {file_data}");
 
     verifier.send(vec!["v2node.storage".into()], "Storage", json!({}), json!({}));
     let stored = terminal(&verifier, Duration::from_secs(10));
@@ -243,11 +255,9 @@ domain.run();
     let c4 = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(c4.status, atelier_kernel::ContractStatus::Completed, "{:?}", c4.data);
     let c4_data = c4.data.unwrap();
-    assert!(c4_data["object_id"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
-    assert!(c4_data["physical_path"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
-    assert_eq!(c4_data["got_matches"], true, "{c4_data}");
     assert_eq!(c4_data["size"], 10, "{c4_data}");
     assert_eq!(c4_data["deleted"], true, "{c4_data}");
+    assert_eq!(c4_data["physical_removed"], true, "delete must unlink the physical file: {c4_data}");
 
     verifier.send(vec!["v2node.wait".into()], "Wait", json!({}), json!({}));
     let waited = terminal(&verifier, Duration::from_secs(10));

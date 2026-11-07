@@ -45,7 +45,6 @@ def find_file(value):
 @domain.handler("check")
 async def check(msg):
     domain.enable_file_interception()
-    await domain.refresh_file_index()
     with open("vfs://out/payload.bin", "wb") as f:
         f.write(b"stored-file-object")
     with open("vfs://out/payload.bin", "rb") as f:

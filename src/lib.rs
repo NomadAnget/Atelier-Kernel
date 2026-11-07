@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 pub use diag::discipline::{ConstitutionReport, ConstitutionViolation, check_constitution};
 pub use frontend::interactive::InteractiveFrontendDomain;
 pub use services::ledger::{DeliveryRecord, KernelLedger, ReceiptTransition};
-pub use services::objects::{DeleteOutcome, Object, ObjectHub, ObjectRef};
+pub use services::objects::{DeleteOutcome, FileObject, GetOutcome, ObjectHub};
 pub use core::protocol::{LogFramePayload, LogRecord, ProgressState};
 pub use services::logs::logging::{KernelLogHub, LogPage, LogQuery, LogStore};
 pub use services::observer::KernelObserver;

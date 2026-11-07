@@ -25,15 +25,16 @@ fn terminal(client: &atelier_kernel::DomainPipeClient, timeout: Duration) -> ate
 
 const PRODUCER: &str = r#"
 from atelier_sdk import AtelierDomain
-domain = AtelierDomain("c4")
+domain = AtelierDomain("producer")
 
 @domain.handler("write")
 async def write(msg):
     domain.enable_file_interception()
-    await domain.refresh_file_index()
     with open("vfs://out/payload.bin", "wb") as f:
         f.write(b"hello-object-42")
-    return {"object_id": domain.file_object_id("vfs://out/payload.bin")}
+    meta = await domain.get_object("out/payload.bin")
+    return {"owner": meta["owner"], "virtual_path": meta["virtual_path"],
+            "physical_path": meta["physical_path"], "size": meta["size"]}
 
 import asyncio
 asyncio.run(domain.run_async())
@@ -41,15 +42,13 @@ asyncio.run(domain.run_async())
 
 const CONSUMER: &str = r#"
 from atelier_sdk import AtelierDomain
-domain = AtelierDomain("c4")
+domain = AtelierDomain("consumer")
 
 @domain.handler("take")
 async def take(msg):
-    oid = msg.data["object_id"]
-    res = await domain.request("kernel.storage", "StorageObjectGet", {"object_id": oid}, {})
-    physical = res["data"]["physical_path"]
-    with open(physical, "rb") as f:
-        return {"content": f.read().decode()}
+    meta = await domain.get_object(msg.data["virtual_path"], msg.data["owner"])
+    with open(meta["physical_path"], "rb") as f:
+        return {"content": f.read().decode(), "size": meta["size"]}
 
 import asyncio
 asyncio.run(domain.run_async())
@@ -110,24 +109,25 @@ fn c4_multi_process_object_round_trip() {
     );
     let produced = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(produced.status, atelier_kernel::ContractStatus::Completed, "{:?}", produced.data);
-    let object_id = produced.data.unwrap()["object_id"].as_str().unwrap().to_string();
-    assert!(object_id.starts_with("obj_") || !object_id.is_empty());
+    let produced = produced.data.unwrap();
+    let owner = produced["owner"].as_str().unwrap().to_string();
+    let virtual_path = produced["virtual_path"].as_str().unwrap().to_string();
+    let physical = produced["physical_path"].as_str().unwrap().to_string();
+    assert_eq!(owner, "producer");
+    assert_eq!(virtual_path, "out/payload.bin");
+    assert!(std::path::Path::new(&physical).exists());
 
     verifier.send(
         vec!["consumer.take".into()],
         "Take",
         json!({}),
-        json!({"object_id": object_id}),
+        json!({"owner": owner, "virtual_path": virtual_path}),
     );
     let taken = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(taken.status, atelier_kernel::ContractStatus::Completed, "{:?}", taken.data);
-    assert_eq!(taken.data.unwrap()["content"], "hello-object-42");
-
-    // 物理文件确实落在内核域根下：<project_root>/producer/<object_id>
-    assert!(
-        project_root.join("producer").join(&object_id).exists(),
-        "physical file must live under the kernel-managed domain root"
-    );
+    let taken = taken.data.unwrap();
+    assert_eq!(taken["content"], "hello-object-42");
+    assert_eq!(taken["size"], 15);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

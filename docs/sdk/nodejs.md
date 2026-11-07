@@ -45,7 +45,7 @@ domain.run();
 | 10 | 监督 | `supervisorStart` / `supervisorStop` / `supervisorRestart` / `supervisorUpdate` |
 | 11 | 订阅 | `subscribeLogs` / `subscribeTelemetry` / `subscribeNotify` / `subscribeObserver`（+ `unsubscribe*`） |
 | 12 | 通知 | `notify(level, message, title, details)` |
-| 13 | C4 文件对象 | `enableFileInterception` / `putObject` / `getObject` / `commitObject` / `deleteObject` / `listObjects` / `fileObjectId` / `refreshFileIndex` |
+| 13 | C4 文件对象 | `enableFileInterception` / `putObject` / `getObject` / `deleteObject` / `listObjects` |
 | 14 | 日志 | `logger.debug/info/warn/error`；多状态用 options：`{ phase, ephemeral, key, frac, waiting, done, state, console_only }`（字段名即 `LogRecord` 字段，snake_case） |
 | 15 | 端口 | `bindings` |
 
@@ -63,7 +63,7 @@ SDK 用 `net.createConnection(pipePath)` 连接（Windows 命名管道 / Unix do
 ```js
 domain.enableFileInterception();
 fs.writeFileSync("vfs://out/clip.mp4", payload);
-const objectId = domain.fileObjectId("vfs://out/clip.mp4");
+const meta = await domain.getObject("out/clip.mp4");  // 文件对象：size / file_type / physical_path
 ```
 
 - 运行时补丁覆盖 CommonJS 的 `fs` / `fs.promises`；

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use crate::services::ledger::{KernelLedger, ReceiptTransition};
 use crate::services::logs::logging::{KernelLogHub, LogQuery};
 use crate::core::protocol::LogRecord;
-use crate::services::objects::{DeleteOutcome, ObjectHub};
+use crate::services::objects::{DeleteOutcome, FileObject, GetOutcome, ObjectHub};
 use crate::services::observer::KernelObserver;
 use crate::core::protocol::{
     ContractStatus, DeliveryPolicy, DomainStatus, DomainToKernelFrame, HandlerDescriptor,
@@ -20,8 +20,8 @@ use crate::core::protocol::{
     KERNEL_TELEMETRY_TARGET, KernelMessage, KernelToDomainFrame, MSG_QUERY_DOMAIN_ASSEMBLY,
     MSG_QUERY_HANDLERS, MSG_QUERY_LOGS, MSG_QUERY_OBSERVER, MSG_QUERY_PROGRESS, MSG_QUERY_RUNTIME,
     MSG_REGISTER_HANDLERS, MSG_RESTART_DOMAIN, MSG_START_DOMAIN, MSG_STOP_DOMAIN,
-    MSG_STORAGE_OBJECT_COMMIT, MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET,
-    MSG_STORAGE_OBJECT_LIST, MSG_STORAGE_OBJECT_PUT,
+    MSG_STORAGE_OBJECT_DELETE, MSG_STORAGE_OBJECT_GET, MSG_STORAGE_OBJECT_LIST,
+    MSG_STORAGE_OBJECT_PUT,
     MSG_SUBSCRIBE_LOGS, MSG_SUBSCRIBE_NOTIFY, MSG_SUBSCRIBE_OBSERVER, MSG_SUBSCRIBE_TELEMETRY,
     MSG_SYSTEM_LOG_EVENT, MSG_SYSTEM_NOTIFY_EVENT, MSG_SYSTEM_OBSERVER_EVENT,
     MSG_SYSTEM_TELEMETRY_EVENT, MSG_UNREGISTER_HANDLERS, MSG_UNSUBSCRIBE_LOGS,
@@ -37,6 +37,20 @@ const OBSERVER_QUERY_LIMIT_MAX: u64 = 1_000;
 struct ControlPermit {
     count: Arc<AtomicUsize>,
 }
+/// C4 文件对象 → 线上 JSON（不含内核内部 object_id）。
+fn file_object_json(file: &FileObject) -> Value {
+    json!({
+        "owner": file.owner,
+        "virtual_path": file.virtual_path,
+        "physical_path": file.physical_path,
+        "size": file.size,
+        "file_type": file.file_type,
+        "created_at": file.created_at,
+        "updated_at": file.updated_at,
+    })
+}
+
+
 impl Drop for ControlPermit {
     fn drop(&mut self) {
         self.count.fetch_sub(1, Ordering::AcqRel);
@@ -1473,6 +1487,7 @@ impl KernelRouter {
         // C4 对象接口：虚拟路径 → 唯一 id → 平铺物理文件（内核只索引，域拿 id 引用）。
         match msg.message_type.as_str() {
             MSG_STORAGE_OBJECT_PUT => {
+                // 创建/覆盖：先索引、后原子替换；object_id 完全由内核分配。
                 let Some(virtual_path) = msg.params.get("virtual_path").and_then(Value::as_str)
                 else {
                     self.complete_kernel_internal_target(
@@ -1483,93 +1498,67 @@ impl KernelRouter {
                     );
                     return;
                 };
-                let external_id = msg.params.get("object_id").and_then(Value::as_str);
-                let size = msg.params.get("size").and_then(Value::as_u64).unwrap_or(0);
-                let result = {
-                    let mut hub = self.object_hub.lock();
-                    match external_id {
-                        Some(id) => hub.register_external(source_domain, virtual_path, id, size),
-                        None => hub.create(source_domain, virtual_path),
-                    }
-                };
-                match result {
-                    Ok(obj_ref) => self.complete_kernel_internal_target(
-                        source_domain,
-                        msg,
-                        ContractStatus::Completed,
-                        Some(json!({
-                            "object_id": obj_ref.object_id,
-                            "virtual_path": obj_ref.virtual_path,
-                            "physical_path": obj_ref.physical_path,
-                            "size": obj_ref.size,
-                        })),
-                    ),
-                    Err(e) => self.complete_kernel_internal_target(
-                        source_domain,
-                        msg,
-                        ContractStatus::ExecutionFailed,
-                        Some(json!({"error": "object_register_failed", "reason": e})),
-                    ),
-                }
-            }
-            MSG_STORAGE_OBJECT_COMMIT => {
-                let Some(object_id) = msg.params.get("object_id").and_then(Value::as_str) else {
+                let Some(staging_path) = msg.params.get("staging_path").and_then(Value::as_str)
+                else {
                     self.complete_kernel_internal_target(
                         source_domain,
                         msg,
                         ContractStatus::ContractInvalid,
-                        Some(json!({"error": "missing_object_id"})),
+                        Some(json!({"error": "missing_staging_path"})),
                     );
                     return;
                 };
-                let size = msg.params.get("size").and_then(Value::as_u64).unwrap_or(0);
-                match self.object_hub.lock().commit(object_id, size) {
-                    Ok(()) => self.complete_kernel_internal_target(
+                let result = self
+                    .object_hub
+                    .lock()
+                    .put(source_domain, virtual_path, staging_path);
+                match result {
+                    Ok(file) => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
                         ContractStatus::Completed,
-                        Some(json!({"object_id": object_id, "size": size})),
+                        Some(file_object_json(&file)),
                     ),
-                    Err(e) => self.complete_kernel_internal_target(
+                    Err(error) => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
                         ContractStatus::ExecutionFailed,
-                        Some(json!({"error": "object_commit_failed", "reason": e})),
+                        Some(json!({"error": "object_put_failed", "reason": error})),
                     ),
                 }
             }
             MSG_STORAGE_OBJECT_GET => {
-                // 支持按 object_id（跨域只读）或 virtual_path（本域）解析。
-                // 按 object_id 跨域读取；按 virtual_path 读取时可用 owner 指定归属域（默认调用域）。
-                let object_id = msg.params.get("object_id").and_then(Value::as_str);
-                let virtual_path = msg.params.get("virtual_path").and_then(Value::as_str);
+                // 跨域读取：owner 缺省为调用域。
+                let Some(virtual_path) = msg.params.get("virtual_path").and_then(Value::as_str)
+                else {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ContractInvalid,
+                        Some(json!({"error": "missing_virtual_path"})),
+                    );
+                    return;
+                };
                 let owner = msg
                     .params
                     .get("owner")
                     .and_then(Value::as_str)
                     .unwrap_or(source_domain);
-                let resolved = {
-                    let mut hub = self.object_hub.lock();
-                    match (object_id, virtual_path) {
-                        (Some(id), _) => hub.resolve(id),
-                        (None, Some(vp)) => hub.resolve_path(owner, vp),
-                        (None, None) => None,
-                    }
-                };
-                match resolved {
-                    Some(obj) => self.complete_kernel_internal_target(
+                let outcome = self.object_hub.lock().get(owner, virtual_path);
+                match outcome {
+                    GetOutcome::Found(file) => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
                         ContractStatus::Completed,
-                        Some(json!({
-                            "object_id": obj.object_id,
-                            "virtual_path": obj.virtual_path,
-                            "physical_path": obj.physical_path,
-                            "size": obj.size,
-                            "owner": obj.owner,
-                        })),
+                        Some(file_object_json(&file)),
                     ),
-                    None => self.complete_kernel_internal_target(
+                    GetOutcome::FileMissing => self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ExecutionFailed,
+                        Some(json!({"error": "object_file_missing"})),
+                    ),
+                    GetOutcome::Unknown => self.complete_kernel_internal_target(
                         source_domain,
                         msg,
                         ContractStatus::ExecutionFailed,
@@ -1578,22 +1567,23 @@ impl KernelRouter {
                 }
             }
             MSG_STORAGE_OBJECT_DELETE => {
-                // 跨域删除允许；删除对象 = 删除物理文件 + 索引行，幂等。
-                let object_id = msg.params.get("object_id").and_then(Value::as_str);
-                let virtual_path = msg.params.get("virtual_path").and_then(Value::as_str);
+                // 跨域删除允许；删除对象 = 删物理文件 + 删索引行，幂等。
+                let Some(virtual_path) = msg.params.get("virtual_path").and_then(Value::as_str)
+                else {
+                    self.complete_kernel_internal_target(
+                        source_domain,
+                        msg,
+                        ContractStatus::ContractInvalid,
+                        Some(json!({"error": "missing_virtual_path"})),
+                    );
+                    return;
+                };
                 let owner = msg
                     .params
                     .get("owner")
                     .and_then(Value::as_str)
                     .unwrap_or(source_domain);
-                let outcome = {
-                    let mut hub = self.object_hub.lock();
-                    match (object_id, virtual_path) {
-                        (Some(id), _) => hub.delete(id),
-                        (None, Some(vp)) => hub.delete_path(owner, vp),
-                        (None, None) => DeleteOutcome::Unknown,
-                    }
-                };
+                let outcome = self.object_hub.lock().delete(owner, virtual_path);
                 match outcome {
                     DeleteOutcome::Deleted => self.complete_kernel_internal_target(
                         source_domain,
@@ -1624,16 +1614,9 @@ impl KernelRouter {
                 let objects: Vec<_> = self
                     .object_hub
                     .lock()
-                    .list_owner(owner)
+                    .list(owner)
                     .into_iter()
-                    .map(|o| {
-                        json!({
-                            "object_id": o.object_id,
-                            "virtual_path": o.virtual_path,
-                            "physical_path": o.physical_path,
-                            "size": o.size,
-                        })
-                    })
+                    .map(|file| file_object_json(&file))
                     .collect();
                 self.complete_kernel_internal_target(
                     source_domain,

@@ -40,17 +40,17 @@ async def add(msg):
 @domain.handler("file")
 async def file_handler(msg):
     domain.enable_file_interception()
-    listed = await domain.refresh_file_index()
+    listed = await domain.list_objects()
     with open("vfs://out/payload.bin", "wb") as f:
         f.write(b"v2-file-object")
-    tracked = domain.file_object_id("vfs://out/payload.bin")
+    meta = await domain.get_object("out/payload.bin")
     with open("vfs://out/payload.bin", "rb") as f:
         encoded = domain._encode_files({"f": f})
         decoded = await domain._decode_files(encoded)
     return {
         "content": decoded["f"].read().decode(),
         "encoded": "__atelier_file__" in encoded["f"],
-        "tracked": isinstance(tracked, str) and len(tracked) == 32,
+        "tracked": isinstance(meta.get("physical_path"), str),
         "listed": isinstance(listed, dict),
     }
 
@@ -124,28 +124,21 @@ async def notify_handler(msg):
 
 @domain.handler("c4")
 async def c4_handler(msg):
-    stage = "put"
+    stage = "write"
     try:
-        put = await domain.put_object("e2e/obj-1")
-        stage = "write"
-        with open(put["physical_path"], "wb") as f:
+        domain.enable_file_interception()
+        with open("vfs://e2e/obj-1.bin", "wb") as f:
             f.write(b"c4-payload")
         stage = "get"
-        got = await domain.get_object(put["object_id"])
+        got = await domain.get_object("e2e/obj-1.bin")
         stage = "delete"
-        deleted = await domain.delete_object(put["object_id"])
+        deleted = await domain.delete_object("e2e/obj-1.bin")
         stage = "verify"
-        removed = not os.path.exists(put["physical_path"])
+        removed = not os.path.exists(got["physical_path"])
     except Exception as error:  # noqa: BLE001
         return {"failed_stage": stage, "error": str(error), "detail": getattr(error, "data", None)}
-    return {
-        "object_id": put["object_id"],
-        "physical_path": put["physical_path"],
-        "got_matches": got.get("physical_path") == put["physical_path"],
-        "size": got.get("size"),
-        "deleted": bool(isinstance(deleted, dict) and deleted.get("deleted")),
-        "physical_removed": removed,
-    }
+    return {"size": got.get("size"), "deleted": bool(deleted.get("deleted")),
+            "physical_removed": removed}
 
 @domain.handler("wait")
 async def wait_handler(msg):
@@ -265,8 +258,8 @@ fn sdk_v2_round_trip() {
     let file_data = file_result.data.unwrap();
     assert_eq!(file_data["content"], "v2-file-object");
     assert_eq!(file_data["encoded"], true);
-    assert_eq!(file_data["tracked"], true, "file_object_id: {file_data}");
-    assert_eq!(file_data["listed"], true, "refresh_file_index: {file_data}");
+    assert_eq!(file_data["tracked"], true, "file metadata: {file_data}");
+    assert_eq!(file_data["listed"], true, "list_objects: {file_data}");
 
     verifier.send(vec!["v2test.storage".into()], "Storage", json!({}), json!({}));
     let stored = terminal(&verifier, Duration::from_secs(10));
@@ -305,9 +298,6 @@ fn sdk_v2_round_trip() {
     let c4 = terminal(&verifier, Duration::from_secs(10));
     assert_eq!(c4.status, atelier_kernel::ContractStatus::Completed, "{:?}", c4.data);
     let c4_data = c4.data.unwrap();
-    assert!(c4_data["object_id"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
-    assert!(c4_data["physical_path"].as_str().is_some_and(|s| !s.is_empty()), "{c4_data}");
-    assert_eq!(c4_data["got_matches"], true, "{c4_data}");
     assert_eq!(c4_data["size"], 10, "{c4_data}");
     assert_eq!(c4_data["deleted"], true, "{c4_data}");
     assert_eq!(c4_data["physical_removed"], true, "delete must unlink the physical file: {c4_data}");

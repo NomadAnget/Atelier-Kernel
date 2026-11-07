@@ -93,6 +93,9 @@ class AtelierDomain {
     this._seq = 1;
     this._namespace = null;
     this._handles = new WeakMap();
+    this._vfsFiles = new Map();
+    this._stagingFiles = new Map();
+    this._filesRoot = null;
     this._logger = new Logger(this);
     this._closed = false;
     this._input = null;
@@ -301,107 +304,227 @@ class AtelierDomain {
     return (await this.request("kernel.notify", title || "Notification", { severity: level, level }, { title, message, details })).data;
   }
 
-  // 能力 13：C4
-  enableFileInterception(root) {
-    this._namespace = new FileNamespace(root || process.env.ATELIER_FILES_ROOT || ".", (virtual, objectId) =>
-      this._write({ frame_type: "send", seq: this._seq++, targets: ["kernel.storage"], message_type: "StorageObjectPut", params: { virtual_path: virtual, object_id: objectId }, data: {} })
-    );
-    this._patchFs(this._namespace);
-    // ESM 命名导入（`import {writeFile} from 'node:fs/promises'`）在模块加载时绑定，
-    // 运行时改 fs 对象覆盖不到；vfs-shim.mjs 通过这个全局读取当前实例的命名空间。
-    globalThis.__atelierVfs = this._namespace;
-    return this._namespace;
+  // ── 能力 13：C4 文件对象（逻辑路径寻址；object_id 只在核心里） ──────────
+  _vpath(p) {
+    return typeof p === "string" && p.startsWith("vfs://")
+      ? p.slice("vfs://".length).replace(/^\/+/, "")
+      : null;
   }
 
-  _patchFs(ns) {
-    const handles = this._handles;
-    const originalPromiseOpen = fs.promises.open;
-    const wrap = (holder, name, forWrite, index = 0) => {
-      const original = holder[name];
-      if (typeof original !== "function") return;
-      holder[name] = function (...args) {
-        if (ns.matches(args[index])) args[index] = ns.resolve(args[index], forWrite);
-        return original.apply(holder, args);
-      };
-    };
-    const table = [
-      ["readFile", false],
-      ["stat", false],
-      ["access", false],
-      ["writeFile", true],
-      ["appendFile", true],
-      ["unlink", true],
-      ["rm", true],
-    ];
-    for (const [name, forWrite] of table) {
-      wrap(fs, name, forWrite);
-      wrap(fs, name + "Sync", forWrite);
-      wrap(fs.promises, name, forWrite);
+  _stagingDir() {
+    const filesRoot = this._filesRoot || process.env.ATELIER_FILES_ROOT;
+    if (!filesRoot) throw new Error("C4: ATELIER_FILES_ROOT 未设置，无法定位暂存目录");
+    const absolute = path.resolve(filesRoot);
+    const owner = path.basename(absolute);
+    const dir = path.join(path.dirname(absolute), ".staging", owner);
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  _newStaging() {
+    return path.join(this._stagingDir(), `${crypto.randomUUID()}.part`);
+  }
+
+  async _adopt(virtualPath, staging) {
+    try {
+      const meta = (await this.request("kernel.storage", "StorageObjectPut", {
+        virtual_path: virtualPath,
+        staging_path: staging,
+      })).data;
+      this._stagingFiles.delete(virtualPath);
+      this._vfsFiles.set(virtualPath, meta);
+      return meta;
+    } catch (error) {
+      this._stagingFiles.set(virtualPath, staging);
+      throw error;
     }
-    // fs.open 的句柄不暴露路径，用 WeakMap 记住「句柄 → object_id」供编解码反查。
-    const openHandler = (holder, original, sync) => {
-      if (typeof original !== "function") return;
-      holder.open = function (p, ...rest) {
-        if (ns.matches(p)) {
-          const physical = ns.resolve(p, true);
-          const objectId = ns.objectIdForPath(physical);
-          const result = original.call(holder, physical, ...rest);
-          if (!sync && result && typeof result.then === "function") {
-            return result.then((handle) => {
-              handles.set(handle, objectId);
-              return handle;
-            });
-          }
-          return result;
-        }
-        return original.call(holder, p, ...rest);
-      };
-    };
-    openHandler(fs, fs.open, false);
-    openHandler(fs, fs.openSync, true);
-    fs.promises.open = function (p, ...rest) {
-      if (ns.matches(p)) {
-        const physical = ns.resolve(p, true);
-        const objectId = ns.objectIdForPath(physical);
-        return originalPromiseOpen.call(fs.promises, physical, ...rest).then((handle) => {
-          handles.set(handle, objectId);
-          return handle;
-        });
-      }
-      return originalPromiseOpen.call(fs.promises, p, ...rest);
-    };
-  }
-  async putObject(virtualPath) {
-    return (await this.request("kernel.storage", "StorageObjectPut", { virtual_path: virtualPath })).data;
-  }
-  async getObject(objectId) {
-    return (await this.request("kernel.storage", "StorageObjectGet", { object_id: objectId })).data;
-  }
-  async commitObject(objectId, size) {
-    return (await this.request("kernel.storage", "StorageObjectCommit", { object_id: objectId, size: Number(size) })).data;
   }
 
-  async deleteObject(objectId) {
-    // 删除对象 = 删物理文件 + 索引行；跨域允许、幂等。
-    return (await this.request("kernel.storage", "StorageObjectDelete", { object_id: objectId })).data;
+  _sendAdopt(virtualPath, staging) {
+    this._stagingFiles.set(virtualPath, staging);
+    this._write({
+      frame_type: "send",
+      seq: this._seq++,
+      targets: ["kernel.storage"],
+      message_type: "StorageObjectPut",
+      params: { virtual_path: virtualPath, staging_path: staging },
+      data: {},
+    });
+  }
+
+  async _resolveRead(virtualPath) {
+    let meta = this._vfsFiles.get(virtualPath);
+    if (!meta) {
+      meta = (await this.request("kernel.storage", "StorageObjectGet", { virtual_path: virtualPath })).data;
+      this._vfsFiles.set(virtualPath, meta);
+    }
+    return meta;
+  }
+
+  _resolveReadSync(virtualPath) {
+    const meta = this._vfsFiles.get(virtualPath);
+    if (!meta) throw new Error(`vfs 同步读取需要先 getObject()/listObjects(): ${virtualPath}`);
+    return meta;
+  }
+
+  enableFileInterception(root) {
+    this._filesRoot = root || process.env.ATELIER_FILES_ROOT || ".";
+    this._stagingDir();
+    this._patchFs();
+    globalThis.__atelierVfs = {
+      matches: (p) => this._vpath(p) !== null,
+      vpath: (p) => this._vpath(p),
+    };
+    return this;
+  }
+
+  _patchFs() {
+    const sdk = this;
+    const vpath = (p) => sdk._vpath(p);
+    const isWriteMode = (flags) => typeof flags === "string" && /[wax]/.test(flags) && !flags.includes("+");
+
+    for (const name of ["writeFile", "appendFile"]) {
+      const original = fs.promises[name];
+      if (typeof original === "function") {
+        fs.promises[name] = async (p, ...rest) => {
+          const vp = vpath(p);
+          if (!vp) return original.call(fs.promises, p, ...rest);
+          const staging = sdk._newStaging();
+          await original.call(fs.promises, staging, ...rest);
+          return sdk._adopt(vp, staging);
+        };
+      }
+      const syncOriginal = fs[name + "Sync"];
+      if (typeof syncOriginal === "function") {
+        fs[name + "Sync"] = (p, ...rest) => {
+          const vp = vpath(p);
+          if (!vp) return syncOriginal.call(fs, p, ...rest);
+          const staging = sdk._newStaging();
+          const result = syncOriginal.call(fs, staging, ...rest);
+          sdk._sendAdopt(vp, staging);
+          return result;
+        };
+      }
+    }
+
+    for (const name of ["readFile", "stat", "access"]) {
+      const original = fs.promises[name];
+      if (typeof original === "function") {
+        fs.promises[name] = async (p, ...rest) => {
+          const vp = vpath(p);
+          if (!vp) return original.call(fs.promises, p, ...rest);
+          const meta = await sdk._resolveRead(vp);
+          return original.call(fs.promises, meta.physical_path, ...rest);
+        };
+      }
+      const syncOriginal = fs[name + "Sync"];
+      if (typeof syncOriginal === "function") {
+        fs[name + "Sync"] = (p, ...rest) => {
+          const vp = vpath(p);
+          if (!vp) return syncOriginal.call(fs, p, ...rest);
+          return syncOriginal.call(fs, sdk._resolveReadSync(vp).physical_path, ...rest);
+        };
+      }
+    }
+
+    for (const name of ["unlink", "rm"]) {
+      const original = fs.promises[name];
+      if (typeof original === "function") {
+        fs.promises[name] = async (p, ...rest) => {
+          const vp = vpath(p);
+          if (!vp) return original.call(fs.promises, p, ...rest);
+          return sdk.deleteObject(vp);
+        };
+      }
+      const syncOriginal = fs[name + "Sync"];
+      if (typeof syncOriginal === "function") {
+        fs[name + "Sync"] = (p, ...rest) => {
+          const vp = vpath(p);
+          if (!vp) return syncOriginal.call(fs, p, ...rest);
+          sdk._write({
+            frame_type: "send",
+            seq: sdk._seq++,
+            targets: ["kernel.storage"],
+            message_type: "StorageObjectDelete",
+            params: { virtual_path: vp },
+            data: {},
+          });
+          sdk._vfsFiles.delete(vp);
+          return undefined;
+        };
+      }
+    }
+
+    const originalPromiseOpen = fs.promises.open;
+    fs.promises.open = async (p, flags, ...rest) => {
+      const vp = vpath(p);
+      if (!vp) return originalPromiseOpen.call(fs.promises, p, flags, ...rest);
+      if (isWriteMode(flags)) {
+        const staging = sdk._newStaging();
+        const handle = await originalPromiseOpen.call(fs.promises, staging, flags, ...rest);
+        const originalClose = handle.close.bind(handle);
+        handle.close = async () => {
+          await originalClose();
+          await sdk._adopt(vp, staging);
+        };
+        handle.virtual_path = vp;
+        handle.owner = sdk.domain;
+        return handle;
+      }
+      const meta = await sdk._resolveRead(vp);
+      const handle = await originalPromiseOpen.call(fs.promises, meta.physical_path, flags, ...rest);
+      handle.virtual_path = vp;
+      handle.owner = meta.owner;
+      handle.file_meta = meta;
+      return handle;
+    };
+
+    const originalCreateWriteStream = fs.createWriteStream;
+    fs.createWriteStream = (p, options) => {
+      const vp = vpath(p);
+      if (!vp) return originalCreateWriteStream.call(fs, p, options);
+      const staging = sdk._newStaging();
+      const stream = originalCreateWriteStream.call(fs, staging, options);
+      stream.on("close", () => {
+        sdk._adopt(vp, staging).catch((error) => sdk._logger.error(`vfs 归档失败 ${vp}: ${error.message}`));
+      });
+      return stream;
+    };
+  }
+
+  async putObject(virtualPath) {
+    const staging = this._stagingFiles.get(virtualPath);
+    if (!staging) return this.getObject(virtualPath);
+    return this._adopt(virtualPath, staging);
+  }
+
+  async getObject(virtualPath, owner) {
+    const params = { virtual_path: virtualPath };
+    if (owner) params.owner = owner;
+    const meta = (await this.request("kernel.storage", "StorageObjectGet", params)).data;
+    if (!owner) this._vfsFiles.set(virtualPath, meta);
+    return meta;
+  }
+
+  async deleteObject(virtualPath, owner) {
+    const params = { virtual_path: virtualPath };
+    if (owner) params.owner = owner;
+    const result = (await this.request("kernel.storage", "StorageObjectDelete", params)).data;
+    this._vfsFiles.delete(virtualPath);
+    const staging = this._stagingFiles.get(virtualPath);
+    this._stagingFiles.delete(virtualPath);
+    if (staging) fs.rm(staging, { force: true }, () => {});
+    return result;
   }
 
   async listObjects(owner) {
-    return (await this.request("kernel.storage", "StorageObjectList", owner ? { owner } : {})).data;
+    const data = (await this.request("kernel.storage", "StorageObjectList", owner ? { owner } : {})).data;
+    if (!owner) for (const item of data.objects || []) this._vfsFiles.set(item.virtual_path, item);
+    return data;
   }
-  fileObjectId(virtualPath) {
-    return this._namespace ? this._namespace.objectId(virtualPath) : null;
-  }
-  async refreshFileIndex() {
-    return this.listObjects();
-  }
-
-  // 能力 13 配套：消息里的文件句柄编解码（实例级，无全局状态）
   _encodeFiles(value) {
-    if (this._handles.has(value)) return { __atelier_file__: this._handles.get(value) };
-    if (this._namespace && value && typeof value.read === "function" && typeof value.path === "string" && value.path) {
-      const objectId = this._namespace.objectIdForPath(value.path);
-      if (objectId) return { __atelier_file__: objectId };
+    if (value && typeof value === "object" && (typeof value.read === "function" || typeof value.close === "function") && typeof value.virtual_path === "string" && typeof value.owner === "string") {
+      return { __atelier_file__: { owner: value.owner, virtual_path: value.virtual_path } };
     }
     if (Array.isArray(value)) return value.map((item) => this._encodeFiles(item));
     if (value && typeof value === "object" && value.constructor === Object) {
@@ -411,6 +534,7 @@ class AtelierDomain {
     }
     return value;
   }
+
   async _decodeFiles(value) {
     if (Array.isArray(value)) {
       const out = [];
@@ -419,12 +543,13 @@ class AtelierDomain {
     }
     if (value && typeof value === "object" && value.constructor === Object) {
       const keys = Object.keys(value);
-      if (keys.length === 1 && keys[0] === "__atelier_file__" && typeof value.__atelier_file__ === "string") {
-        const ref = await this.getObject(value.__atelier_file__);
-        const handle = await fs.promises.open(ref.physical_path, "r+");
-        // C4：物理文件是平铺 id（无扩展名）；逻辑路径随句柄携带，供格式判定。
-        handle.object_id = value.__atelier_file__;
+      const ref = value.__atelier_file__;
+      if (keys.length === 1 && ref && typeof ref === "object") {
+        const meta = await this.getObject(ref.virtual_path, ref.owner);
+        const handle = await fs.promises.open(meta.physical_path, "r+");
         handle.virtual_path = ref.virtual_path;
+        handle.owner = ref.owner || meta.owner;
+        handle.file_meta = meta;
         return handle;
       }
       const out = {};

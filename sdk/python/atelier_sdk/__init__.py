@@ -4,7 +4,7 @@
 本模块只负责协议与能力，不关心 Windows 命名管道 / Unix domain socket 的差异。
 """
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 import asyncio
 import json
@@ -450,8 +450,14 @@ class AtelierDomain:
     async def _decode_files(self, value):
         if isinstance(value, dict):
             if len(value) == 1 and isinstance(value.get("__atelier_file__"), str):
-                ref = await self.get_object(value["__atelier_file__"])
-                return open(ref["physical_path"], "rb+")
+                object_id = value["__atelier_file__"]
+                ref = await self.get_object(object_id)
+                handle = open(ref["physical_path"], "rb+")
+                # C4：物理文件是平铺 id（无扩展名），逻辑路径（含目录与后缀）在索引里。
+                # 句柄同时带上两者，业务侧/引擎据此选格式，不必猜物理名。
+                handle.object_id = object_id
+                handle.virtual_path = ref.get("virtual_path")
+                return handle
             return {key: await self._decode_files(item) for key, item in value.items()}
         if isinstance(value, list):
             return [await self._decode_files(item) for item in value]

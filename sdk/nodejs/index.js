@@ -412,7 +412,11 @@ class AtelierDomain {
       const keys = Object.keys(value);
       if (keys.length === 1 && keys[0] === "__atelier_file__" && typeof value.__atelier_file__ === "string") {
         const ref = await this.getObject(value.__atelier_file__);
-        return fs.promises.open(ref.physical_path, "r+");
+        const handle = await fs.promises.open(ref.physical_path, "r+");
+        // C4：物理文件是平铺 id（无扩展名）；逻辑路径随句柄携带，供格式判定。
+        handle.object_id = value.__atelier_file__;
+        handle.virtual_path = ref.virtual_path;
+        return handle;
       }
       const out = {};
       for (const [key, item] of Object.entries(value)) out[key] = await this._decodeFiles(item);

@@ -25,6 +25,10 @@ def _ipc(name, mode):
 "#;
 
 fn probe(code: &str, stages: &[&str]) -> Value {
+    probe_within(code, stages, Duration::from_secs(10))
+}
+
+fn probe_within(code: &str, stages: &[&str], timeout: Duration) -> Value {
     let work = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tmp/process-diagnostics")
         .join(uuid::Uuid::new_v4().to_string());
@@ -49,7 +53,7 @@ fn probe(code: &str, stages: &[&str]) -> Value {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + timeout;
     loop {
         let text = fs::read_to_string(&log).unwrap();
         for line in text.lines() {
@@ -94,9 +98,12 @@ fn natural_child_signal_is_observed_before_cleanup() {
 fn oversized_rx_records_original_error_before_cleanup() {
     // 必须像真实域一样先连 IN 再连 OUT：只开 OUT 时内核的 tx 线程会永远卡在 accept，
     // 回收路径一旦置 `stop`，`pump_lines` 就不记录 rx 诊断，这条断言会退化成超时。
-    let row = probe(
+    // 16 MiB+1 的越界帧要走完整条 socket/管道链路；macOS CI 在并发负载下 10 s 会抖，
+    // 给这条用例单独的更宽限期，避免把"慢"误判成"没有诊断"。
+    let row = probe_within(
         &format!("{IPC_OPEN}\nimport time\nr=_ipc('ATELIER_IPC_IN','rb'); w=_ipc('ATELIER_IPC_OUT','wb'); w.write(b'x'*(16*1024*1024+1)); time.sleep(30)"),
         &["rx_read"],
+        Duration::from_secs(60),
     );
     assert_eq!(row["diagnostic"]["details"]["kind"], "InvalidData");
     assert_eq!(

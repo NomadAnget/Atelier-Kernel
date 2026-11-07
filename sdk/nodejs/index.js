@@ -367,13 +367,58 @@ class AtelierDomain {
     return meta;
   }
 
+  _cleanStaleStaging() {
+    const dir = this._stagingDir();
+    const cutoff = Date.now() - 24 * 3600 * 1000;
+    for (const name of fs.readdirSync(dir)) {
+      const file = path.join(dir, name);
+      try {
+        if (fs.statSync(file).mtimeMs < cutoff) fs.rmSync(file, { force: true });
+      } catch (_) {
+        /* 清理失败不影响主流程 */
+      }
+    }
+  }
+
   enableFileInterception(root) {
     this._filesRoot = root || process.env.ATELIER_FILES_ROOT || ".";
-    this._stagingDir();
+    this._cleanStaleStaging();
     this._patchFs();
+    const sdk = this;
     globalThis.__atelierVfs = {
-      matches: (p) => this._vpath(p) !== null,
-      vpath: (p) => this._vpath(p),
+      matches: (p) => sdk._vpath(p) !== null,
+      vpath: (p) => sdk._vpath(p),
+      resolve: (p, forWrite) => {
+        const vp = sdk._vpath(p);
+        if (!vp) return p;
+        if (!forWrite) return sdk._resolveReadSync(vp).physical_path;
+        let staging = sdk._stagingFiles.get(vp);
+        if (!staging || !fs.existsSync(staging)) {
+          staging = sdk._newStaging();
+          sdk._stagingFiles.set(vp, staging);
+        }
+        return staging;
+      },
+      commit: (p) => {
+        const vp = sdk._vpath(p);
+        const staging = vp && sdk._stagingFiles.get(vp);
+        if (staging) sdk._sendAdopt(vp, staging);
+        return vp;
+      },
+      remove: (p) => {
+        const vp = sdk._vpath(p);
+        if (!vp) return null;
+        sdk._write({
+          frame_type: "send",
+          seq: sdk._seq++,
+          targets: ["kernel.storage"],
+          message_type: "StorageObjectDelete",
+          params: { virtual_path: vp },
+          data: {},
+        });
+        sdk._vfsFiles.delete(vp);
+        return vp;
+      },
     };
     return this;
   }

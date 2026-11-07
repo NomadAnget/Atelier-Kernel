@@ -13,6 +13,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import uuid
 
 
@@ -485,6 +486,17 @@ class AtelierDomain:
     def _new_staging(self):
         return os.path.join(self._staging_dir(), f"{uuid.uuid4().hex}.part")
 
+    def _clean_stale_staging(self):
+        """清理 24 小时前的暂存残留（崩溃/未关闭）。"""
+        cutoff = time.time() - 24 * 3600
+        for name in os.listdir(self._staging_dir()):
+            path = os.path.join(self._staging_dir(), name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                continue
+
     def _adopt(self, virtual_path, staging, *, raise_on_error=True):
         try:
             meta = self._sync_request(
@@ -519,6 +531,7 @@ class AtelierDomain:
         import builtins
 
         self._staging_dir()
+        self._clean_stale_staging()
         original = builtins.open
         sdk = self
         prefix = "vfs://"

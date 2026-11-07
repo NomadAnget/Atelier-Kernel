@@ -19,19 +19,50 @@ function rp(p, forWrite) {
 
 const wrap = (fn, forWrite) =>
   function (p, ...rest) {
-    return fn.call(this, rp(p, forWrite), ...rest);
+    const n = ns();
+    const vp = n && typeof p === "string" ? n.vpath(p) : null;
+    if (!vp) return fn.call(this, p, ...rest);
+    const result = fn.call(this, rp(p, forWrite), ...rest);
+    if (forWrite && result && typeof result.then === "function") {
+      return result.then((value) => {
+        n.commit(p);
+        return value;
+      });
+    }
+    return result;
   };
 
 // path-taking operations, wrapped
 export const readFile = wrap(real.readFile, false);
 export const writeFile = wrap(real.writeFile, true);
 export const appendFile = wrap(real.appendFile, true);
-export const open = wrap(real.open, true);
+export const open = async (p, flags, ...rest) => {
+  const n = ns();
+  const vp = n && typeof p === "string" ? n.vpath(p) : null;
+  if (!vp) return real.open.call(real, p, flags, ...rest);
+  const forWrite = /[wax]/.test(flags) && !flags.includes("+");
+  const handle = await real.open.call(real, rp(p, forWrite), flags, ...rest);
+  if (!forWrite) return handle;
+  const originalClose = handle.close.bind(handle);
+  handle.close = async () => {
+    await originalClose();
+    n.commit(p);
+  };
+  return handle;
+};
 export const stat = wrap(real.stat, false);
 export const lstat = wrap(real.lstat, false);
 export const access = wrap(real.access, false);
-export const rm = wrap(real.rm, true);
-export const unlink = wrap(real.unlink, true);
+export const rm = async (p, ...rest) => {
+  const n = ns();
+  if (n && typeof p === "string" && n.vpath(p)) return n.remove(p);
+  return real.rm.call(real, p, ...rest);
+};
+export const unlink = async (p) => {
+  const n = ns();
+  if (n && typeof p === "string" && n.vpath(p)) return n.remove(p);
+  return real.unlink.call(real, p);
+};
 export const rename = (a, b, ...rest) => real.rename(rp(a, true), rp(b, true), ...rest);
 export const copyFile = (a, b, ...rest) => real.copyFile(rp(a, false), rp(b, true), ...rest);
 
